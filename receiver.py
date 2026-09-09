@@ -1,9 +1,14 @@
+#################### START OF FILE: receiver.py ####################
+
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
-Features: UDP Broadcast Beacon, 4-Digit PIN Authentication, Multi-Touch Canvas.
+Features: UDP Broadcast Beacon, 4-Digit PIN Authentication, Multi-Touch Canvas,
+          Rotating File Logging, Non-blocking Clean Thread Shutdown.
 """
 
 import json
+import logging
+import os
 import random
 import socket
 import struct
@@ -26,12 +31,39 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mrcoopers_receiver.log")
+
+logger = logging.getLogger("Receiver")
+logger.setLevel(logging.DEBUG)
+
+if not logger.handlers:
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(LOG_FILE_PATH, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.DEBUG)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+# Optional Sound Support
 try:
     import sounddevice as sd
 
     AUDIO_AVAILABLE = True
-except Exception:
+    logger.info("sounddevice audio subsystem initialized successfully.")
+except Exception as e:
     AUDIO_AVAILABLE = False
+    logger.warning(f"sounddevice audio subsystem unavailable: {e}")
 
 VIDEO_PORT = 9988
 CONTROL_PORT = 9989
@@ -47,9 +79,28 @@ def get_local_ip() -> str:
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
     finally:
         s.close()
+
+
+def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
+    """Reads exactly `count` bytes from socket buffer or returns None on disconnect."""
+    buf = bytearray()
+    while len(buf) < count:
+        try:
+            chunk = sock.recv(count - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        except (socket.timeout, BlockingIOError):
+            continue
+        except Exception:
+            return None
+    return bytes(buf)
 
 
 # ---------------------------------------------------------------------------
@@ -62,33 +113,45 @@ class DiscoveryBeaconThread(QThread):
 
     def __init__(self, get_pin_func, get_pin_req_func):
         super().__init__()
+        self.setObjectName("BeaconThread")
         self.get_pin_func = get_pin_func
         self.get_pin_req_func = get_pin_req_func
         self.running = True
 
     def run(self):
+        logger.info("Discovery Beacon thread started.")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
         while self.running:
             try:
                 local_ip = get_local_ip()
+                pin_req = self.get_pin_req_func()
                 payload = json.dumps(
                     {
                         "service": "MrCoopersScreenShare",
                         "ip": local_ip,
-                        "pin_required": self.get_pin_req_func(),
+                        "pin_required": pin_req,
                     }
                 ).encode("utf-8")
+
                 sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
-            except Exception:
-                pass
-            self.msleep(1500)
+                logger.debug(f"Beacon broadcasted: IP={local_ip}, pin_required={pin_req}")
+            except Exception as e:
+                logger.error(f"Discovery broadcast error: {e}")
+
+            # Sleep in small slices for instant interruption on stop
+            for _ in range(15):
+                if not self.running:
+                    break
+                self.msleep(100)
+
         sock.close()
+        logger.info("Discovery Beacon thread terminated.")
 
     def stop(self):
         self.running = False
-        self.wait()
+        self.wait(1000)
 
 
 class VideoServerThread(QThread):
@@ -96,10 +159,9 @@ class VideoServerThread(QThread):
     client_connected = Signal(str)
     client_disconnected = Signal()
 
-    def __init__(
-        self, get_pin_func, get_pin_req_func, port: int = VIDEO_PORT
-    ):
+    def __init__(self, get_pin_func, get_pin_req_func, port: int = VIDEO_PORT):
         super().__init__()
+        self.setObjectName("VideoServerThread")
         self.port = port
         self.get_pin_func = get_pin_func
         self.get_pin_req_func = get_pin_req_func
@@ -107,70 +169,124 @@ class VideoServerThread(QThread):
         self.server_sock: Optional[socket.socket] = None
 
     def run(self):
+        logger.info(f"Video Server binding to 0.0.0.0:{self.port}...")
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_sock.bind(("0.0.0.0", self.port))
         self.server_sock.listen(1)
+        self.server_sock.settimeout(0.5)
+
+        logger.info("Video Server listening for incoming sender connections.")
 
         while self.running:
             try:
                 conn, addr = self.server_sock.accept()
-                if self._verify_handshake(conn):
-                    self.client_connected.emit(addr[0])
-                    self._handle_client(conn)
-                else:
-                    conn.close()
-            except Exception:
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    logger.error(f"Video accept error: {e}")
                 break
 
-    def _verify_handshake(self, conn: socket.socket) -> bool:
+            logger.info(f"Incoming video connection from {addr[0]}:{addr[1]}")
+            if self._verify_handshake(conn, addr[0]):
+                self.client_connected.emit(addr[0])
+                self._handle_client(conn, addr[0])
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        if self.server_sock:
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+        logger.info("Video Server thread finished.")
+
+    def _verify_handshake(self, conn: socket.socket, client_ip: str) -> bool:
         """Verifies 4-digit PIN if PIN requirement is active."""
         try:
             conn.settimeout(5.0)
-            header = conn.recv(4)
+            header = recv_exact(conn, 4)
             if not header:
+                logger.warning(f"Handshake failed: connection closed by {client_ip}")
                 return False
+
             size = struct.unpack(">L", header)[0]
-            data = json.loads(conn.recv(size).decode("utf-8"))
+            raw_payload = recv_exact(conn, size)
+            if not raw_payload:
+                logger.warning(f"Handshake failed: incomplete payload from {client_ip}")
+                return False
 
+            data = json.loads(raw_payload.decode("utf-8"))
             pin_req = self.get_pin_req_func()
-            client_pin = data.get("pin", "")
+            client_pin = str(data.get("pin", "")).strip()
+            server_pin = str(self.get_pin_func()).strip()
 
-            if pin_req and client_pin != self.get_pin_func():
-                resp = json.dumps(
-                    {"auth": False, "msg": "Incorrect PIN"}
-                ).encode("utf-8")
+            logger.info(
+                f"Authentication request from {client_ip}: PIN provided='{client_pin}', "
+                f"PIN expected='{server_pin}', Required={pin_req}"
+            )
+
+            if pin_req and client_pin != server_pin:
+                logger.warning(f"Authentication rejected for {client_ip}: Invalid PIN '{client_pin}'")
+                resp = json.dumps({"auth": False, "msg": "Incorrect PIN"}).encode("utf-8")
                 conn.sendall(struct.pack(">L", len(resp)) + resp)
                 return False
 
-            resp = json.dumps({"auth": True}).encode("utf-8")
+            logger.info(f"Authentication approved for {client_ip}.")
+            resp = json.dumps({"auth": True, "msg": "OK"}).encode("utf-8")
             conn.sendall(struct.pack(">L", len(resp)) + resp)
             conn.settimeout(None)
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"Handshake exception with {client_ip}: {e}")
             return False
 
-    def _handle_client(self, conn: socket.socket):
+    def _handle_client(self, conn: socket.socket, client_ip: str):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.settimeout(0.5)
         payload_size = struct.calcsize(">L")
         data = bytearray()
+        frames_count = 0
+        last_log_time = time.time()
+
+        logger.info(f"Receiving video frames stream from {client_ip}...")
 
         while self.running:
             try:
                 while len(data) < payload_size:
-                    packet = conn.recv(4096)
-                    if not packet:
-                        raise ConnectionResetError
-                    data.extend(packet)
+                    if not self.running:
+                        break
+                    try:
+                        packet = conn.recv(65536)
+                        if not packet:
+                            raise ConnectionResetError("Connection closed by sender.")
+                        data.extend(packet)
+                    except socket.timeout:
+                        continue
+
+                if not self.running:
+                    break
 
                 msg_size = struct.unpack(">L", data[:payload_size])[0]
                 data = data[payload_size:]
 
                 while len(data) < msg_size:
-                    packet = conn.recv(min(msg_size - len(data), 65536))
-                    if not packet:
-                        raise ConnectionResetError
-                    data.extend(packet)
+                    if not self.running:
+                        break
+                    try:
+                        packet = conn.recv(min(msg_size - len(data), 65536))
+                        if not packet:
+                            raise ConnectionResetError("Connection dropped during frame transfer.")
+                        data.extend(packet)
+                    except socket.timeout:
+                        continue
+
+                if not self.running:
+                    break
 
                 frame_data = data[:msg_size]
                 data = data[msg_size:]
@@ -180,106 +296,178 @@ class VideoServerThread(QThread):
                 if img is not None:
                     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                     h, w, ch = img_rgb.shape
-                    qimg = QImage(
-                        img_rgb.data, w, h, ch * w, QImage.Format_RGB888
-                    ).copy()
+                    qimg = QImage(img_rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
                     self.frame_received.emit(qimg)
-            except Exception:
+                    frames_count += 1
+
+                if time.time() - last_log_time >= 5.0:
+                    fps_val = frames_count / (time.time() - last_log_time)
+                    logger.debug(f"Video streaming active: ~{fps_val:.1f} FPS (Received {frames_count} frames)")
+                    frames_count = 0
+                    last_log_time = time.time()
+
+            except ConnectionResetError as e:
+                logger.info(f"Video client disconnected ({client_ip}): {e}")
+                break
+            except Exception as e:
+                logger.error(f"Error handling video frame from {client_ip}: {e}")
                 break
 
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+        logger.info(f"Video session with {client_ip} ended.")
         self.client_disconnected.emit()
 
     def stop(self):
         self.running = False
         if self.server_sock:
-            self.server_sock.close()
-        self.wait()
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+        self.wait(1000)
 
 
 class AudioServerThread(QThread):
     def __init__(self, port: int = AUDIO_PORT):
         super().__init__()
+        self.setObjectName("AudioServerThread")
         self.port = port
         self.running = True
         self.server_sock: Optional[socket.socket] = None
 
     def run(self):
         if not AUDIO_AVAILABLE:
+            logger.warning("Audio playback disabled (sounddevice not installed).")
             return
+
+        logger.info(f"Audio Server binding to 0.0.0.0:{self.port}...")
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_sock.bind(("0.0.0.0", self.port))
         self.server_sock.listen(1)
+        self.server_sock.settimeout(0.5)
 
         try:
             out_stream = sd.OutputStream(
                 samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16"
             )
             out_stream.start()
-        except Exception:
+            logger.info("Audio output stream started.")
+        except Exception as e:
+            logger.error(f"Failed to open audio output stream: {e}")
             return
 
         while self.running:
             try:
-                conn, _ = self.server_sock.accept()
+                conn, addr = self.server_sock.accept()
+                logger.info(f"Audio connection established with {addr[0]}")
+                conn.settimeout(0.5)
                 while self.running:
-                    pcm_data = conn.recv(4096)
-                    if not pcm_data:
+                    try:
+                        pcm_data = conn.recv(4096)
+                        if not pcm_data:
+                            break
+                        samples = np.frombuffer(pcm_data, dtype=np.int16)
+                        out_stream.write(samples)
+                    except socket.timeout:
+                        continue
+                    except Exception:
                         break
-                    samples = np.frombuffer(pcm_data, dtype=np.int16)
-                    out_stream.write(samples)
                 conn.close()
-            except Exception:
+                logger.info(f"Audio connection with {addr[0]} closed.")
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    logger.error(f"Audio Server exception: {e}")
                 break
 
-        out_stream.stop()
-        out_stream.close()
+        try:
+            out_stream.stop()
+            out_stream.close()
+        except Exception:
+            pass
+
+        if self.server_sock:
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+        logger.info("Audio Server thread finished.")
 
     def stop(self):
         self.running = False
         if self.server_sock:
-            self.server_sock.close()
-        self.wait()
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+        self.wait(1000)
 
 
 class ControlServerThread(QThread):
     def __init__(self, port: int = CONTROL_PORT):
         super().__init__()
+        self.setObjectName("ControlServerThread")
         self.port = port
         self.running = True
         self.client_conn: Optional[socket.socket] = None
         self.server_sock: Optional[socket.socket] = None
 
     def run(self):
+        logger.info(f"Control Server binding to 0.0.0.0:{self.port}...")
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_sock.bind(("0.0.0.0", self.port))
         self.server_sock.listen(1)
+        self.server_sock.settimeout(0.5)
 
         while self.running:
             try:
-                conn, _ = self.server_sock.accept()
+                conn, addr = self.server_sock.accept()
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.client_conn = conn
-            except Exception:
+                logger.info(f"Control channel connected to {addr[0]}")
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    logger.error(f"Control Server accept exception: {e}")
                 break
+
+        if self.server_sock:
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+        logger.info("Control Server thread finished.")
 
     def send_event(self, event_data: dict):
         if self.client_conn:
             try:
                 msg = json.dumps(event_data).encode("utf-8")
                 self.client_conn.sendall(struct.pack(">L", len(msg)) + msg)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to transmit control event: {e}")
                 self.client_conn = None
 
     def stop(self):
         self.running = False
         if self.client_conn:
-            self.client_conn.close()
+            try:
+                self.client_conn.close()
+            except Exception:
+                pass
         if self.server_sock:
-            self.server_sock.close()
-        self.wait()
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+        self.wait(1000)
 
 
 # ---------------------------------------------------------------------------
@@ -407,16 +595,13 @@ class ReceiverMainWindow(QMainWindow):
         self.resize(1280, 800)
 
         # Generate 4-digit PIN for session
-        self.pin = str(random.randint(1000, 9999))
+        self.pin = f"{random.randint(1000, 9999)}"
+        logger.info(f"Initialized Receiver. Local IP: {get_local_ip()} | Session PIN: {self.pin}")
 
         self.control_thread = ControlServerThread()
         self.audio_thread = AudioServerThread()
-        self.video_thread = VideoServerThread(
-            self.get_pin, self.is_pin_required
-        )
-        self.beacon_thread = DiscoveryBeaconThread(
-            self.get_pin, self.is_pin_required
-        )
+        self.video_thread = VideoServerThread(self.get_pin, self.is_pin_required)
+        self.beacon_thread = DiscoveryBeaconThread(self.get_pin, self.is_pin_required)
 
         self.video_thread.frame_received.connect(self.on_frame)
         self.video_thread.client_connected.connect(self.on_connected)
@@ -453,23 +638,24 @@ class ReceiverMainWindow(QMainWindow):
         title.setFont(QFont("Segoe UI", 34, QFont.Bold))
         title.setStyleSheet("color: #00a2ed;")
 
-        ip_lbl = QLabel(f"Display IP: {get_local_ip()}")
-        ip_lbl.setFont(QFont("Segoe UI", 22))
-        ip_lbl.setStyleSheet("color: #ffffff;")
+        self.ip_lbl = QLabel(f"Display IP: {get_local_ip()}")
+        self.ip_lbl.setFont(QFont("Segoe UI", 22))
+        self.ip_lbl.setStyleSheet("color: #ffffff;")
 
-        pin_lbl = QLabel(f"PIN: {self.pin}")
-        pin_lbl.setFont(QFont("Segoe UI", 28, QFont.Bold))
-        pin_lbl.setStyleSheet("color: #00d084; letter-spacing: 4px;")
+        self.pin_lbl = QLabel(f"PIN: {self.pin}")
+        self.pin_lbl.setFont(QFont("Segoe UI", 28, QFont.Bold))
+        self.pin_lbl.setStyleSheet("color: #00d084; letter-spacing: 4px;")
 
         self.pin_req_cb = QCheckBox("Require 4-digit PIN to Connect")
-        self.pin_req_cb.setChecked(False)  # Unchecked = Instant Auto-Connect
+        self.pin_req_cb.setChecked(False)
         self.pin_req_cb.setStyleSheet(
             "color: #8f9bb3; font-size: 14px; margin-top: 10px;"
         )
+        self.pin_req_cb.stateChanged.connect(self.on_pin_req_changed)
 
         sb_layout.addWidget(title, alignment=Qt.AlignCenter)
-        sb_layout.addWidget(ip_lbl, alignment=Qt.AlignCenter)
-        sb_layout.addWidget(pin_lbl, alignment=Qt.AlignCenter)
+        sb_layout.addWidget(self.ip_lbl, alignment=Qt.AlignCenter)
+        sb_layout.addWidget(self.pin_lbl, alignment=Qt.AlignCenter)
         sb_layout.addWidget(self.pin_req_cb, alignment=Qt.AlignCenter)
 
         # Canvas View
@@ -477,10 +663,16 @@ class ReceiverMainWindow(QMainWindow):
         self.stack.addWidget(self.standby)
         self.stack.addWidget(self.canvas)
 
+    def on_pin_req_changed(self, state):
+        req = self.is_pin_required()
+        logger.info(f"PIN requirement changed: {req}")
+
     def on_connected(self, ip: str):
+        logger.info(f"Display Canvas activated for sender {ip}")
         self.stack.setCurrentWidget(self.canvas)
 
     def on_disconnected(self):
+        logger.info("Display switched back to standby.")
         self.canvas.current_frame = None
         self.stack.setCurrentWidget(self.standby)
 
@@ -488,10 +680,12 @@ class ReceiverMainWindow(QMainWindow):
         self.canvas.update_frame(img)
 
     def closeEvent(self, event):
+        logger.info("Receiver shutting down. Terminating worker threads cleanly...")
+        self.beacon_thread.stop()
         self.video_thread.stop()
         self.audio_thread.stop()
         self.control_thread.stop()
-        self.beacon_thread.stop()
+        logger.info("All threads terminated. Goodbye.")
         event.accept()
 
 

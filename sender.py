@@ -1,6 +1,9 @@
+#################### START OF FILE: sender.py ####################
+
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Features: Auto-Discovery, Auto-Connect, Optional PIN, Taskbar Support, 60 FPS.
+Features: Auto-Discovery, Robust Auto-Connect, Optional PIN Auth, Taskbar Support,
+          60 FPS, Deprecation-free MSS, High-Speed Low Latency Streaming.
 """
 
 import ctypes
@@ -36,7 +39,8 @@ try:
     import sounddevice as sd
 
     AUDIO_AVAILABLE = True
-except Exception:
+except Exception as e:
+    print(f"[DEBUG Sender Audio] sounddevice unavailable: {e}")
     AUDIO_AVAILABLE = False
 
 # Input Backends (evdev for Wayland / Linux, pynput fallback for Windows)
@@ -71,6 +75,29 @@ if sys.platform == "win32":
         )
     except Exception:
         pass
+
+
+def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
+    """Reads exactly `count` bytes from socket or returns None on error/disconnect."""
+    buf = bytearray()
+    while len(buf) < count:
+        try:
+            chunk = sock.recv(count - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        except (socket.timeout, BlockingIOError):
+            continue
+        except Exception:
+            return None
+    return bytes(buf)
+
+
+def create_mss_instance():
+    """Returns a mss instance without deprecation warnings."""
+    if hasattr(mss, "MSS"):
+        return mss.MSS()
+    return mss.mss()
 
 
 # ---------------------------------------------------------------------------
@@ -117,14 +144,18 @@ class UniversalInputInjector:
                 }
                 self.ui = UInput(cap, name="mrcoopers-virtual-input")
                 self.mode = "evdev"
-            except Exception:
+                print("[DEBUG Injector] Using Linux evdev virtual input.")
+            except Exception as ex:
+                print(f"[DEBUG Injector] evdev init failed: {ex}")
                 self.mode = "none"
 
         if self.mode == "none":
             try:
                 self.mouse = MouseController()
                 self.mode = "pynput"
-            except Exception:
+                print("[DEBUG Injector] Using pynput mouse controller.")
+            except Exception as ex:
+                print(f"[DEBUG Injector] pynput init failed: {ex}")
                 self.mode = "unsupported"
 
     def execute(self, event: dict):
@@ -180,7 +211,10 @@ class UniversalInputInjector:
 
     def close(self):
         if self.mode == "evdev":
-            self.ui.close()
+            try:
+                self.ui.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -198,36 +232,44 @@ class DiscoveryListenerThread(QThread):
         self.running = True
 
     def run(self):
-        sock = socket.socket(
-            socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
-        )
+        print(f"[DEBUG Sender Discovery] Listening for UDP beacons on port {DISCOVERY_PORT}...")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         if hasattr(socket, "SO_REUSEPORT"):
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except Exception:
                 pass
+
         sock.settimeout(1.0)
         try:
             sock.bind(("", DISCOVERY_PORT))
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG Sender Discovery] UDP bind error on port {DISCOVERY_PORT}: {e}")
             return
 
         while self.running:
             try:
-                data, _ = sock.recvfrom(1024)
+                data, addr = sock.recvfrom(2048)
                 payload = json.loads(data.decode("utf-8"))
                 if payload.get("service") == "MrCoopersScreenShare":
-                    self.device_found.emit(
-                        payload["ip"], payload.get("pin_required", False)
-                    )
-            except (socket.timeout, Exception):
+                    rec_ip = payload.get("ip", addr[0])
+                    pin_req = payload.get("pin_required", False)
+                    self.device_found.emit(rec_ip, pin_req)
+            except socket.timeout:
                 continue
+            except Exception as e:
+                if self.running:
+                    print(f"[DEBUG Sender Discovery] Decode error: {e}")
+                continue
+
         sock.close()
+        print("[DEBUG Sender Discovery] Discovery listener stopped.")
 
     def stop(self):
         self.running = False
-        self.wait()
+        self.wait(1000)
 
 
 class ScreenSenderThread(QThread):
@@ -249,10 +291,11 @@ class ScreenSenderThread(QThread):
         self.paused = False
 
     def run(self):
+        print(f"[DEBUG Sender Video] Connecting to {self.target_ip}:{VIDEO_PORT} (PIN: '{self.pin}')...")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(5.0)
+            sock.settimeout(4.0)
             sock.connect((self.target_ip, VIDEO_PORT))
 
             # Handshake with PIN
@@ -260,28 +303,36 @@ class ScreenSenderThread(QThread):
             sock.sendall(struct.pack(">L", len(handshake)) + handshake)
 
             # Wait for handshake response
-            resp_raw = sock.recv(4)
+            resp_raw = recv_exact(sock, 4)
             if not resp_raw:
-                raise ConnectionError("Server rejected connection.")
+                raise ConnectionError("Server rejected connection or closed socket.")
+
             resp_len = struct.unpack(">L", resp_raw)[0]
-            resp = json.loads(sock.recv(resp_len).decode("utf-8"))
+            resp_bytes = recv_exact(sock, resp_len)
+            if not resp_bytes:
+                raise ConnectionError("Failed to receive authentication response.")
+
+            resp = json.loads(resp_bytes.decode("utf-8"))
+            print(f"[DEBUG Sender Video] Handshake response: {resp}")
 
             if not resp.get("auth", False):
-                self.status_changed.emit(
-                    f"Error: {resp.get('msg', 'Auth Failed')}", False
-                )
+                err_msg = resp.get("msg", "Auth Failed")
+                print(f"[DEBUG Sender Video] Auth rejected: {err_msg}")
+                self.status_changed.emit(f"Error: {err_msg}", False)
                 sock.close()
                 return
 
             sock.settimeout(None)
+            print(f"[DEBUG Sender Video] Connected & Authorized. Streaming at {self.fps_limit} FPS...")
             self.status_changed.emit(f"Streaming ({self.fps_limit} FPS)", True)
         except Exception as e:
+            print(f"[DEBUG Sender Video] Connection error: {e}")
             self.status_changed.emit(f"Connect Error: {e}", False)
             return
 
         target_frame_time = 1.0 / max(1, self.fps_limit)
 
-        with mss.mss() as sct:
+        with create_mss_instance() as sct:
             monitor = sct.monitors[1]
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
@@ -300,7 +351,8 @@ class ScreenSenderThread(QThread):
                     data = enc_img.tobytes()
                     try:
                         sock.sendall(struct.pack(">L", len(data)) + data)
-                    except Exception:
+                    except Exception as e:
+                        print(f"[DEBUG Sender Video] Frame send failed: {e}")
                         break
 
                 elapsed = time.perf_counter() - t_start
@@ -308,12 +360,17 @@ class ScreenSenderThread(QThread):
                 if sleep_sec > 0:
                     self.msleep(int(sleep_sec * 1000))
 
-        sock.close()
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+        print("[DEBUG Sender Video] Video streaming thread stopped.")
         self.status_changed.emit("Disconnected", False)
 
     def stop(self):
         self.running = False
-        self.wait()
+        self.wait(1000)
 
 
 class AudioSenderThread(QThread):
@@ -327,11 +384,16 @@ class AudioSenderThread(QThread):
     def run(self):
         if not AUDIO_AVAILABLE:
             return
+        print(f"[DEBUG Sender Audio] Connecting to {self.target_ip}:{AUDIO_PORT}...")
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock.settimeout(3.0)
             self.sock.connect((self.target_ip, AUDIO_PORT))
-        except Exception:
+            self.sock.settimeout(None)
+            print("[DEBUG Sender Audio] Connected to audio receiver.")
+        except Exception as e:
+            print(f"[DEBUG Sender Audio] Connection failed: {e}")
             return
 
         def callback(indata, frames, time_info, status):
@@ -350,15 +412,24 @@ class AudioSenderThread(QThread):
             ):
                 while self.running:
                     self.msleep(100)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[DEBUG Sender Audio] InputStream error: {e}")
 
         if self.sock:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        print("[DEBUG Sender Audio] Audio sender stopped.")
 
     def stop(self):
         self.running = False
-        self.wait()
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        self.wait(1000)
 
 
 class InputReceiverThread(QThread):
@@ -368,14 +439,19 @@ class InputReceiverThread(QThread):
         self.running = True
 
     def run(self):
+        print(f"[DEBUG Sender Control] Connecting to {self.target_ip}:{CONTROL_PORT}...")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(3.0)
             sock.connect((self.target_ip, CONTROL_PORT))
-        except Exception:
+            sock.settimeout(0.5)
+            print("[DEBUG Sender Control] Control channel connected.")
+        except Exception as e:
+            print(f"[DEBUG Sender Control] Control channel connection failed: {e}")
             return
 
-        with mss.mss() as sct:
+        with create_mss_instance() as sct:
             mon = sct.monitors[1]
             scr_w, scr_h = mon["width"], mon["height"]
 
@@ -386,34 +462,58 @@ class InputReceiverThread(QThread):
         while self.running:
             try:
                 while len(data) < payload_size:
-                    packet = sock.recv(2048)
-                    if not packet:
-                        raise ConnectionResetError
-                    data.extend(packet)
+                    if not self.running:
+                        break
+                    try:
+                        packet = sock.recv(2048)
+                        if not packet:
+                            raise ConnectionResetError
+                        data.extend(packet)
+                    except socket.timeout:
+                        continue
+
+                if not self.running:
+                    break
 
                 packed_size = data[:payload_size]
                 data = data[payload_size:]
                 msg_size = struct.unpack(">L", packed_size)[0]
 
                 while len(data) < msg_size:
-                    packet = sock.recv(min(msg_size - len(data), 4096))
-                    if not packet:
-                        raise ConnectionResetError
-                    data.extend(packet)
+                    if not self.running:
+                        break
+                    try:
+                        packet = sock.recv(min(msg_size - len(data), 4096))
+                        if not packet:
+                            raise ConnectionResetError
+                        data.extend(packet)
+                    except socket.timeout:
+                        continue
+
+                if not self.running:
+                    break
 
                 raw_msg = data[:msg_size]
                 data = data[msg_size:]
                 event = json.loads(raw_msg.decode("utf-8"))
                 injector.execute(event)
-            except Exception:
+            except ConnectionResetError:
+                break
+            except Exception as e:
+                if self.running:
+                    print(f"[DEBUG Sender Control] Input processing error: {e}")
                 break
 
         injector.close()
-        sock.close()
+        try:
+            sock.close()
+        except Exception:
+            pass
+        print("[DEBUG Sender Control] Input receiver thread stopped.")
 
     def stop(self):
         self.running = False
-        self.wait()
+        self.wait(1000)
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +546,6 @@ class FloatingSenderWindow(QWidget):
         self.discovery_thread.start()
 
     def _init_window(self):
-        # Frameless, Always on Top, but visible in Taskbar
         self.setWindowFlags(
             Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
         )
@@ -550,6 +649,7 @@ class FloatingSenderWindow(QWidget):
         self.pin_input.setPlaceholderText("PIN (if required)")
         self.pin_input.setMaxLength(4)
         self.pin_input.setFixedWidth(110)
+        self.pin_input.textChanged.connect(self.on_pin_text_changed)
 
         auto_row.addWidget(self.auto_connect_cb)
         auto_row.addStretch()
@@ -588,7 +688,6 @@ class FloatingSenderWindow(QWidget):
         self.control_panel.setVisible(False)
         self.adjustSize()
 
-    # Drag Handler with Wayland Compositor fallback
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             handle = self.windowHandle()
@@ -627,15 +726,26 @@ class FloatingSenderWindow(QWidget):
         self.discovered_ip = ip
         self.pin_required = pin_required
 
-        if not self.ip_input.text():
+        if not self.ip_input.text().strip():
             self.ip_input.setText(ip)
 
         # Trigger auto-connect if enabled and not already streaming
         if (
             self.auto_connect_cb.isChecked()
             and (not self.stream_thread or not self.stream_thread.isRunning())
-            and not pin_required
         ):
+            if not pin_required or len(self.pin_input.text().strip()) == 4:
+                print(f"[DEBUG Sender] Auto-Connecting to discovered receiver {ip}...")
+                self.start_sharing()
+
+    def on_pin_text_changed(self, text: str):
+        # If user types a complete 4-digit PIN while auto-connect is active, initiate share
+        if (
+            len(text.strip()) == 4
+            and self.auto_connect_cb.isChecked()
+            and (not self.stream_thread or not self.stream_thread.isRunning())
+        ):
+            print("[DEBUG Sender] 4-Digit PIN entered. Triggering share...")
             self.start_sharing()
 
     def toggle_connect(self):
@@ -647,10 +757,13 @@ class FloatingSenderWindow(QWidget):
     def start_sharing(self):
         target_ip = self.ip_input.text().strip() or self.discovered_ip
         if not target_ip:
+            print("[DEBUG Sender] Cannot start sharing: No target IP provided.")
             return
 
         chosen_fps = 60 if self.fps_combo.currentIndex() == 0 else 30
         pin_code = self.pin_input.text().strip()
+
+        print(f"[DEBUG Sender] Starting stream to {target_ip} (FPS: {chosen_fps}, PIN: '{pin_code}')...")
 
         self.fps_combo.setEnabled(False)
         self.connect_btn.setText("Stop")
@@ -674,6 +787,7 @@ class FloatingSenderWindow(QWidget):
         self.input_thread.start()
 
     def stop_sharing(self):
+        print("[DEBUG Sender] Stopping all sharing threads...")
         for th in (self.stream_thread, self.audio_thread, self.input_thread):
             if th:
                 th.stop()
@@ -693,14 +807,17 @@ class FloatingSenderWindow(QWidget):
             self.is_paused = not self.is_paused
             self.stream_thread.paused = self.is_paused
             self.pause_btn.setText("▶ Resume" if self.is_paused else "⏸ Pause")
+            print(f"[DEBUG Sender] Screen pause state: {self.is_paused}")
 
     def toggle_mute(self):
         if self.audio_thread:
             self.is_muted = not self.is_muted
             self.audio_thread.muted = self.is_muted
             self.mute_btn.setText("🔇 Muted" if self.is_muted else "🔊 Audio On")
+            print(f"[DEBUG Sender] Audio mute state: {self.is_muted}")
 
     def on_stream_status(self, text: str, active: bool):
+        print(f"[DEBUG Sender] Stream status updated: '{text}' (active={active})")
         self.status_dot.setStyleSheet(
             f"color: {'#00d084' if active else '#d83b01'}; font-size: 14px;"
         )
@@ -708,6 +825,7 @@ class FloatingSenderWindow(QWidget):
             self.stop_sharing()
 
     def closeEvent(self, event):
+        print("[DEBUG Sender] Application closing. Terminating all active threads...")
         self.stop_sharing()
         if self.discovery_thread:
             self.discovery_thread.stop()
