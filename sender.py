@@ -2,8 +2,8 @@
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Features: Taskbar Click Toggle (Bring to Front / Send to Back / Minimize),
-          Custom Taskbar Application Icon, Enter Key Screenshare Trigger,
+Features: Onedir Hot-Replaceable Script Bootstrap, Taskbar Click Toggle,
+          Custom Application Icon, Enter Key Screenshare Trigger,
           Save IP to history.json ONLY on Success, Strict Always-On-Top Enforcer,
           Highly-Visible Collapsed Mini Pill (Hover-Illuminated, 30% Base Opacity),
           RDP-Level Quality (4:4:4 Chroma Subsampling, Crisp Text Rendering),
@@ -14,11 +14,28 @@ Features: Taskbar Click Toggle (Bring to Front / Send to Back / Minimize),
 import ctypes
 import json
 import os
+import runpy
 import socket
 import struct
 import sys
 import time
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Onedir Dynamic Script Loader (Allows replacing sender.py without recompiling)
+# ---------------------------------------------------------------------------
+if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP") != "1":
+    _app_dir = os.path.dirname(os.path.abspath(sys.executable))
+    _external_script = os.path.join(_app_dir, "sender.py")
+    if os.path.exists(_external_script):
+        try:
+            os.environ["_MRCOOPERS_BOOTSTRAP"] = "1"
+            runpy.run_path(_external_script, run_name="__main__")
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as _ex:
+            print(f"[BOOTSTRAP ERROR] Failed to run external sender.py: {_ex}")
 
 import cv2
 import mss
@@ -95,7 +112,7 @@ if sys.platform == "win32":
 
 
 def get_app_directory() -> str:
-    """Returns the base directory where sender is running (works for scripts and frozen executables)."""
+    """Returns the base directory where sender is running."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
@@ -307,7 +324,7 @@ class UniversalInputInjector:
 class DiscoveryListenerThread(QThread):
     """Listens for Receiver beacons on LAN."""
 
-    device_found = Signal(str, bool)  # ip, pin_required
+    device_found = Signal(str, bool)
 
     def __init__(self):
         super().__init__()
@@ -655,7 +672,6 @@ class FloatingSenderWindow(QWidget):
         self.discovery_thread.start()
 
     def _init_window(self):
-        # Enable Window minimize hint so OS taskbars know how to toggle minimize/restore
         self.setWindowFlags(
             Qt.Window
             | Qt.FramelessWindowHint
@@ -665,7 +681,6 @@ class FloatingSenderWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setWindowOpacity(0.94)
 
-        # Inject WS_MINIMIZEBOX and WS_SYSMENU on Windows so taskbar clicks minimize & restore
         if sys.platform == "win32":
             try:
                 hwnd = int(self.winId())
@@ -708,7 +723,6 @@ class FloatingSenderWindow(QWidget):
         """Handles taskbar minimize and restore state toggling cleanly."""
         if event.type() == QEvent.WindowStateChange:
             if not self.isMinimized():
-                # Re-assert topmost and opacity when restored from taskbar
                 self.enforce_always_on_top()
                 if not self.is_mini_mode:
                     self.setWindowOpacity(self.opacity_slider.value() / 100.0)

@@ -2,8 +2,9 @@
 
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
-Features: UDP Broadcast Beacon, 4-Digit PIN Authentication, Multi-Touch Canvas,
-          High-Fidelity RDP-Tier Direct Pixel Rendering, 2MB Socket Buffers,
+Features: Onedir Hot-Replaceable Script Bootstrap, UDP Broadcast Beacon,
+          4-Digit PIN Authentication, Multi-Touch Canvas, High-Fidelity
+          RDP-Tier Direct Pixel Rendering, 2MB Socket Buffers,
           Rotating File Logging, Non-blocking Clean Thread Shutdown.
 """
 
@@ -11,11 +12,28 @@ import json
 import logging
 import os
 import random
+import runpy
 import socket
 import struct
 import sys
 import time
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Onedir Dynamic Script Loader (Allows replacing receiver.py without recompiling)
+# ---------------------------------------------------------------------------
+if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP_REC") != "1":
+    _app_dir = os.path.dirname(os.path.abspath(sys.executable))
+    _external_script = os.path.join(_app_dir, "receiver.py")
+    if os.path.exists(_external_script):
+        try:
+            os.environ["_MRCOOPERS_BOOTSTRAP_REC"] = "1"
+            runpy.run_path(_external_script, run_name="__main__")
+            sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as _ex:
+            print(f"[BOOTSTRAP ERROR] Failed to run external receiver.py: {_ex}")
 
 import cv2
 import numpy as np
@@ -527,7 +545,6 @@ class TouchDisplayCanvas(QWidget):
         if self.current_frame:
             vx, vy, vw, vh = self._get_video_rect()
             if vw == self.current_frame.width() and vh == self.current_frame.height():
-                # Direct 1:1 pixel drawing without scaling interpolation
                 painter.drawPixmap(vx, vy, self.current_frame)
             else:
                 scaled = self.current_frame.scaled(

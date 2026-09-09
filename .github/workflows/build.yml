@@ -1,3 +1,5 @@
+#################### START OF FILE: .github/workflows/build.yml ####################
+
 name: Build MrCoopersScreenShare Executables
 
 on:
@@ -10,20 +12,20 @@ on:
 
 jobs:
   # =========================================================================
-  # 1. Build Windows Binaries (sender.exe & receiver.exe)
+  # 1. Build Windows Onedir Packages (sender & receiver)
   # =========================================================================
   build-windows:
-    name: Build Windows EXEs
+    name: Build Windows Onedir Packages
     runs-on: windows-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.14.6
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14.6"
+          python-version: "3.12"
           cache: "pip"
 
       - name: Install Python Dependencies
@@ -31,9 +33,9 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install PySide6 opencv-python-headless mss sounddevice numpy pynput pyinstaller
 
-      - name: Build sender.exe with PyInstaller
+      - name: Build sender (onedir) with PyInstaller
         run: |
-          pyinstaller --noconsole --onefile `
+          pyinstaller --noconsole --onedir `
             --name "sender" `
             --hidden-import "sounddevice" `
             --hidden-import "pynput" `
@@ -43,29 +45,39 @@ jobs:
             --hidden-import "cv2" `
             sender.py
 
-      - name: Build receiver.exe with PyInstaller
+      - name: Build receiver (onedir) with PyInstaller
         run: |
-          pyinstaller --noconsole --onefile `
+          pyinstaller --noconsole --onedir `
             --name "receiver" `
             --hidden-import "sounddevice" `
             --hidden-import "mss" `
             --hidden-import "cv2" `
             receiver.py
 
+      - name: Bundle raw scripts & create portable ZIP archives
+        run: |
+          # Copy source scripts into output folders so users can directly edit/replace them
+          Copy-Item "sender.py" -Destination "dist\sender\sender.py"
+          Copy-Item "receiver.py" -Destination "dist\receiver\receiver.py"
+
+          # Compress to zip files for distribution
+          Compress-Archive -Path "dist\sender" -DestinationPath "dist\MrCoopersScreenShare-Sender-Windows.zip"
+          Compress-Archive -Path "dist\receiver" -DestinationPath "dist\MrCoopersScreenShare-Receiver-Windows.zip"
+
       - name: Upload Windows Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: windows-executables
+          name: windows-onedir-packages
           path: |
-            dist/sender.exe
-            dist/receiver.exe
+            dist/MrCoopersScreenShare-Sender-Windows.zip
+            dist/MrCoopersScreenShare-Receiver-Windows.zip
           retention-days: 14
 
   # =========================================================================
-  # 2. Build Linux AppImage (Sender Script)
+  # 2. Build Linux Standalone Packages (Sender Script)
   # =========================================================================
-  build-linux-appimage:
-    name: Build Linux Sender AppImage
+  build-linux:
+    name: Build Linux Onedir & AppImage
     runs-on: ubuntu-latest
 
     steps:
@@ -75,12 +87,12 @@ jobs:
       - name: Install Linux System Libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libportaudio2 libpulse-dev wget file
+          sudo apt-get install -y libasound2-dev libportaudio2 libpulse-dev wget file zip
 
-      - name: Set up Python 3.14.6
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14.6"
+          python-version: "3.12"
           cache: "pip"
 
       - name: Install Python Dependencies
@@ -88,9 +100,9 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install PySide6 opencv-python-headless mss sounddevice numpy evdev pyinstaller
 
-      - name: Build Standalone Binary with PyInstaller
+      - name: Build onedir package with PyInstaller
         run: |
-          pyinstaller --noconsole --onefile \
+          pyinstaller --noconsole --onedir \
             --name "sender" \
             --hidden-import "sounddevice" \
             --hidden-import "evdev" \
@@ -98,16 +110,18 @@ jobs:
             --hidden-import "cv2" \
             sender.py
 
+          # Copy editable script into directory
+          cp sender.py dist/sender/sender.py
+          cd dist && zip -r MrCoopersScreenShare-Sender-Linux.zip sender/ && cd ..
+
       - name: Package as AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
-          # 1. Prepare AppDir structure
           mkdir -p AppDir/usr/bin
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
-          cp dist/sender AppDir/usr/bin/sender
+          cp -r dist/sender/* AppDir/usr/bin/
 
-          # 2. Create Desktop Entry
           cat << 'EOF' > AppDir/mrcoopers-sender.desktop
           [Desktop Entry]
           Type=Application
@@ -119,7 +133,6 @@ jobs:
           Terminal=false
           EOF
 
-          # 3. Create generic application icon (SVG)
           cat << 'EOF' > AppDir/mrcoopers-sender.svg
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
             <rect width="64" height="64" rx="14" fill="#0078d4"/>
@@ -129,7 +142,6 @@ jobs:
           cp AppDir/mrcoopers-sender.svg AppDir/.DirIcon
           cp AppDir/mrcoopers-sender.svg AppDir/usr/share/icons/hicolor/256x256/apps/mrcoopers-sender.svg
 
-          # 4. Create AppRun launcher
           cat << 'EOF' > AppDir/AppRun
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "${0}")")"
@@ -137,17 +149,18 @@ jobs:
           EOF
           chmod +x AppDir/AppRun
 
-          # 5. Download and execute appimagetool
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
 
           ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir MrCoopersScreenShare-Sender-x86_64.AppImage
 
-      - name: Upload AppImage Artifact
+      - name: Upload Linux Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-sender-appimage
-          path: MrCoopersScreenShare-Sender-x86_64.AppImage
+          name: linux-packages
+          path: |
+            dist/MrCoopersScreenShare-Sender-Linux.zip
+            MrCoopersScreenShare-Sender-x86_64.AppImage
           retention-days: 14
 
   # =========================================================================
@@ -155,7 +168,7 @@ jobs:
   # =========================================================================
   create-release:
     name: Publish Release Assets
-    needs: [build-windows, build-linux-appimage]
+    needs: [build-windows, build-linux]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -165,21 +178,23 @@ jobs:
       - name: Download Windows Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: windows-executables
+          name: windows-onedir-packages
           path: release-assets
 
-      - name: Download Linux Artifact
+      - name: Download Linux Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: linux-sender-appimage
+          name: linux-packages
           path: release-assets
 
       - name: Create Release and Upload Files
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/sender.exe
-            release-assets/receiver.exe
+            release-assets/MrCoopersScreenShare-Sender-Windows.zip
+            release-assets/MrCoopersScreenShare-Receiver-Windows.zip
+            release-assets/MrCoopersScreenShare-Sender-Linux.zip
             release-assets/MrCoopersScreenShare-Sender-x86_64.AppImage
           draft: false
           prerelease: false
+          compression-level: 6
