@@ -1,12 +1,14 @@
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
-Accepts multi-touch/mouse gestures, plays live stereo sound, and renders screen mirror.
+Features: UDP Broadcast Beacon, 4-Digit PIN Authentication, Multi-Touch Canvas.
 """
 
 import json
+import random
 import socket
 import struct
 import sys
+import time
 from typing import Optional
 
 import cv2
@@ -15,6 +17,8 @@ from PySide6.QtCore import QEvent, QPointF, Qt, QThread, Signal
 from PySide6.QtGui import QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QStackedWidget,
@@ -32,6 +36,7 @@ except Exception:
 VIDEO_PORT = 9988
 CONTROL_PORT = 9989
 AUDIO_PORT = 9990
+DISCOVERY_PORT = 9991
 SAMPLE_RATE = 44100
 CHANNELS = 2
 
@@ -48,8 +53,42 @@ def get_local_ip() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Server Threads
+# Server & Beacon Threads
 # ---------------------------------------------------------------------------
+
+
+class DiscoveryBeaconThread(QThread):
+    """Periodically broadcasts receiver IP & PIN requirement across the LAN."""
+
+    def __init__(self, get_pin_func, get_pin_req_func):
+        super().__init__()
+        self.get_pin_func = get_pin_func
+        self.get_pin_req_func = get_pin_req_func
+        self.running = True
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        while self.running:
+            try:
+                local_ip = get_local_ip()
+                payload = json.dumps(
+                    {
+                        "service": "MrCoopersScreenShare",
+                        "ip": local_ip,
+                        "pin_required": self.get_pin_req_func(),
+                    }
+                ).encode("utf-8")
+                sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
+            except Exception:
+                pass
+            self.msleep(1500)
+        sock.close()
+
+    def stop(self):
+        self.running = False
+        self.wait()
 
 
 class VideoServerThread(QThread):
@@ -57,9 +96,13 @@ class VideoServerThread(QThread):
     client_connected = Signal(str)
     client_disconnected = Signal()
 
-    def __init__(self, port: int = VIDEO_PORT):
+    def __init__(
+        self, get_pin_func, get_pin_req_func, port: int = VIDEO_PORT
+    ):
         super().__init__()
         self.port = port
+        self.get_pin_func = get_pin_func
+        self.get_pin_req_func = get_pin_req_func
         self.running = True
         self.server_sock: Optional[socket.socket] = None
 
@@ -72,10 +115,40 @@ class VideoServerThread(QThread):
         while self.running:
             try:
                 conn, addr = self.server_sock.accept()
-                self.client_connected.emit(addr[0])
-                self._handle_client(conn)
+                if self._verify_handshake(conn):
+                    self.client_connected.emit(addr[0])
+                    self._handle_client(conn)
+                else:
+                    conn.close()
             except Exception:
                 break
+
+    def _verify_handshake(self, conn: socket.socket) -> bool:
+        """Verifies 4-digit PIN if PIN requirement is active."""
+        try:
+            conn.settimeout(5.0)
+            header = conn.recv(4)
+            if not header:
+                return False
+            size = struct.unpack(">L", header)[0]
+            data = json.loads(conn.recv(size).decode("utf-8"))
+
+            pin_req = self.get_pin_req_func()
+            client_pin = data.get("pin", "")
+
+            if pin_req and client_pin != self.get_pin_func():
+                resp = json.dumps(
+                    {"auth": False, "msg": "Incorrect PIN"}
+                ).encode("utf-8")
+                conn.sendall(struct.pack(">L", len(resp)) + resp)
+                return False
+
+            resp = json.dumps({"auth": True}).encode("utf-8")
+            conn.sendall(struct.pack(">L", len(resp)) + resp)
+            conn.settimeout(None)
+            return True
+        except Exception:
+            return False
 
     def _handle_client(self, conn: socket.socket):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -210,7 +283,7 @@ class ControlServerThread(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Canvas & Display GUI
+# Canvas & Main Window
 # ---------------------------------------------------------------------------
 
 
@@ -333,35 +406,73 @@ class ReceiverMainWindow(QMainWindow):
         self.setWindowTitle("MrCoopersScreenShare - Receiver")
         self.resize(1280, 800)
 
+        # Generate 4-digit PIN for session
+        self.pin = str(random.randint(1000, 9999))
+
         self.control_thread = ControlServerThread()
         self.audio_thread = AudioServerThread()
-        self.video_thread = VideoServerThread()
+        self.video_thread = VideoServerThread(
+            self.get_pin, self.is_pin_required
+        )
+        self.beacon_thread = DiscoveryBeaconThread(
+            self.get_pin, self.is_pin_required
+        )
 
         self.video_thread.frame_received.connect(self.on_frame)
         self.video_thread.client_connected.connect(self.on_connected)
         self.video_thread.client_disconnected.connect(self.on_disconnected)
 
-        for th in (self.control_thread, self.audio_thread, self.video_thread):
+        for th in (
+            self.control_thread,
+            self.audio_thread,
+            self.video_thread,
+            self.beacon_thread,
+        ):
             th.start()
 
+        self._setup_ui()
+
+    def get_pin(self) -> str:
+        return self.pin
+
+    def is_pin_required(self) -> bool:
+        return self.pin_req_cb.isChecked()
+
+    def _setup_ui(self):
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
+        # Standby View
         self.standby = QWidget()
         self.standby.setStyleSheet("background-color: #12161f;")
         sb_layout = QVBoxLayout(self.standby)
         sb_layout.setAlignment(Qt.AlignCenter)
+        sb_layout.setSpacing(14)
 
         title = QLabel("MrCoopersScreenShare")
-        title.setFont(QFont("Segoe UI", 32, QFont.Bold))
+        title.setFont(QFont("Segoe UI", 34, QFont.Bold))
         title.setStyleSheet("color: #00a2ed;")
+
         ip_lbl = QLabel(f"Display IP: {get_local_ip()}")
         ip_lbl.setFont(QFont("Segoe UI", 22))
         ip_lbl.setStyleSheet("color: #ffffff;")
 
+        pin_lbl = QLabel(f"PIN: {self.pin}")
+        pin_lbl.setFont(QFont("Segoe UI", 28, QFont.Bold))
+        pin_lbl.setStyleSheet("color: #00d084; letter-spacing: 4px;")
+
+        self.pin_req_cb = QCheckBox("Require 4-digit PIN to Connect")
+        self.pin_req_cb.setChecked(False)  # Unchecked = Instant Auto-Connect
+        self.pin_req_cb.setStyleSheet(
+            "color: #8f9bb3; font-size: 14px; margin-top: 10px;"
+        )
+
         sb_layout.addWidget(title, alignment=Qt.AlignCenter)
         sb_layout.addWidget(ip_lbl, alignment=Qt.AlignCenter)
+        sb_layout.addWidget(pin_lbl, alignment=Qt.AlignCenter)
+        sb_layout.addWidget(self.pin_req_cb, alignment=Qt.AlignCenter)
 
+        # Canvas View
         self.canvas = TouchDisplayCanvas(self.control_thread)
         self.stack.addWidget(self.standby)
         self.stack.addWidget(self.canvas)
@@ -380,6 +491,7 @@ class ReceiverMainWindow(QMainWindow):
         self.video_thread.stop()
         self.audio_thread.stop()
         self.control_thread.stop()
+        self.beacon_thread.stop()
         event.accept()
 
 

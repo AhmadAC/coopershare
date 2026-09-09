@@ -1,9 +1,9 @@
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Supports: Windows, Linux (X11 & Wayland / Fedora Kinoite).
-Default Streaming: 60 FPS with Adaptive Frame Timing.
+Features: Auto-Discovery, Auto-Connect, Optional PIN, Taskbar Support, 60 FPS.
 """
 
+import ctypes
 import json
 import socket
 import struct
@@ -15,14 +15,16 @@ import cv2
 import mss
 import numpy as np
 from PySide6.QtCore import QPoint, Qt, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QAction, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QSlider,
     QVBoxLayout,
@@ -57,17 +59,26 @@ if not USE_EVDEV:
 VIDEO_PORT = 9988
 CONTROL_PORT = 9989
 AUDIO_PORT = 9990
+DISCOVERY_PORT = 9991
 SAMPLE_RATE = 44100
 CHANNELS = 2
 
+# Ensure proper Windows Taskbar Grouping & Icon
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "mrcoopers.screenshare.sender.1"
+        )
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
-# Cross-Platform Input Injector (Wayland uinput + Windows/X11 pynput)
+# Cross-Platform Input Injector
 # ---------------------------------------------------------------------------
 
 
 class UniversalInputInjector:
-    """Injects mouse and touch events cross-platform."""
 
     def __init__(self, screen_w: int, screen_h: int):
         self.screen_w = screen_w
@@ -125,7 +136,6 @@ class UniversalInputInjector:
             if nx is not None and ny is not None:
                 self.ui.write(e.EV_ABS, e.ABS_X, int(nx * self.screen_w))
                 self.ui.write(e.EV_ABS, e.ABS_Y, int(ny * self.screen_h))
-
             if ev_type in ("touch_down", "mouse_down"):
                 btn = (
                     e.BTN_RIGHT
@@ -151,7 +161,6 @@ class UniversalInputInjector:
                     int(nx * self.screen_w),
                     int(ny * self.screen_h),
                 )
-
             if ev_type in ("touch_down", "mouse_down"):
                 btn = (
                     Button.right
@@ -175,16 +184,65 @@ class UniversalInputInjector:
 
 
 # ---------------------------------------------------------------------------
-# Background Streaming & Control Threads
+# Background Threads (Discovery, Screen, Audio, Input)
 # ---------------------------------------------------------------------------
+
+
+class DiscoveryListenerThread(QThread):
+    """Listens for Receiver beacons on LAN."""
+
+    device_found = Signal(str, bool)  # ip, pin_required
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+
+    def run(self):
+        sock = socket.socket(
+            socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
+        )
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except Exception:
+                pass
+        sock.settimeout(1.0)
+        try:
+            sock.bind(("", DISCOVERY_PORT))
+        except Exception:
+            return
+
+        while self.running:
+            try:
+                data, _ = sock.recvfrom(1024)
+                payload = json.loads(data.decode("utf-8"))
+                if payload.get("service") == "MrCoopersScreenShare":
+                    self.device_found.emit(
+                        payload["ip"], payload.get("pin_required", False)
+                    )
+            except (socket.timeout, Exception):
+                continue
+        sock.close()
+
+    def stop(self):
+        self.running = False
+        self.wait()
 
 
 class ScreenSenderThread(QThread):
     status_changed = Signal(str, bool)
 
-    def __init__(self, target_ip: str, quality: int = 65, fps_limit: int = 60):
+    def __init__(
+        self,
+        target_ip: str,
+        pin: str = "",
+        quality: int = 65,
+        fps_limit: int = 60,
+    ):
         super().__init__()
         self.target_ip = target_ip
+        self.pin = pin
         self.quality = quality
         self.fps_limit = fps_limit
         self.running = True
@@ -194,10 +252,31 @@ class ScreenSenderThread(QThread):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(5.0)
             sock.connect((self.target_ip, VIDEO_PORT))
+
+            # Handshake with PIN
+            handshake = json.dumps({"pin": self.pin}).encode("utf-8")
+            sock.sendall(struct.pack(">L", len(handshake)) + handshake)
+
+            # Wait for handshake response
+            resp_raw = sock.recv(4)
+            if not resp_raw:
+                raise ConnectionError("Server rejected connection.")
+            resp_len = struct.unpack(">L", resp_raw)[0]
+            resp = json.loads(sock.recv(resp_len).decode("utf-8"))
+
+            if not resp.get("auth", False):
+                self.status_changed.emit(
+                    f"Error: {resp.get('msg', 'Auth Failed')}", False
+                )
+                sock.close()
+                return
+
+            sock.settimeout(None)
             self.status_changed.emit(f"Streaming ({self.fps_limit} FPS)", True)
         except Exception as e:
-            self.status_changed.emit(f"Stream Error: {e}", False)
+            self.status_changed.emit(f"Connect Error: {e}", False)
             return
 
         target_frame_time = 1.0 / max(1, self.fps_limit)
@@ -213,7 +292,6 @@ class ScreenSenderThread(QThread):
                     self.msleep(100)
                     continue
 
-                # Screen capture & compression
                 img = np.array(sct.grab(monitor))
                 bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                 success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
@@ -225,7 +303,6 @@ class ScreenSenderThread(QThread):
                     except Exception:
                         break
 
-                # Precise Adaptive Frame-Rate Timing
                 elapsed = time.perf_counter() - t_start
                 sleep_sec = target_frame_time - elapsed
                 if sleep_sec > 0:
@@ -357,13 +434,21 @@ class FloatingSenderWindow(QWidget):
         self.is_expanded = False
         self.is_paused = False
         self.is_muted = False
+        self.discovered_ip = ""
+        self.pin_required = False
 
         self._init_window()
         self._setup_ui()
 
+        # Start listening for auto-discovery beacon
+        self.discovery_thread = DiscoveryListenerThread()
+        self.discovery_thread.device_found.connect(self.on_device_discovered)
+        self.discovery_thread.start()
+
     def _init_window(self):
+        # Frameless, Always on Top, but visible in Taskbar
         self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.SubWindow
+            Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setWindowOpacity(0.92)
@@ -391,6 +476,7 @@ class FloatingSenderWindow(QWidget):
                 border-radius: 6px; font-weight: bold; font-size: 11px; padding: 6px 12px;
             }
             QPushButton:hover { background-color: #106ebe; }
+            QCheckBox { color: #8f9bb3; font-size: 11px; }
             QSlider::groove:horizontal { height: 4px; background: #333c4e; border-radius: 2px; }
             QSlider::handle:horizontal { background: #00a2ed; width: 12px; margin: -4px 0; border-radius: 6px; }
         """
@@ -403,7 +489,7 @@ class FloatingSenderWindow(QWidget):
         self.header_bar = QWidget()
         h_layout = QHBoxLayout(self.header_bar)
         h_layout.setContentsMargins(0, 0, 0, 0)
-        h_layout.setSpacing(8)
+        h_layout.setSpacing(6)
 
         self.status_dot = QLabel("●")
         self.status_dot.setStyleSheet("color: #8f9bb3; font-size: 14px;")
@@ -417,10 +503,18 @@ class FloatingSenderWindow(QWidget):
         )
         self.expand_btn.clicked.connect(self.toggle_expand)
 
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedSize(24, 24)
+        self.close_btn.setStyleSheet(
+            "background: #332228; color: #ff6b6b; border-radius: 12px; padding: 0px;"
+        )
+        self.close_btn.clicked.connect(self.close)
+
         h_layout.addWidget(self.status_dot)
         h_layout.addWidget(self.title_lbl)
         h_layout.addStretch()
         h_layout.addWidget(self.expand_btn)
+        h_layout.addWidget(self.close_btn)
 
         self.card_layout.addWidget(self.header_bar)
 
@@ -430,14 +524,14 @@ class FloatingSenderWindow(QWidget):
         p_layout.setContentsMargins(0, 4, 0, 0)
         p_layout.setSpacing(8)
 
-        # Target IP + FPS Selector + Share Button
+        # Row 1: Target IP + FPS Selector + Share Button
         ip_row = QHBoxLayout()
         self.ip_input = QLineEdit()
         self.ip_input.setPlaceholderText("Receiver IP (e.g. 192.168.1.5)")
 
         self.fps_combo = QComboBox()
         self.fps_combo.addItems(["60 FPS", "30 FPS"])
-        self.fps_combo.setCurrentIndex(0)  # Default 60 FPS
+        self.fps_combo.setCurrentIndex(0)
 
         self.connect_btn = QPushButton("Share")
         self.connect_btn.clicked.connect(self.toggle_connect)
@@ -447,7 +541,22 @@ class FloatingSenderWindow(QWidget):
         ip_row.addWidget(self.connect_btn)
         p_layout.addLayout(ip_row)
 
-        # Action Buttons
+        # Row 2: Auto-connect toggle + Optional PIN input
+        auto_row = QHBoxLayout()
+        self.auto_connect_cb = QCheckBox("Auto-Connect")
+        self.auto_connect_cb.setChecked(True)
+
+        self.pin_input = QLineEdit()
+        self.pin_input.setPlaceholderText("PIN (if required)")
+        self.pin_input.setMaxLength(4)
+        self.pin_input.setFixedWidth(110)
+
+        auto_row.addWidget(self.auto_connect_cb)
+        auto_row.addStretch()
+        auto_row.addWidget(self.pin_input)
+        p_layout.addLayout(auto_row)
+
+        # Row 3: Action Buttons
         btn_row = QHBoxLayout()
         self.pause_btn = QPushButton("⏸ Pause")
         self.pause_btn.clicked.connect(self.toggle_pause)
@@ -461,7 +570,7 @@ class FloatingSenderWindow(QWidget):
         btn_row.addWidget(self.mute_btn)
         p_layout.addLayout(btn_row)
 
-        # Opacity Slider
+        # Row 4: Opacity Slider
         trans_row = QHBoxLayout()
         trans_row.addWidget(QLabel("Opacity:"))
         self.opacity_slider = QSlider(Qt.Horizontal)
@@ -479,6 +588,7 @@ class FloatingSenderWindow(QWidget):
         self.control_panel.setVisible(False)
         self.adjustSize()
 
+    # Drag Handler with Wayland Compositor fallback
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             handle = self.windowHandle()
@@ -499,11 +609,34 @@ class FloatingSenderWindow(QWidget):
             self.move(event.globalPosition().toPoint() - self._drag_pos)
             event.accept()
 
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.setStyleSheet("background-color: #262c3b; color: white;")
+        quit_action = QAction("Exit MrCoopersScreenShare", self)
+        quit_action.triggered.connect(self.close)
+        menu.addAction(quit_action)
+        menu.exec(event.globalPos())
+
     def toggle_expand(self):
         self.is_expanded = not self.is_expanded
         self.control_panel.setVisible(self.is_expanded)
         self.expand_btn.setText("▲" if self.is_expanded else "▼")
         self.adjustSize()
+
+    def on_device_discovered(self, ip: str, pin_required: bool):
+        self.discovered_ip = ip
+        self.pin_required = pin_required
+
+        if not self.ip_input.text():
+            self.ip_input.setText(ip)
+
+        # Trigger auto-connect if enabled and not already streaming
+        if (
+            self.auto_connect_cb.isChecked()
+            and (not self.stream_thread or not self.stream_thread.isRunning())
+            and not pin_required
+        ):
+            self.start_sharing()
 
     def toggle_connect(self):
         if self.stream_thread and self.stream_thread.isRunning():
@@ -512,20 +645,24 @@ class FloatingSenderWindow(QWidget):
             self.start_sharing()
 
     def start_sharing(self):
-        target_ip = self.ip_input.text().strip()
+        target_ip = self.ip_input.text().strip() or self.discovered_ip
         if not target_ip:
             return
 
         chosen_fps = 60 if self.fps_combo.currentIndex() == 0 else 30
-        self.fps_combo.setEnabled(False)
+        pin_code = self.pin_input.text().strip()
 
+        self.fps_combo.setEnabled(False)
         self.connect_btn.setText("Stop")
         self.connect_btn.setStyleSheet("background-color: #d83b01;")
         self.pause_btn.setEnabled(True)
         self.mute_btn.setEnabled(True)
 
         self.stream_thread = ScreenSenderThread(
-            target_ip=target_ip, quality=65, fps_limit=chosen_fps
+            target_ip=target_ip,
+            pin=pin_code,
+            quality=65,
+            fps_limit=chosen_fps,
         )
         self.stream_thread.status_changed.connect(self.on_stream_status)
         self.stream_thread.start()
@@ -569,6 +706,12 @@ class FloatingSenderWindow(QWidget):
         )
         if not active:
             self.stop_sharing()
+
+    def closeEvent(self, event):
+        self.stop_sharing()
+        if self.discovery_thread:
+            self.discovery_thread.stop()
+        event.accept()
 
 
 if __name__ == "__main__":
