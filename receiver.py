@@ -3,6 +3,7 @@
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
 Features: UDP Broadcast Beacon, 4-Digit PIN Authentication, Multi-Touch Canvas,
+          High-Fidelity RDP-Tier Direct Pixel Rendering, 2MB Socket Buffers,
           Rotating File Logging, Non-blocking Clean Thread Shutdown.
 """
 
@@ -71,6 +72,7 @@ AUDIO_PORT = 9990
 DISCOVERY_PORT = 9991
 SAMPLE_RATE = 44100
 CHANNELS = 2
+SOCKET_BUFFER_SIZE = 2 * 1024 * 1024  # 2MB High Throughput Buffer
 
 
 def get_local_ip() -> str:
@@ -140,7 +142,6 @@ class DiscoveryBeaconThread(QThread):
             except Exception as e:
                 logger.error(f"Discovery broadcast error: {e}")
 
-            # Sleep in small slices for instant interruption on stop
             for _ in range(15):
                 if not self.running:
                     break
@@ -169,9 +170,14 @@ class VideoServerThread(QThread):
         self.server_sock: Optional[socket.socket] = None
 
     def run(self):
-        logger.info(f"Video Server binding to 0.0.0.0:{self.port}...")
+        logger.info(f"Video Server binding to 0.0.0.0:{self.port} (RDP-Quality mode)...")
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_SIZE)
+        except Exception as e:
+            logger.warning(f"Could not expand socket receive buffer: {e}")
+
         self.server_sock.bind(("0.0.0.0", self.port))
         self.server_sock.listen(1)
         self.server_sock.settimeout(0.5)
@@ -247,6 +253,11 @@ class VideoServerThread(QThread):
 
     def _handle_client(self, conn: socket.socket, client_ip: str):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_SIZE)
+        except Exception:
+            pass
+
         conn.settimeout(0.5)
         payload_size = struct.calcsize(">L")
         data = bytearray()
@@ -261,7 +272,7 @@ class VideoServerThread(QThread):
                     if not self.running:
                         break
                     try:
-                        packet = conn.recv(65536)
+                        packet = conn.recv(131072)
                         if not packet:
                             raise ConnectionResetError("Connection closed by sender.")
                         data.extend(packet)
@@ -278,7 +289,7 @@ class VideoServerThread(QThread):
                     if not self.running:
                         break
                     try:
-                        packet = conn.recv(min(msg_size - len(data), 65536))
+                        packet = conn.recv(min(msg_size - len(data), 131072))
                         if not packet:
                             raise ConnectionResetError("Connection dropped during frame transfer.")
                         data.extend(packet)
@@ -510,12 +521,19 @@ class TouchDisplayCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
         if self.current_frame:
             vx, vy, vw, vh = self._get_video_rect()
-            scaled = self.current_frame.scaled(
-                vw, vh, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            painter.drawPixmap(vx, vy, scaled)
+            if vw == self.current_frame.width() and vh == self.current_frame.height():
+                # Direct 1:1 pixel drawing without scaling interpolation
+                painter.drawPixmap(vx, vy, self.current_frame)
+            else:
+                scaled = self.current_frame.scaled(
+                    vw, vh, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                painter.drawPixmap(vx, vy, scaled)
 
     def event(self, event: QEvent) -> bool:
         if event.type() in (
@@ -591,7 +609,7 @@ class ReceiverMainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MrCoopersScreenShare - Receiver")
+        self.setWindowTitle("MrCoopersScreenShare - Receiver (RDP Quality)")
         self.resize(1280, 800)
 
         # Generate 4-digit PIN for session

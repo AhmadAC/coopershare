@@ -2,8 +2,9 @@
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Features: Auto-Discovery, Robust Auto-Connect, Optional PIN Auth, Taskbar Support,
-          60 FPS, Deprecation-free MSS, High-Speed Low Latency Streaming.
+Features: RDP-Level Quality (4:4:4 Chroma Subsampling, Crisp Text Rendering),
+          Ultra-Compact Circular Mini-Bubble Mode, High-Throughput 2MB TCP Socket,
+          Auto-Discovery, Robust Auto-Connect, Optional PIN Auth, 60 FPS.
 """
 
 import ctypes
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QSlider,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -66,6 +68,7 @@ AUDIO_PORT = 9990
 DISCOVERY_PORT = 9991
 SAMPLE_RATE = 44100
 CHANNELS = 2
+SOCKET_BUFFER_SIZE = 2 * 1024 * 1024  # 2MB High-Fidelity Buffer
 
 # Ensure proper Windows Taskbar Grouping & Icon
 if sys.platform == "win32":
@@ -279,22 +282,32 @@ class ScreenSenderThread(QThread):
         self,
         target_ip: str,
         pin: str = "",
-        quality: int = 65,
+        quality: int = 95,
         fps_limit: int = 60,
+        use_444_chroma: bool = True,
     ):
         super().__init__()
         self.target_ip = target_ip
         self.pin = pin
         self.quality = quality
         self.fps_limit = fps_limit
+        self.use_444_chroma = use_444_chroma
         self.running = True
         self.paused = False
 
     def run(self):
-        print(f"[DEBUG Sender Video] Connecting to {self.target_ip}:{VIDEO_PORT} (PIN: '{self.pin}')...")
+        print(
+            f"[DEBUG Sender Video] Connecting to {self.target_ip}:{VIDEO_PORT} "
+            f"(PIN: '{self.pin}', Quality: {self.quality}, 4:4:4 Chroma: {self.use_444_chroma})..."
+        )
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_SIZE)
+            except Exception as e:
+                print(f"[DEBUG Sender Video] SO_SNDBUF setting notice: {e}")
+
             sock.settimeout(4.0)
             sock.connect((self.target_ip, VIDEO_PORT))
 
@@ -323,7 +336,7 @@ class ScreenSenderThread(QThread):
                 return
 
             sock.settimeout(None)
-            print(f"[DEBUG Sender Video] Connected & Authorized. Streaming at {self.fps_limit} FPS...")
+            print(f"[DEBUG Sender Video] Connected & Authorized. Streaming at {self.fps_limit} FPS (RDP Ultra Quality)...")
             self.status_changed.emit(f"Streaming ({self.fps_limit} FPS)", True)
         except Exception as e:
             print(f"[DEBUG Sender Video] Connection error: {e}")
@@ -332,9 +345,21 @@ class ScreenSenderThread(QThread):
 
         target_frame_time = 1.0 / max(1, self.fps_limit)
 
+        # Build High-Fidelity RDP-Level Encoding Parameters
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+
+        # Enable JPEG baseline optimization if supported
+        if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
+            encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
+
+        # Enable 4:4:4 Full Chroma Subsampling (Crystal-Clear Text / Zero Color Bleed)
+        if self.use_444_chroma:
+            sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
+            sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
+            encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+
         with create_mss_instance() as sct:
             monitor = sct.monitors[1]
-            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
             while self.running:
                 t_start = time.perf_counter()
@@ -517,7 +542,7 @@ class InputReceiverThread(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Floating Frameless Controller UI
+# Floating Frameless Controller UI (Expanded Card & Mini Circle Bubble)
 # ---------------------------------------------------------------------------
 
 
@@ -530,12 +555,16 @@ class FloatingSenderWindow(QWidget):
         self.audio_thread: Optional[AudioSenderThread] = None
         self.input_thread: Optional[InputReceiverThread] = None
 
-        self._drag_pos = QPoint()
-        self.is_expanded = False
+        self._drag_start_pos = QPoint()
+        self._window_start_pos = QPoint()
+        self._is_dragging = False
+
+        self.is_mini_mode = False
         self.is_paused = False
         self.is_muted = False
         self.discovered_ip = ""
         self.pin_required = False
+        self.status_color = "#8f9bb3"
 
         self._init_window()
         self._setup_ui()
@@ -550,13 +579,19 @@ class FloatingSenderWindow(QWidget):
             Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setWindowOpacity(0.92)
+        self.setWindowOpacity(0.94)
 
     def _setup_ui(self):
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
 
-        self.card = QFrame(self)
+        self.stack = QStackedWidget(self)
+
+        # -------------------------------------------------------------------
+        # View 1: Expanded Full Controller Card
+        # -------------------------------------------------------------------
+        self.card = QFrame()
         self.card.setObjectName("card")
         self.card.setStyleSheet(
             """
@@ -581,7 +616,7 @@ class FloatingSenderWindow(QWidget):
         """
         )
         self.card_layout = QVBoxLayout(self.card)
-        self.card_layout.setContentsMargins(12, 8, 12, 8)
+        self.card_layout.setContentsMargins(12, 10, 12, 10)
         self.card_layout.setSpacing(8)
 
         # Header Pill
@@ -591,16 +626,17 @@ class FloatingSenderWindow(QWidget):
         h_layout.setSpacing(6)
 
         self.status_dot = QLabel("●")
-        self.status_dot.setStyleSheet("color: #8f9bb3; font-size: 14px;")
+        self.status_dot.setStyleSheet(f"color: {self.status_color}; font-size: 14px;")
         self.title_lbl = QLabel("MrCoopersScreenShare")
         self.title_lbl.setStyleSheet("font-weight: bold; color: #00a2ed;")
 
-        self.expand_btn = QPushButton("▼")
-        self.expand_btn.setFixedSize(24, 24)
-        self.expand_btn.setStyleSheet(
+        self.collapse_btn = QPushButton("▼")
+        self.collapse_btn.setToolTip("Collapse to mini floating circle")
+        self.collapse_btn.setFixedSize(24, 24)
+        self.collapse_btn.setStyleSheet(
             "background: #262c3b; border-radius: 12px; padding: 0px;"
         )
-        self.expand_btn.clicked.connect(self.toggle_expand)
+        self.collapse_btn.clicked.connect(self.collapse_to_mini)
 
         self.close_btn = QPushButton("✕")
         self.close_btn.setFixedSize(24, 24)
@@ -612,35 +648,40 @@ class FloatingSenderWindow(QWidget):
         h_layout.addWidget(self.status_dot)
         h_layout.addWidget(self.title_lbl)
         h_layout.addStretch()
-        h_layout.addWidget(self.expand_btn)
+        h_layout.addWidget(self.collapse_btn)
         h_layout.addWidget(self.close_btn)
 
         self.card_layout.addWidget(self.header_bar)
 
-        # Expanded Controls
-        self.control_panel = QWidget()
-        p_layout = QVBoxLayout(self.control_panel)
-        p_layout.setContentsMargins(0, 4, 0, 0)
-        p_layout.setSpacing(8)
-
-        # Row 1: Target IP + FPS Selector + Share Button
+        # Controls
+        # Row 1: Target IP + Share Button
         ip_row = QHBoxLayout()
         self.ip_input = QLineEdit()
         self.ip_input.setPlaceholderText("Receiver IP (e.g. 192.168.1.5)")
-
-        self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["60 FPS", "30 FPS"])
-        self.fps_combo.setCurrentIndex(0)
 
         self.connect_btn = QPushButton("Share")
         self.connect_btn.clicked.connect(self.toggle_connect)
 
         ip_row.addWidget(self.ip_input)
-        ip_row.addWidget(self.fps_combo)
         ip_row.addWidget(self.connect_btn)
-        p_layout.addLayout(ip_row)
+        self.card_layout.addLayout(ip_row)
 
-        # Row 2: Auto-connect toggle + Optional PIN input
+        # Row 2: FPS & RDP-Quality Preset Selector
+        qual_row = QHBoxLayout()
+        self.fps_combo = QComboBox()
+        self.fps_combo.addItems(["60 FPS", "30 FPS"])
+        self.fps_combo.setCurrentIndex(0)
+
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(["Ultra (RDP 4:4:4)", "High Quality (85)", "Balanced (70)"])
+        self.quality_combo.setCurrentIndex(0)
+        self.quality_combo.setToolTip("Ultra uses full 4:4:4 chroma subsampling for crisp RDP-tier text.")
+
+        qual_row.addWidget(self.fps_combo)
+        qual_row.addWidget(self.quality_combo)
+        self.card_layout.addLayout(qual_row)
+
+        # Row 3: Auto-connect toggle + Optional PIN input
         auto_row = QHBoxLayout()
         self.auto_connect_cb = QCheckBox("Auto-Connect")
         self.auto_connect_cb.setChecked(True)
@@ -654,9 +695,9 @@ class FloatingSenderWindow(QWidget):
         auto_row.addWidget(self.auto_connect_cb)
         auto_row.addStretch()
         auto_row.addWidget(self.pin_input)
-        p_layout.addLayout(auto_row)
+        self.card_layout.addLayout(auto_row)
 
-        # Row 3: Action Buttons
+        # Row 4: Action Buttons
         btn_row = QHBoxLayout()
         self.pause_btn = QPushButton("⏸ Pause")
         self.pause_btn.clicked.connect(self.toggle_pause)
@@ -668,60 +709,115 @@ class FloatingSenderWindow(QWidget):
 
         btn_row.addWidget(self.pause_btn)
         btn_row.addWidget(self.mute_btn)
-        p_layout.addLayout(btn_row)
+        self.card_layout.addLayout(btn_row)
 
-        # Row 4: Opacity Slider
+        # Row 5: Opacity Slider
         trans_row = QHBoxLayout()
         trans_row.addWidget(QLabel("Opacity:"))
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(20, 100)
-        self.opacity_slider.setValue(92)
+        self.opacity_slider.setValue(94)
         self.opacity_slider.valueChanged.connect(
             lambda v: self.setWindowOpacity(v / 100.0)
         )
         trans_row.addWidget(self.opacity_slider)
-        p_layout.addLayout(trans_row)
+        self.card_layout.addLayout(trans_row)
 
-        self.card_layout.addWidget(self.control_panel)
-        self.main_layout.addWidget(self.card)
+        # -------------------------------------------------------------------
+        # View 2: Collapsed Mini Circular Dot Indicator (34x34)
+        # -------------------------------------------------------------------
+        self.mini_bubble = QFrame()
+        self.mini_bubble.setObjectName("mini_bubble")
+        self.mini_bubble.setFixedSize(34, 34)
+        self.mini_bubble.setToolTip("MrCoopersScreenShare (Click to expand / Drag to move)")
+        self.mini_bubble.setStyleSheet(
+            """
+            QFrame#mini_bubble {
+                background-color: #1a1e29;
+                border: 2px solid #333c4d;
+                border-radius: 17px;
+            }
+            QFrame#mini_bubble:hover {
+                background-color: #262c3b;
+                border: 2px solid #00a2ed;
+            }
+        """
+        )
+        mini_layout = QVBoxLayout(self.mini_bubble)
+        mini_layout.setContentsMargins(0, 0, 0, 0)
+        mini_layout.setAlignment(Qt.AlignCenter)
 
-        self.control_panel.setVisible(False)
+        self.mini_status_dot = QLabel("●")
+        self.mini_status_dot.setAlignment(Qt.AlignCenter)
+        self.mini_status_dot.setStyleSheet(
+            f"color: {self.status_color}; font-size: 18px; margin-bottom: 2px;"
+        )
+        mini_layout.addWidget(self.mini_status_dot)
+
+        self.stack.addWidget(self.card)
+        self.stack.addWidget(self.mini_bubble)
+
+        self.main_layout.addWidget(self.stack)
+        self.expand_window()
+
+    def collapse_to_mini(self):
+        self.is_mini_mode = True
+        self.stack.setCurrentWidget(self.mini_bubble)
+        self.setFixedSize(34, 34)
+        print("[DEBUG Sender GUI] Collapsed to mini circular bubble mode.")
+
+    def expand_window(self):
+        self.is_mini_mode = False
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        self.stack.setCurrentWidget(self.card)
+        self.card.adjustSize()
         self.adjustSize()
+        print("[DEBUG Sender GUI] Expanded to full controller card.")
 
+    # -----------------------------------------------------------------------
+    # Mouse & Drag Events (Seamless Dragging & Expand on Click)
+    # -----------------------------------------------------------------------
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            handle = self.windowHandle()
-            if (
-                handle
-                and hasattr(handle, "startSystemMove")
-                and handle.startSystemMove()
-            ):
-                event.accept()
-                return
-            self._drag_pos = (
-                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            )
-            event.accept()
+            self._drag_start_pos = event.globalPosition().toPoint()
+            self._window_start_pos = self.pos()
+            self._is_dragging = False
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton and not self._drag_pos.isNull():
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-            event.accept()
+        if event.buttons() == Qt.LeftButton:
+            diff = event.globalPosition().toPoint() - self._drag_start_pos
+            if diff.manhattanLength() > 4:
+                self._is_dragging = True
+                self.move(self._window_start_pos + diff)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            if self.is_mini_mode and not self._is_dragging:
+                self.expand_window()
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         menu.setStyleSheet("background-color: #262c3b; color: white;")
+
+        if self.is_mini_mode:
+            expand_act = QAction("Expand Controls", self)
+            expand_act.triggered.connect(self.expand_window)
+            menu.addAction(expand_act)
+        else:
+            collapse_act = QAction("Collapse to Circle", self)
+            collapse_act.triggered.connect(self.collapse_to_mini)
+            menu.addAction(collapse_act)
+
+        menu.addSeparator()
         quit_action = QAction("Exit MrCoopersScreenShare", self)
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
         menu.exec(event.globalPos())
 
-    def toggle_expand(self):
-        self.is_expanded = not self.is_expanded
-        self.control_panel.setVisible(self.is_expanded)
-        self.expand_btn.setText("▲" if self.is_expanded else "▼")
-        self.adjustSize()
-
+    # -----------------------------------------------------------------------
+    # Streaming & Connection Logic
+    # -----------------------------------------------------------------------
     def on_device_discovered(self, ip: str, pin_required: bool):
         self.discovered_ip = ip
         self.pin_required = pin_required
@@ -739,7 +835,6 @@ class FloatingSenderWindow(QWidget):
                 self.start_sharing()
 
     def on_pin_text_changed(self, text: str):
-        # If user types a complete 4-digit PIN while auto-connect is active, initiate share
         if (
             len(text.strip()) == 4
             and self.auto_connect_cb.isChecked()
@@ -763,9 +858,25 @@ class FloatingSenderWindow(QWidget):
         chosen_fps = 60 if self.fps_combo.currentIndex() == 0 else 30
         pin_code = self.pin_input.text().strip()
 
-        print(f"[DEBUG Sender] Starting stream to {target_ip} (FPS: {chosen_fps}, PIN: '{pin_code}')...")
+        # Quality Preset Mapping
+        quality_idx = self.quality_combo.currentIndex()
+        if quality_idx == 0:
+            target_quality = 95
+            use_444 = True
+        elif quality_idx == 1:
+            target_quality = 85
+            use_444 = True
+        else:
+            target_quality = 70
+            use_444 = False
+
+        print(
+            f"[DEBUG Sender] Starting stream to {target_ip} (FPS: {chosen_fps}, "
+            f"Quality: {target_quality}, 4:4:4 Chroma: {use_444}, PIN: '{pin_code}')..."
+        )
 
         self.fps_combo.setEnabled(False)
+        self.quality_combo.setEnabled(False)
         self.connect_btn.setText("Stop")
         self.connect_btn.setStyleSheet("background-color: #d83b01;")
         self.pause_btn.setEnabled(True)
@@ -774,8 +885,9 @@ class FloatingSenderWindow(QWidget):
         self.stream_thread = ScreenSenderThread(
             target_ip=target_ip,
             pin=pin_code,
-            quality=65,
+            quality=target_quality,
             fps_limit=chosen_fps,
+            use_444_chroma=use_444,
         )
         self.stream_thread.status_changed.connect(self.on_stream_status)
         self.stream_thread.start()
@@ -796,11 +908,13 @@ class FloatingSenderWindow(QWidget):
         self.input_thread = None
 
         self.fps_combo.setEnabled(True)
+        self.quality_combo.setEnabled(True)
         self.connect_btn.setText("Share")
         self.connect_btn.setStyleSheet("background-color: #0078d4;")
         self.pause_btn.setEnabled(False)
         self.mute_btn.setEnabled(False)
-        self.status_dot.setStyleSheet("color: #8f9bb3; font-size: 14px;")
+
+        self._update_status_color("#8f9bb3")
 
     def toggle_pause(self):
         if self.stream_thread:
@@ -818,11 +932,17 @@ class FloatingSenderWindow(QWidget):
 
     def on_stream_status(self, text: str, active: bool):
         print(f"[DEBUG Sender] Stream status updated: '{text}' (active={active})")
-        self.status_dot.setStyleSheet(
-            f"color: {'#00d084' if active else '#d83b01'}; font-size: 14px;"
-        )
+        color = "#00d084" if active else "#d83b01"
+        self._update_status_color(color)
         if not active:
             self.stop_sharing()
+
+    def _update_status_color(self, color_hex: str):
+        self.status_color = color_hex
+        self.status_dot.setStyleSheet(f"color: {color_hex}; font-size: 14px;")
+        self.mini_status_dot.setStyleSheet(
+            f"color: {color_hex}; font-size: 18px; margin-bottom: 2px;"
+        )
 
     def closeEvent(self, event):
         print("[DEBUG Sender] Application closing. Terminating all active threads...")
