@@ -2,13 +2,18 @@
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Features: RDP-Level Quality (4:4:4 Chroma Subsampling, Crisp Text Rendering),
-          Ultra-Compact Circular Mini-Bubble Mode, High-Throughput 2MB TCP Socket,
-          Auto-Discovery, Robust Auto-Connect, Optional PIN Auth, 60 FPS.
+Features: Taskbar Click Toggle (Bring to Front / Send to Back / Minimize),
+          Custom Taskbar Application Icon, Enter Key Screenshare Trigger,
+          Save IP to history.json ONLY on Success, Strict Always-On-Top Enforcer,
+          Highly-Visible Collapsed Mini Pill (Hover-Illuminated, 30% Base Opacity),
+          RDP-Level Quality (4:4:4 Chroma Subsampling, Crisp Text Rendering),
+          High-Throughput 2MB TCP Socket, Auto-Discovery, Robust Auto-Connect,
+          Optional PIN Auth, 60 FPS.
 """
 
 import ctypes
 import json
+import os
 import socket
 import struct
 import sys
@@ -18,8 +23,17 @@ from typing import Optional
 import cv2
 import mss
 import numpy as np
-from PySide6.QtCore import QPoint, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QFont, QIcon
+from PySide6.QtCore import QEvent, QPoint, Qt, QThread, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QCursor,
+    QFont,
+    QIcon,
+    QKeyEvent,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -78,6 +92,71 @@ if sys.platform == "win32":
         )
     except Exception:
         pass
+
+
+def get_app_directory() -> str:
+    """Returns the base directory where sender is running (works for scripts and frozen executables)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+HISTORY_FILE_PATH = os.path.join(get_app_directory(), "history.json")
+
+
+def load_ip_from_history() -> str:
+    """Loads the last saved IP from history.json."""
+    if os.path.exists(HISTORY_FILE_PATH):
+        try:
+            with open(HISTORY_FILE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return str(data.get("last_ip", "")).strip()
+        except Exception as e:
+            print(f"[DEBUG Sender] Failed to read history.json: {e}")
+    return ""
+
+
+def save_ip_to_history(ip_address: str):
+    """Saves the IP address to history.json upon successful connection."""
+    ip_clean = ip_address.strip()
+    if not ip_clean:
+        return
+    try:
+        data = {"last_ip": ip_clean}
+        with open(HISTORY_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        print(f"[DEBUG Sender] Successfully connected! Saved '{ip_clean}' to history.json")
+    except Exception as e:
+        print(f"[DEBUG Sender] Failed to write history.json: {e}")
+
+
+def create_application_icon() -> QIcon:
+    """Generates a high-DPI desktop and taskbar icon for MrCoopersScreenShare."""
+    pix = QPixmap(64, 64)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    # Blue Rounded Background Badge
+    painter.setBrush(QColor("#0078d4"))
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
+
+    # White Screen Frame
+    painter.setBrush(QColor("#ffffff"))
+    painter.drawRoundedRect(14, 15, 36, 24, 4, 4)
+
+    # Screen Display Area
+    painter.setBrush(QColor("#1a1e29"))
+    painter.drawRect(18, 19, 28, 16)
+
+    # Screen Stand & Base
+    painter.setBrush(QColor("#ffffff"))
+    painter.drawRect(29, 41, 6, 4)
+    painter.drawRoundedRect(22, 45, 20, 3, 1, 1)
+
+    painter.end()
+    return QIcon(pix)
 
 
 def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
@@ -348,11 +427,9 @@ class ScreenSenderThread(QThread):
         # Build High-Fidelity RDP-Level Encoding Parameters
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
-        # Enable JPEG baseline optimization if supported
         if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
             encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
 
-        # Enable 4:4:4 Full Chroma Subsampling (Crystal-Clear Text / Zero Color Bleed)
         if self.use_444_chroma:
             sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
             sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
@@ -542,7 +619,7 @@ class InputReceiverThread(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Floating Frameless Controller UI (Expanded Card & Mini Circle Bubble)
+# Floating Frameless Controller UI (Taskbar Toggle & Always-On-Top Mini Pill)
 # ---------------------------------------------------------------------------
 
 
@@ -551,6 +628,8 @@ class FloatingSenderWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MrCoopersScreenShare - Sender")
+        self.setWindowIcon(create_application_icon())
+
         self.stream_thread: Optional[ScreenSenderThread] = None
         self.audio_thread: Optional[AudioSenderThread] = None
         self.input_thread: Optional[InputReceiverThread] = None
@@ -568,6 +647,7 @@ class FloatingSenderWindow(QWidget):
 
         self._init_window()
         self._setup_ui()
+        self._load_saved_history()
 
         # Start listening for auto-discovery beacon
         self.discovery_thread = DiscoveryListenerThread()
@@ -575,11 +655,66 @@ class FloatingSenderWindow(QWidget):
         self.discovery_thread.start()
 
     def _init_window(self):
+        # Enable Window minimize hint so OS taskbars know how to toggle minimize/restore
         self.setWindowFlags(
-            Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+            Qt.Window
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowMinimizeButtonHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setWindowOpacity(0.94)
+
+        # Inject WS_MINIMIZEBOX and WS_SYSMENU on Windows so taskbar clicks minimize & restore
+        if sys.platform == "win32":
+            try:
+                hwnd = int(self.winId())
+                GWL_STYLE = -16
+                WS_MINIMIZEBOX = 0x00020000
+                WS_SYSMENU = 0x00080000
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+                ctypes.windll.user32.SetWindowLongW(
+                    hwnd, GWL_STYLE, style | WS_MINIMIZEBOX | WS_SYSMENU
+                )
+            except Exception as e:
+                print(f"[DEBUG Sender Win32] Style init notice: {e}")
+
+        self.enforce_always_on_top()
+
+    def enforce_always_on_top(self):
+        """Hardware/Win32 OS level reinforcement to maintain topmost z-order."""
+        if sys.platform == "win32":
+            try:
+                hwnd = int(self.winId())
+                HWND_TOPMOST = -1
+                SWP_NOMOVE = 0x0002
+                SWP_NOSIZE = 0x0001
+                SWP_NOACTIVATE = 0x0010
+                SWP_SHOWWINDOW = 0x0040
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )
+            except Exception:
+                pass
+        self.raise_()
+
+    def changeEvent(self, event: QEvent):
+        """Handles taskbar minimize and restore state toggling cleanly."""
+        if event.type() == QEvent.WindowStateChange:
+            if not self.isMinimized():
+                # Re-assert topmost and opacity when restored from taskbar
+                self.enforce_always_on_top()
+                if not self.is_mini_mode:
+                    self.setWindowOpacity(self.opacity_slider.value() / 100.0)
+                else:
+                    self.setWindowOpacity(0.35)
+        super().changeEvent(event)
 
     def _setup_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -631,7 +766,7 @@ class FloatingSenderWindow(QWidget):
         self.title_lbl.setStyleSheet("font-weight: bold; color: #00a2ed;")
 
         self.collapse_btn = QPushButton("▼")
-        self.collapse_btn.setToolTip("Collapse to mini floating circle")
+        self.collapse_btn.setToolTip("Collapse to mini floating indicator")
         self.collapse_btn.setFixedSize(24, 24)
         self.collapse_btn.setStyleSheet(
             "background: #262c3b; border-radius: 12px; padding: 0px;"
@@ -658,6 +793,7 @@ class FloatingSenderWindow(QWidget):
         ip_row = QHBoxLayout()
         self.ip_input = QLineEdit()
         self.ip_input.setPlaceholderText("Receiver IP (e.g. 192.168.1.5)")
+        self.ip_input.returnPressed.connect(self.toggle_connect)
 
         self.connect_btn = QPushButton("Share")
         self.connect_btn.clicked.connect(self.toggle_connect)
@@ -690,6 +826,7 @@ class FloatingSenderWindow(QWidget):
         self.pin_input.setPlaceholderText("PIN (if required)")
         self.pin_input.setMaxLength(4)
         self.pin_input.setFixedWidth(110)
+        self.pin_input.returnPressed.connect(self.toggle_connect)
         self.pin_input.textChanged.connect(self.on_pin_text_changed)
 
         auto_row.addWidget(self.auto_connect_cb)
@@ -718,68 +855,109 @@ class FloatingSenderWindow(QWidget):
         self.opacity_slider.setRange(20, 100)
         self.opacity_slider.setValue(94)
         self.opacity_slider.valueChanged.connect(
-            lambda v: self.setWindowOpacity(v / 100.0)
+            lambda v: self.setWindowOpacity(v / 100.0) if not self.is_mini_mode else None
         )
         trans_row.addWidget(self.opacity_slider)
         self.card_layout.addLayout(trans_row)
 
         # -------------------------------------------------------------------
-        # View 2: Collapsed Mini Circular Dot Indicator (34x34)
+        # View 2: Collapsed Mini Pill Indicator (48x16 Hitbox, 30x5 Rounded Bar)
         # -------------------------------------------------------------------
-        self.mini_bubble = QFrame()
-        self.mini_bubble.setObjectName("mini_bubble")
-        self.mini_bubble.setFixedSize(34, 34)
-        self.mini_bubble.setToolTip("MrCoopersScreenShare (Click to expand / Drag to move)")
-        self.mini_bubble.setStyleSheet(
-            """
-            QFrame#mini_bubble {
-                background-color: #1a1e29;
-                border: 2px solid #333c4d;
-                border-radius: 17px;
-            }
-            QFrame#mini_bubble:hover {
-                background-color: #262c3b;
-                border: 2px solid #00a2ed;
-            }
-        """
-        )
-        mini_layout = QVBoxLayout(self.mini_bubble)
+        self.mini_container = QFrame()
+        self.mini_container.setObjectName("mini_container")
+        self.mini_container.setFixedSize(48, 16)
+        self.mini_container.setCursor(Qt.PointingHandCursor)
+        self.mini_container.setToolTip("MrCoopersScreenShare (Always On Top | Click to expand / Drag to move)")
+
+        mini_layout = QVBoxLayout(self.mini_container)
         mini_layout.setContentsMargins(0, 0, 0, 0)
         mini_layout.setAlignment(Qt.AlignCenter)
 
-        self.mini_status_dot = QLabel("●")
-        self.mini_status_dot.setAlignment(Qt.AlignCenter)
-        self.mini_status_dot.setStyleSheet(
-            f"color: {self.status_color}; font-size: 18px; margin-bottom: 2px;"
-        )
-        mini_layout.addWidget(self.mini_status_dot)
+        self.mini_bar = QFrame()
+        self.mini_bar.setObjectName("mini_bar")
+        self.mini_bar.setFixedSize(30, 5)
+        self._update_mini_bar_style()
+
+        mini_layout.addWidget(self.mini_bar)
 
         self.stack.addWidget(self.card)
-        self.stack.addWidget(self.mini_bubble)
+        self.stack.addWidget(self.mini_container)
 
         self.main_layout.addWidget(self.stack)
         self.expand_window()
 
+    def _load_saved_history(self):
+        saved_ip = load_ip_from_history()
+        if saved_ip:
+            self.ip_input.setText(saved_ip)
+            print(f"[DEBUG Sender] Auto-filled saved IP: {saved_ip}")
+
+    def _update_mini_bar_style(self):
+        self.mini_container.setStyleSheet(
+            """
+            QFrame#mini_container {
+                background: transparent;
+            }
+        """
+        )
+        self.mini_bar.setStyleSheet(
+            f"""
+            QFrame#mini_bar {{
+                background-color: {self.status_color};
+                border: 1px solid rgba(255, 255, 255, 0.45);
+                border-radius: 2px;
+            }}
+            QFrame#mini_bar:hover {{
+                background-color: #00a2ed;
+                border: 1px solid #ffffff;
+            }}
+        """
+        )
+
     def collapse_to_mini(self):
         self.is_mini_mode = True
-        self.stack.setCurrentWidget(self.mini_bubble)
-        self.setFixedSize(34, 34)
-        print("[DEBUG Sender GUI] Collapsed to mini circular bubble mode.")
+        self.stack.setCurrentWidget(self.mini_container)
+        self.setWindowOpacity(0.35)
+        self.setFixedSize(48, 16)
+        self.enforce_always_on_top()
+        print("[DEBUG Sender GUI] Collapsed to always-on-top mini floating indicator.")
 
     def expand_window(self):
         self.is_mini_mode = False
         self.setMinimumSize(0, 0)
         self.setMaximumSize(16777215, 16777215)
         self.stack.setCurrentWidget(self.card)
+        self.setWindowOpacity(self.opacity_slider.value() / 100.0)
         self.card.adjustSize()
         self.adjustSize()
-        print("[DEBUG Sender GUI] Expanded to full controller card.")
+        self.enforce_always_on_top()
+        print("[DEBUG Sender GUI] Expanded to full always-on-top controller card.")
 
     # -----------------------------------------------------------------------
-    # Mouse & Drag Events (Seamless Dragging & Expand on Click)
+    # Keyboard & Mouse Events
     # -----------------------------------------------------------------------
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if not self.is_mini_mode:
+                self.toggle_connect()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def enterEvent(self, event):
+        if self.is_mini_mode:
+            self.setWindowOpacity(1.0)
+        self.enforce_always_on_top()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self.is_mini_mode:
+            self.setWindowOpacity(0.35)
+        super().leaveEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self.enforce_always_on_top()
             self._drag_start_pos = event.globalPosition().toPoint()
             self._window_start_pos = self.pos()
             self._is_dragging = False
@@ -787,7 +965,7 @@ class FloatingSenderWindow(QWidget):
     def mouseMoveEvent(self, event):
         if event.buttons() == Qt.LeftButton:
             diff = event.globalPosition().toPoint() - self._drag_start_pos
-            if diff.manhattanLength() > 4:
+            if diff.manhattanLength() > 2:
                 self._is_dragging = True
                 self.move(self._window_start_pos + diff)
 
@@ -795,6 +973,11 @@ class FloatingSenderWindow(QWidget):
         if event.button() == Qt.LeftButton:
             if self.is_mini_mode and not self._is_dragging:
                 self.expand_window()
+            self.enforce_always_on_top()
+
+    def showEvent(self, event):
+        self.enforce_always_on_top()
+        super().showEvent(event)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -805,7 +988,7 @@ class FloatingSenderWindow(QWidget):
             expand_act.triggered.connect(self.expand_window)
             menu.addAction(expand_act)
         else:
-            collapse_act = QAction("Collapse to Circle", self)
+            collapse_act = QAction("Collapse to Mini", self)
             collapse_act.triggered.connect(self.collapse_to_mini)
             menu.addAction(collapse_act)
 
@@ -934,15 +1117,18 @@ class FloatingSenderWindow(QWidget):
         print(f"[DEBUG Sender] Stream status updated: '{text}' (active={active})")
         color = "#00d084" if active else "#d83b01"
         self._update_status_color(color)
-        if not active:
+
+        if active:
+            connected_ip = self.ip_input.text().strip() or self.discovered_ip
+            if connected_ip:
+                save_ip_to_history(connected_ip)
+        else:
             self.stop_sharing()
 
     def _update_status_color(self, color_hex: str):
         self.status_color = color_hex
         self.status_dot.setStyleSheet(f"color: {color_hex}; font-size: 14px;")
-        self.mini_status_dot.setStyleSheet(
-            f"color: {color_hex}; font-size: 18px; margin-bottom: 2px;"
-        )
+        self._update_mini_bar_style()
 
     def closeEvent(self, event):
         print("[DEBUG Sender] Application closing. Terminating all active threads...")
@@ -954,6 +1140,7 @@ class FloatingSenderWindow(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setWindowIcon(create_application_icon())
     win = FloatingSenderWindow()
     win.show()
     win.move(80, 80)
