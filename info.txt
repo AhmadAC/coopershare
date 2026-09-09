@@ -1,0 +1,11 @@
+# MrCoopersScreenShare
+
+Cross-platform screen sharing with reverse touch-back and audio streaming for Windows and Linux (Wayland / Fedora Kinoite).
+
+## Quick Start
+
+### 1. Install Dependencies
+```bash
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt

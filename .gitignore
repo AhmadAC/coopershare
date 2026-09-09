@@ -1,0 +1,23 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+maxhub_env/
+.venv/
+
+# PyInstaller / AppImage Build outputs
+build/
+dist/
+*.spec
+AppDir/
+*.AppImage
+*.exe
+
+# IDE / Editor configs
+.vscode/
+.idea/
+*.swp

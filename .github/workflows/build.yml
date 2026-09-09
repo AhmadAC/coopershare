@@ -1,0 +1,185 @@
+name: Build MrCoopersScreenShare Executables
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  # =========================================================================
+  # 1. Build Windows Binaries (sender.exe & receiver.exe)
+  # =========================================================================
+  build-windows:
+    name: Build Windows EXEs
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14.6
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14.6"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install PySide6 opencv-python-headless mss sounddevice numpy pynput pyinstaller
+
+      - name: Build sender.exe with PyInstaller
+        run: |
+          pyinstaller --noconsole --onefile `
+            --name "sender" `
+            --hidden-import "sounddevice" `
+            --hidden-import "pynput" `
+            --hidden-import "pynput.keyboard._win32" `
+            --hidden-import "pynput.mouse._win32" `
+            --hidden-import "mss" `
+            --hidden-import "cv2" `
+            sender.py
+
+      - name: Build receiver.exe with PyInstaller
+        run: |
+          pyinstaller --noconsole --onefile `
+            --name "receiver" `
+            --hidden-import "sounddevice" `
+            --hidden-import "mss" `
+            --hidden-import "cv2" `
+            receiver.py
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-executables
+          path: |
+            dist/sender.exe
+            dist/receiver.exe
+          retention-days: 14
+
+  # =========================================================================
+  # 2. Build Linux AppImage (Sender Script)
+  # =========================================================================
+  build-linux-appimage:
+    name: Build Linux Sender AppImage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux System Libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libportaudio2 libpulse-dev wget file
+
+      - name: Set up Python 3.14.6
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14.6"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install PySide6 opencv-python-headless mss sounddevice numpy evdev pyinstaller
+
+      - name: Build Standalone Binary with PyInstaller
+        run: |
+          pyinstaller --noconsole --onefile \
+            --name "sender" \
+            --hidden-import "sounddevice" \
+            --hidden-import "evdev" \
+            --hidden-import "mss" \
+            --hidden-import "cv2" \
+            sender.py
+
+      - name: Package as AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          # 1. Prepare AppDir structure
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          cp dist/sender AppDir/usr/bin/sender
+
+          # 2. Create Desktop Entry
+          cat << 'EOF' > AppDir/mrcoopers-sender.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=MrCoopersScreenShare Sender
+          Comment=Screen sharing and touch controller
+          Exec=sender
+          Icon=mrcoopers-sender
+          Categories=Utility;Network;
+          Terminal=false
+          EOF
+
+          # 3. Create generic application icon (SVG)
+          cat << 'EOF' > AppDir/mrcoopers-sender.svg
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="14" fill="#0078d4"/>
+            <polygon points="24,18 46,32 24,46" fill="#ffffff"/>
+          </svg>
+          EOF
+          cp AppDir/mrcoopers-sender.svg AppDir/.DirIcon
+          cp AppDir/mrcoopers-sender.svg AppDir/usr/share/icons/hicolor/256x256/apps/mrcoopers-sender.svg
+
+          # 4. Create AppRun launcher
+          cat << 'EOF' > AppDir/AppRun
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          exec "${HERE}/usr/bin/sender" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          # 5. Download and execute appimagetool
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir MrCoopersScreenShare-Sender-x86_64.AppImage
+
+      - name: Upload AppImage Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-sender-appimage
+          path: MrCoopersScreenShare-Sender-x86_64.AppImage
+          retention-days: 14
+
+  # =========================================================================
+  # 3. Create GitHub Release (Runs on git tags like v1.0.0)
+  # =========================================================================
+  create-release:
+    name: Publish Release Assets
+    needs: [build-windows, build-linux-appimage]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-executables
+          path: release-assets
+
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-sender-appimage
+          path: release-assets
+
+      - name: Create Release and Upload Files
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/sender.exe
+            release-assets/receiver.exe
+            release-assets/MrCoopersScreenShare-Sender-x86_64.AppImage
+          draft: false
+          prerelease: false
