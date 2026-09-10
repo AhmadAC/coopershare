@@ -2,10 +2,11 @@
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Features: Native Windows WASAPI Desktop Audio Loopback Capture (Driverless COM ctypes),
-          Real-Time Hardware Mouse Cursor Overlay, Dynamic Audio Negotiation,
-          Taskbar Click Toggle, Custom Application Icon, Enter Key Screenshare Trigger,
-          Save IP to history.json ONLY on Success, Strict Always-On-Top Enforcer,
+Features: Ctrl+Click Mini Pill Pause/Resume Toggle, Native Windows WASAPI Desktop
+          Audio Loopback Capture (Driverless COM ctypes), Real-Time Hardware Mouse
+          Cursor Overlay, Dynamic Audio Negotiation, Taskbar Click Toggle,
+          Custom Application Icon, Enter Key Screenshare Trigger, Save IP to
+          history.json ONLY on Success, Strict Always-On-Top Enforcer,
           Highly-Visible Collapsed Mini Pill (Hover-Illuminated, 30% Base Opacity),
           Ultra-Crisp Text Rendering (4:4:4 Chroma Subsampling, Optimized Matrices),
           High-Throughput 2MB TCP Socket, Auto-Discovery, Robust Auto-Connect,
@@ -1229,7 +1230,9 @@ class FloatingSenderWindow(QWidget):
         self.mini_container.setObjectName("mini_container")
         self.mini_container.setFixedSize(48, 16)
         self.mini_container.setCursor(Qt.PointingHandCursor)
-        self.mini_container.setToolTip("MrCoopersScreenShare (Always On Top | Click to expand / Drag to move)")
+        self.mini_container.setToolTip(
+            "MrCoopersScreenShare (Ctrl+Click: Pause/Resume | Click: Expand | Drag: Move)"
+        )
 
         mini_layout = QVBoxLayout(self.mini_container)
         mini_layout.setContentsMargins(0, 0, 0, 0)
@@ -1334,7 +1337,11 @@ class FloatingSenderWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             if self.is_mini_mode and not self._is_dragging:
-                self.expand_window()
+                # Ctrl+Click triggers Pause / Resume
+                if event.modifiers() & Qt.ControlModifier:
+                    self.toggle_pause()
+                else:
+                    self.expand_window()
             self.enforce_always_on_top()
 
     def showEvent(self, event):
@@ -1344,6 +1351,12 @@ class FloatingSenderWindow(QWidget):
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         menu.setStyleSheet("background-color: #262c3b; color: white;")
+
+        if self.stream_thread and self.stream_thread.isRunning():
+            pause_act = QAction("Resume Stream" if self.is_paused else "Pause Stream", self)
+            pause_act.triggered.connect(self.toggle_pause)
+            menu.addAction(pause_act)
+            menu.addSeparator()
 
         if self.is_mini_mode:
             expand_act = QAction("Expand Controls", self)
@@ -1449,11 +1462,13 @@ class FloatingSenderWindow(QWidget):
         self.stream_thread = None
         self.audio_thread = None
         self.input_thread = None
+        self.is_paused = False
 
         self.fps_combo.setEnabled(True)
         self.quality_combo.setEnabled(True)
         self.connect_btn.setText("Share")
         self.connect_btn.setStyleSheet("background-color: #0078d4;")
+        self.pause_btn.setText("⏸ Pause")
         self.pause_btn.setEnabled(False)
         self.mute_btn.setEnabled(False)
 
@@ -1464,7 +1479,13 @@ class FloatingSenderWindow(QWidget):
             self.is_paused = not self.is_paused
             self.stream_thread.paused = self.is_paused
             self.pause_btn.setText("▶ Resume" if self.is_paused else "⏸ Pause")
-            print(f"[DEBUG Sender] Screen pause state: {self.is_paused}")
+
+            if self.is_paused:
+                self._update_status_color("#ffaa00")
+            else:
+                self._update_status_color("#00d084")
+
+            print(f"[DEBUG Sender] Screen pause state toggled to: {self.is_paused}")
 
     def toggle_mute(self):
         if self.audio_thread:
@@ -1475,7 +1496,10 @@ class FloatingSenderWindow(QWidget):
 
     def on_stream_status(self, text: str, active: bool):
         print(f"[DEBUG Sender] Stream status updated: '{text}' (active={active})")
-        color = "#00d084" if active else "#d83b01"
+        if active:
+            color = "#ffaa00" if self.is_paused else "#00d084"
+        else:
+            color = "#d83b01"
         self._update_status_color(color)
 
         if active:
