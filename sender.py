@@ -1,28 +1,27 @@
-#################### START OF FILE: sender.py ####################
-
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
 Features: Persistent Always-On-Top Collapsed Mini Pill (WS_EX_TOPMOST + Non-Intrusive Guard),
-          Host Speaker Mute Toggle (Mutes Host PC, Streams to Receiver TV),
-          TV Audio Volume Slider (0% - 150%), Live Mid-Stream FPS & Quality Switching,
-          Ctrl+Click Mini Pill Pause/Resume Toggle, Native 64-bit Windows WASAPI
-          Desktop Audio Loopback (Driverless COM ctypes), Real-Time Hardware Mouse
-          Cursor Overlay, Dynamic Audio Negotiation, Taskbar Click Toggle,
-          Custom Application Icon, Enter Key Screenshare Trigger, Save IP to
-          history.json ONLY on Success, Strict Always-On-Top Enforcer,
-          Highly-Visible Collapsed Mini Pill (Hover-Illuminated, 30% Base Opacity),
-          Ultra-Crisp Text Rendering (4:4:4 Chroma Subsampling, Optimized Matrices),
-          High-Throughput 2MB TCP Socket, Auto-Discovery, Robust Auto-Connect.
+          Remote Receiver Window Management (Maximize, Make Smaller, Minimize via Right-Click Context Menu),
+          Device Name & IP Manager (Friendly Name Selection from Dropdown & Right-Click Context Menu),
+          Receiver Touch / Input Injection Toggle, Host Speaker Mute Toggle,
+          TV Audio Volume Slider (0% - 150%) with True Zero Silence Output on Mute,
+          Resume Button (Orange) & TV Muted Button (Red) styling,
+          Collapsed Mode Taskbar Click Non-Minimize Red Pulsing Animation (3 Seconds),
+          Live Mid-Stream FPS & Quality Switching, Ctrl+Click Mini Pill Pause/Resume Toggle,
+          Native 64-bit Windows WASAPI Desktop Audio Loopback (Driverless COM ctypes),
+          Real-Time Hardware Mouse Cursor Overlay, 4:4:4 Chroma Subsampling Ultra Crisp Text.
 """
 
 import ctypes
 from ctypes import HRESULT, POINTER, Structure, byref, c_float, c_int, c_int64, c_long, c_short, c_ubyte, c_uint, c_uint64, c_ulong, c_ushort, c_void_p
 import json
+import math
 import os
 import runpy
 import socket
 import struct
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -62,6 +61,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -126,28 +126,26 @@ def get_app_directory() -> str:
 HISTORY_FILE_PATH = os.path.join(get_app_directory(), "history.json")
 
 
-def load_ip_from_history() -> str:
-    """Loads the last saved IP from history.json."""
+def load_history() -> dict:
+    """Loads saved devices and last connected IP from history.json."""
     if os.path.exists(HISTORY_FILE_PATH):
         try:
             with open(HISTORY_FILE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return str(data.get("last_ip", "")).strip()
+                if not isinstance(data.get("devices"), dict):
+                    data["devices"] = {}
+                return data
         except Exception as e:
             print(f"[DEBUG Sender] Failed to read history.json: {e}")
-    return ""
+    return {"last_ip": "", "devices": {}}
 
 
-def save_ip_to_history(ip_address: str):
-    """Saves the IP address to history.json upon successful connection."""
-    ip_clean = ip_address.strip()
-    if not ip_clean:
-        return
+def save_history(history_data: dict):
+    """Saves the history data dict to history.json."""
     try:
-        data = {"last_ip": ip_clean}
         with open(HISTORY_FILE_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
-        print(f"[DEBUG Sender] Successfully connected! Saved '{ip_clean}' to history.json")
+            json.dump(history_data, f, indent=4)
+        print("[DEBUG Sender] Saved history.json successfully.")
     except Exception as e:
         print(f"[DEBUG Sender] Failed to write history.json: {e}")
 
@@ -582,7 +580,7 @@ class NativeWindowsWasapiLoopback:
             frame_count = num_frames.value
             total_samples = frame_count * self.channels
 
-            if flags.value & 0x01:  # AUDCLNT_BUFFERFLAGS_SILENT
+            if flags.value & 0x01 or volume <= 0.0:  # Muted / Silent
                 pcm_bytes = b"\x00" * (frame_count * CHANNELS * 2)
             else:
                 if self.is_float:
@@ -975,29 +973,31 @@ class AudioSenderThread(QThread):
 
         if use_native_wasapi:
             while self.running:
-                if not self.muted:
-                    chunk = wasapi.read_pcm16_chunk(volume=self.volume)
-                    if chunk and self.sock:
-                        try:
-                            self.sock.sendall(chunk)
-                        except Exception as ex:
-                            print(f"[DEBUG Sender Audio] Transmit error: {ex}")
-                            break
-                    else:
-                        self.msleep(4)
+                eff_vol = 0.0 if self.muted else self.volume
+                chunk = wasapi.read_pcm16_chunk(volume=eff_vol)
+                if chunk and self.sock:
+                    try:
+                        self.sock.sendall(chunk)
+                    except Exception as ex:
+                        print(f"[DEBUG Sender Audio] Transmit error: {ex}")
+                        break
                 else:
-                    self.msleep(50)
+                    self.msleep(4)
             wasapi.stop()
         else:
             if AUDIO_AVAILABLE:
                 def callback(indata, frames, time_info, status):
-                    if self.running and not self.muted and self.sock:
+                    if self.running and self.sock:
                         try:
-                            if self.volume != 1.0:
-                                scaled = np.clip(indata.astype(np.float32) * self.volume, -32768.0, 32767.0).astype(np.int16)
-                                self.sock.sendall(scaled.tobytes())
+                            if self.muted:
+                                silence = b"\x00" * (frames * CHANNELS * 2)
+                                self.sock.sendall(silence)
                             else:
-                                self.sock.sendall(indata.tobytes())
+                                if self.volume != 1.0:
+                                    scaled = np.clip(indata.astype(np.float32) * self.volume, -32768.0, 32767.0).astype(np.int16)
+                                    self.sock.sendall(scaled.tobytes())
+                                else:
+                                    self.sock.sendall(indata.tobytes())
                         except Exception:
                             pass
 
@@ -1031,10 +1031,23 @@ class AudioSenderThread(QThread):
 
 
 class InputReceiverThread(QThread):
-    def __init__(self, target_ip: str):
+    def __init__(self, target_ip: str, is_input_enabled_func):
         super().__init__()
         self.target_ip = target_ip
+        self.is_input_enabled_func = is_input_enabled_func
         self.running = True
+        self.sock: Optional[socket.socket] = None
+        self._send_lock = threading.Lock()
+
+    def send_command(self, cmd: dict):
+        """Sends remote control commands (e.g. Window Management) to the receiver."""
+        with self._send_lock:
+            if self.sock:
+                try:
+                    data = json.dumps(cmd).encode("utf-8")
+                    self.sock.sendall(struct.pack(">L", len(data)) + data)
+                except Exception as e:
+                    print(f"[DEBUG Sender Control] Failed to transmit command to receiver: {e}")
 
     def run(self):
         print(f"[DEBUG Sender Control] Connecting to {self.target_ip}:{CONTROL_PORT}...")
@@ -1044,6 +1057,8 @@ class InputReceiverThread(QThread):
             sock.settimeout(3.0)
             sock.connect((self.target_ip, CONTROL_PORT))
             sock.settimeout(0.5)
+            with self._send_lock:
+                self.sock = sock
             print("[DEBUG Sender Control] Control channel connected.")
         except Exception as e:
             print(f"[DEBUG Sender Control] Control channel connection failed: {e}")
@@ -1094,7 +1109,10 @@ class InputReceiverThread(QThread):
                 raw_msg = data[:msg_size]
                 data = data[msg_size:]
                 event = json.loads(raw_msg.decode("utf-8"))
-                injector.execute(event)
+
+                # Check if input execution is enabled
+                if self.is_input_enabled_func():
+                    injector.execute(event)
             except ConnectionResetError:
                 break
             except Exception as e:
@@ -1103,14 +1121,23 @@ class InputReceiverThread(QThread):
                 break
 
         injector.close()
-        try:
-            sock.close()
-        except Exception:
-            pass
+        with self._send_lock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            self.sock = None
         print("[DEBUG Sender Control] Input receiver thread stopped.")
 
     def stop(self):
         self.running = False
+        with self._send_lock:
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
         self.wait(1000)
 
 
@@ -1138,20 +1165,32 @@ class FloatingSenderWindow(QWidget):
         self.is_paused = False
         self.is_stream_muted = False
         self.is_host_muted = False
+        self.input_enabled = True
         self.tv_volume = 1.0
         self.discovered_ip = ""
         self.pin_required = False
         self.status_color = "#8f9bb3"
 
-        self._init_window()
-        self._setup_ui()
-        self._load_saved_history()
+        # Pulsing Animation attributes for Collapsed Taskbar Click
+        self.is_pulsing = False
+        self.pulse_start_time = 0.0
+
+        self.history_data = load_history()
 
         # Non-intrusive Topmost Enforcer Timer for Collapsed Mini Pill
         self.topmost_timer = QTimer(self)
         self.topmost_timer.setInterval(500)
         self.topmost_timer.timeout.connect(self._on_topmost_timer)
         self.topmost_timer.start()
+
+        # 3-Second Red Pulse Timer for taskbar clicks in mini mode
+        self.pulse_timer = QTimer(self)
+        self.pulse_timer.setInterval(40)
+        self.pulse_timer.timeout.connect(self._on_pulse_step)
+
+        self._init_window()
+        self._setup_ui()
+        self._populate_device_list()
 
         # Start listening for auto-discovery beacon
         self.discovery_thread = DiscoveryListenerThread()
@@ -1219,15 +1258,40 @@ class FloatingSenderWindow(QWidget):
         if self.is_mini_mode and not self.isMinimized():
             self.enforce_always_on_top()
 
+    def trigger_mini_pulse(self):
+        """Triggers a 3-second red pulsing effect oscillating opacity between 0.30 and 0.90."""
+        self.is_pulsing = True
+        self.pulse_start_time = time.time()
+        self._update_mini_bar_style(override_color="#ff3333")
+        self.pulse_timer.start()
+
+    def _on_pulse_step(self):
+        elapsed = time.time() - self.pulse_start_time
+        if elapsed >= 3.0 or not self.is_mini_mode:
+            self.pulse_timer.stop()
+            self.is_pulsing = False
+            self.setWindowOpacity(0.35)
+            self._update_mini_bar_style()
+            return
+
+        # Sinusoidal oscillation between 0.30 and 0.90 opacity
+        osc = (math.sin(elapsed * math.pi * 3.5) + 1.0) / 2.0
+        current_op = 0.30 + (0.60 * osc)
+        self.setWindowOpacity(current_op)
+        self.enforce_always_on_top()
+
     def changeEvent(self, event: QEvent):
-        """Handles taskbar minimize and restore state toggling cleanly."""
-        if event.type() == QEvent.WindowStateChange:
-            if not self.isMinimized():
+        """Handles taskbar click / window state changes with red pulsing animation in mini mode."""
+        if event.type() in (QEvent.WindowStateChange, QEvent.ActivationChange):
+            if self.is_mini_mode:
+                if self.isMinimized():
+                    self.showNormal()
                 self.enforce_always_on_top()
-                if not self.is_mini_mode:
+                self.trigger_mini_pulse()
+            else:
+                if not self.isMinimized():
+                    self.enforce_always_on_top()
                     self.setWindowOpacity(self.opacity_slider.value() / 100.0)
-                else:
-                    self.setWindowOpacity(0.35)
         super().changeEvent(event)
 
     def _setup_ui(self):
@@ -1268,7 +1332,7 @@ class FloatingSenderWindow(QWidget):
         self.card_layout.setContentsMargins(12, 10, 12, 10)
         self.card_layout.setSpacing(8)
 
-        # Header Pill
+        # Header Bar
         self.header_bar = QWidget()
         h_layout = QHBoxLayout(self.header_bar)
         h_layout.setContentsMargins(0, 0, 0, 0)
@@ -1302,17 +1366,18 @@ class FloatingSenderWindow(QWidget):
 
         self.card_layout.addWidget(self.header_bar)
 
-        # Controls
-        # Row 1: Target IP + Share Button
+        # Row 1: Target Device Dropdown / IP Selector + Share Button
         ip_row = QHBoxLayout()
-        self.ip_input = QLineEdit()
-        self.ip_input.setPlaceholderText("Receiver IP (e.g. 192.168.1.5)")
-        self.ip_input.returnPressed.connect(self.toggle_connect)
+        self.device_combo = QComboBox()
+        self.device_combo.setEditable(True)
+        self.device_combo.setPlaceholderText("Select TV or Enter IP...")
+        self.device_combo.setToolTip("Select a TV by name or enter an IP. Right-click to assign friendly names.")
+        self.device_combo.lineEdit().returnPressed.connect(self.toggle_connect)
 
         self.connect_btn = QPushButton("Share")
         self.connect_btn.clicked.connect(self.toggle_connect)
 
-        ip_row.addWidget(self.ip_input)
+        ip_row.addWidget(self.device_combo, 1)
         ip_row.addWidget(self.connect_btn)
         self.card_layout.addLayout(ip_row)
 
@@ -1334,24 +1399,30 @@ class FloatingSenderWindow(QWidget):
         qual_row.addWidget(self.quality_combo)
         self.card_layout.addLayout(qual_row)
 
-        # Row 3: Auto-connect toggle + Optional PIN input
+        # Row 3: Auto-connect & Touch Input toggles + Optional PIN input
         auto_row = QHBoxLayout()
         self.auto_connect_cb = QCheckBox("Auto-Connect")
         self.auto_connect_cb.setChecked(True)
 
+        self.touch_input_cb = QCheckBox("TV Touch Control")
+        self.touch_input_cb.setChecked(True)
+        self.touch_input_cb.setToolTip("When enabled, touching the TV screen controls this PC.")
+        self.touch_input_cb.toggled.connect(self.on_touch_input_toggled)
+
         self.pin_input = QLineEdit()
-        self.pin_input.setPlaceholderText("PIN (if required)")
+        self.pin_input.setPlaceholderText("PIN (if req.)")
         self.pin_input.setMaxLength(4)
-        self.pin_input.setFixedWidth(110)
+        self.pin_input.setFixedWidth(90)
         self.pin_input.returnPressed.connect(self.toggle_connect)
         self.pin_input.textChanged.connect(self.on_pin_text_changed)
 
         auto_row.addWidget(self.auto_connect_cb)
+        auto_row.addWidget(self.touch_input_cb)
         auto_row.addStretch()
         auto_row.addWidget(self.pin_input)
         self.card_layout.addLayout(auto_row)
 
-        # Row 4: Action Buttons (Pause, TV Stream Mute, Host Speaker Mute)
+        # Row 4: Action Buttons (Pause/Resume, TV Audio Mute, Host Speaker Mute)
         btn_row = QHBoxLayout()
         self.pause_btn = QPushButton("⏸ Pause")
         self.pause_btn.clicked.connect(self.toggle_pause)
@@ -1441,24 +1512,49 @@ class FloatingSenderWindow(QWidget):
             self.is_host_muted = HostAudioController.get_host_mute()
             self._update_host_mute_ui()
 
-    def _load_saved_history(self):
-        saved_ip = load_ip_from_history()
-        if saved_ip:
-            self.ip_input.setText(saved_ip)
-            print(f"[DEBUG Sender] Auto-filled saved IP: {saved_ip}")
+    def _populate_device_list(self):
+        """Populates the device selector dropdown with saved friendly names and IPs."""
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
 
-    def _update_mini_bar_style(self):
-        self.mini_container.setStyleSheet(
-            """
-            QFrame#mini_container {
-                background: transparent;
-            }
-        """
-        )
+        devices = self.history_data.get("devices", {})
+        last_ip = self.history_data.get("last_ip", "").strip()
+
+        matched_index = -1
+        idx = 0
+        for ip, name in devices.items():
+            label = f"{name} ({ip})" if name else ip
+            self.device_combo.addItem(label, ip)
+            if ip == last_ip:
+                matched_index = idx
+            idx += 1
+
+        if matched_index >= 0:
+            self.device_combo.setCurrentIndex(matched_index)
+        elif last_ip:
+            self.device_combo.setEditText(last_ip)
+
+        self.device_combo.blockSignals(False)
+
+    def get_selected_target_ip(self) -> str:
+        """Extracts the clean target IP from the device combo selection or manual text."""
+        raw_text = self.device_combo.currentText().strip()
+        data_val = self.device_combo.currentData()
+        if data_val:
+            return str(data_val).strip()
+
+        # Check if formatted like "Friendly Name (192.168.1.5)"
+        if "(" in raw_text and ")" in raw_text:
+            return raw_text.split("(")[-1].replace(")", "").strip()
+        return raw_text
+
+    def _update_mini_bar_style(self, override_color: Optional[str] = None):
+        color = override_color or self.status_color
+        self.mini_container.setStyleSheet("QFrame#mini_container { background: transparent; }")
         self.mini_bar.setStyleSheet(
             f"""
             QFrame#mini_bar {{
-                background-color: {self.status_color};
+                background-color: {color};
                 border: 1px solid rgba(255, 255, 255, 0.45);
                 border-radius: 2px;
             }}
@@ -1479,14 +1575,69 @@ class FloatingSenderWindow(QWidget):
 
     def expand_window(self):
         self.is_mini_mode = False
+        if hasattr(self, "pulse_timer") and self.pulse_timer.isActive():
+            self.pulse_timer.stop()
         self.setMinimumSize(0, 0)
         self.setMaximumSize(16777215, 16777215)
         self.stack.setCurrentWidget(self.card)
-        self.setWindowOpacity(self.opacity_slider.value() / 100.0)
+        if hasattr(self, "opacity_slider"):
+            self.setWindowOpacity(self.opacity_slider.value() / 100.0)
         self.card.adjustSize()
         self.adjustSize()
         self.enforce_always_on_top()
         print("[DEBUG Sender GUI] Expanded to full always-on-top controller card.")
+
+    # -----------------------------------------------------------------------
+    # Friendly Name & Remote Window Management
+    # -----------------------------------------------------------------------
+    def prompt_set_friendly_name(self):
+        """Allows assigning or updating a friendly name for the current target IP."""
+        current_ip = self.get_selected_target_ip()
+        if not current_ip:
+            return
+
+        devices = self.history_data.get("devices", {})
+        existing_name = devices.get(current_ip, "")
+
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Set Friendly TV Name",
+            f"Enter friendly name for display IP ({current_ip}):",
+            QLineEdit.Normal,
+            existing_name,
+        )
+
+        if ok and new_name.strip():
+            devices[current_ip] = new_name.strip()
+            self.history_data["devices"] = devices
+            self.history_data["last_ip"] = current_ip
+            save_history(self.history_data)
+            self._populate_device_list()
+
+    def remove_selected_device(self):
+        """Removes the currently selected device from saved friendly devices."""
+        current_ip = self.get_selected_target_ip()
+        devices = self.history_data.get("devices", {})
+        if current_ip in devices:
+            del devices[current_ip]
+            self.history_data["devices"] = devices
+            save_history(self.history_data)
+            self._populate_device_list()
+
+    def send_receiver_window_command(self, action: str):
+        """Sends window state commands (maximize, normal, minimize) to the connected TV receiver."""
+        if self.input_thread and self.input_thread.isRunning():
+            self.input_thread.send_command({"type": "window_control", "action": action})
+            print(f"[DEBUG Sender] Transmitted remote TV window command: '{action}'")
+        else:
+            print("[DEBUG Sender] Cannot send TV window command: Not connected to receiver.")
+
+    def on_touch_input_toggled(self, checked: bool):
+        self.input_enabled = checked
+        print(f"[DEBUG Sender] Receiver touch input control enabled: {self.input_enabled}")
+
+    def is_input_enabled(self) -> bool:
+        return self.input_enabled
 
     # -----------------------------------------------------------------------
     # Keyboard & Mouse Events
@@ -1500,13 +1651,13 @@ class FloatingSenderWindow(QWidget):
         super().keyPressEvent(event)
 
     def enterEvent(self, event):
-        if self.is_mini_mode:
+        if self.is_mini_mode and not self.is_pulsing:
             self.setWindowOpacity(1.0)
         self.enforce_always_on_top()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        if self.is_mini_mode:
+        if self.is_mini_mode and not self.is_pulsing:
             self.setWindowOpacity(0.35)
             self.enforce_always_on_top()
         super().leaveEvent(event)
@@ -1542,7 +1693,71 @@ class FloatingSenderWindow(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        menu.setStyleSheet("background-color: #262c3b; color: white;")
+        menu.setStyleSheet(
+            """
+            QMenu {
+                background-color: #1a1e29;
+                color: #ffffff;
+                border: 1px solid #3d475f;
+                border-radius: 8px;
+                padding: 4px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 13px;
+            }
+            QMenu::item {
+                padding: 6px 20px 6px 12px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #333c4d;
+                margin: 4px 6px;
+            }
+        """
+        )
+
+        # Remote Receiver Window Management
+        win_menu = menu.addMenu("📺 TV Window Control")
+        max_act = QAction("🗖 Maximize / Fullscreen TV", self)
+        max_act.triggered.connect(lambda: self.send_receiver_window_command("maximize"))
+        win_menu.addAction(max_act)
+
+        norm_act = QAction("🗗 Make TV Smaller (Restore)", self)
+        norm_act.triggered.connect(lambda: self.send_receiver_window_command("normal"))
+        win_menu.addAction(norm_act)
+
+        min_act = QAction("🗕 Minimize TV Window", self)
+        min_act.triggered.connect(lambda: self.send_receiver_window_command("minimize"))
+        win_menu.addAction(min_act)
+
+        is_connected = bool(self.input_thread and self.input_thread.isRunning())
+        win_menu.setEnabled(is_connected)
+
+        menu.addSeparator()
+
+        # TV Friendly Name Options
+        rename_act = QAction("🏷️ Set Friendly Name for Current TV...", self)
+        rename_act.triggered.connect(self.prompt_set_friendly_name)
+        menu.addAction(rename_act)
+
+        remove_act = QAction("🗑️ Remove Selected TV", self)
+        remove_act.triggered.connect(self.remove_selected_device)
+        menu.addAction(remove_act)
+
+        menu.addSeparator()
+
+        # Touch Control Toggle in Menu
+        touch_act = QAction("Allow TV Touch Input", self)
+        touch_act.setCheckable(True)
+        touch_act.setChecked(self.input_enabled)
+        touch_act.triggered.connect(lambda c: self.touch_input_cb.setChecked(c))
+        menu.addAction(touch_act)
+
+        menu.addSeparator()
 
         if self.stream_thread and self.stream_thread.isRunning():
             pause_act = QAction("Resume Stream" if self.is_paused else "Pause Stream", self)
@@ -1614,8 +1829,9 @@ class FloatingSenderWindow(QWidget):
         self.discovered_ip = ip
         self.pin_required = pin_required
 
-        if not self.ip_input.text().strip():
-            self.ip_input.setText(ip)
+        # If dropdown is empty, populate discovered ip
+        if not self.device_combo.currentText().strip():
+            self.device_combo.setEditText(ip)
 
         if (
             self.auto_connect_cb.isChecked()
@@ -1641,7 +1857,7 @@ class FloatingSenderWindow(QWidget):
             self.start_sharing()
 
     def start_sharing(self):
-        target_ip = self.ip_input.text().strip() or self.discovered_ip
+        target_ip = self.get_selected_target_ip() or self.discovered_ip
         if not target_ip:
             print("[DEBUG Sender] Cannot start sharing: No target IP provided.")
             return
@@ -1681,7 +1897,7 @@ class FloatingSenderWindow(QWidget):
         self.audio_thread = AudioSenderThread(target_ip, volume=self.tv_volume)
         self.audio_thread.start()
 
-        self.input_thread = InputReceiverThread(target_ip)
+        self.input_thread = InputReceiverThread(target_ip, self.is_input_enabled)
         self.input_thread.start()
 
     def stop_sharing(self):
@@ -1697,6 +1913,7 @@ class FloatingSenderWindow(QWidget):
         self.connect_btn.setText("Share")
         self.connect_btn.setStyleSheet("background-color: #0078d4;")
         self.pause_btn.setText("⏸ Pause")
+        self.pause_btn.setStyleSheet("background-color: #0078d4; color: white;")
         self.pause_btn.setEnabled(False)
         self.stream_mute_btn.setEnabled(False)
 
@@ -1706,11 +1923,15 @@ class FloatingSenderWindow(QWidget):
         if self.stream_thread:
             self.is_paused = not self.is_paused
             self.stream_thread.paused = self.is_paused
-            self.pause_btn.setText("▶ Resume" if self.is_paused else "⏸ Pause")
 
             if self.is_paused:
-                self._update_status_color("#ffaa00")
+                self.pause_btn.setText("▶ Resume")
+                # Resume Button: Orange Color styling
+                self.pause_btn.setStyleSheet("background-color: #f37021; color: white; font-weight: bold;")
+                self._update_status_color("#f37021")
             else:
+                self.pause_btn.setText("⏸ Pause")
+                self.pause_btn.setStyleSheet("background-color: #0078d4; color: white; font-weight: bold;")
                 self._update_status_color("#00d084")
 
             print(f"[DEBUG Sender] Screen pause state toggled to: {self.is_paused}")
@@ -1719,28 +1940,40 @@ class FloatingSenderWindow(QWidget):
         if self.audio_thread:
             self.is_stream_muted = not self.is_stream_muted
             self.audio_thread.muted = self.is_stream_muted
-            self.stream_mute_btn.setText("🔇 TV Muted" if self.is_stream_muted else "🔊 TV Audio")
+
+            if self.is_stream_muted:
+                self.stream_mute_btn.setText("🔇 TV Muted")
+                # TV Muted Button: Red Color styling
+                self.stream_mute_btn.setStyleSheet("background-color: #d83b01; color: white; font-weight: bold;")
+            else:
+                self.stream_mute_btn.setText("🔊 TV Audio")
+                self.stream_mute_btn.setStyleSheet("background-color: #0078d4; color: white; font-weight: bold;")
+
             print(f"[DEBUG Sender] TV stream audio mute state: {self.is_stream_muted}")
 
     def on_stream_status(self, text: str, active: bool):
         print(f"[DEBUG Sender] Stream status updated: '{text}' (active={active})")
         if active:
-            color = "#ffaa00" if self.is_paused else "#00d084"
+            color = "#f37021" if self.is_paused else "#00d084"
         else:
             color = "#d83b01"
         self._update_status_color(color)
 
         if active:
-            connected_ip = self.ip_input.text().strip() or self.discovered_ip
+            connected_ip = self.get_selected_target_ip() or self.discovered_ip
             if connected_ip:
-                save_ip_to_history(connected_ip)
+                self.history_data["last_ip"] = connected_ip
+                if connected_ip not in self.history_data.get("devices", {}):
+                    self.history_data.setdefault("devices", {})[connected_ip] = ""
+                save_history(self.history_data)
         else:
             self.stop_sharing()
 
     def _update_status_color(self, color_hex: str):
         self.status_color = color_hex
         self.status_dot.setStyleSheet(f"color: {color_hex}; font-size: 14px;")
-        self._update_mini_bar_style()
+        if not self.is_pulsing:
+            self._update_mini_bar_style()
 
     def closeEvent(self, event):
         print("[DEBUG Sender] Application closing. Terminating all active threads...")

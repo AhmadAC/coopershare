@@ -1,12 +1,14 @@
+
 #################### START OF FILE: receiver.py ####################
 
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
-Features: Fullscreen Frameless Mode, Right-Click Context Menu (Exit Fullscreen / Exit App),
-          Dynamic Multi-Channel Audio Playback (Reshaped 2D Stereo Stream),
-          Onedir Hot-Replaceable Script Bootstrap, UDP Broadcast Beacon,
-          4-Digit PIN Authentication, Multi-Touch Canvas, Direct Bilinear
-          GPU-Accelerated Blitting, 2MB Socket Buffers, Rotating File Logging,
+Features: Fullscreen Frameless Mode, Remote Window Management (Maximize, Make Smaller,
+          Minimize from Sender Context Menu), Right-Click Context Menu (Exit Fullscreen /
+          Exit App / Toggle Standby Details Visibility with JSON persistence),
+          Dynamic Multi-Channel Audio Playback, Onedir Hot-Replaceable Script Bootstrap,
+          UDP Broadcast Beacon, 4-Digit PIN Authentication, Multi-Touch Canvas,
+          Direct Bilinear GPU Blitting, 2MB Socket Buffers, Rotating File Logging,
           Non-blocking Clean Thread Shutdown.
 """
 
@@ -18,6 +20,7 @@ import runpy
 import socket
 import struct
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -55,9 +58,11 @@ from PySide6.QtWidgets import (
 )
 
 # ---------------------------------------------------------------------------
-# Logging Configuration
+# Logging & Configuration File Paths
 # ---------------------------------------------------------------------------
-LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mrcoopers_receiver.log")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE_PATH = os.path.join(APP_DIR, "mrcoopers_receiver.log")
+CONFIG_FILE_PATH = os.path.join(APP_DIR, "receiver_config.json")
 
 logger = logging.getLogger("Receiver")
 logger.setLevel(logging.DEBUG)
@@ -77,6 +82,28 @@ if not logger.handlers:
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
+
+
+def load_receiver_config() -> dict:
+    """Loads receiver configuration from receiver_config.json."""
+    if os.path.exists(CONFIG_FILE_PATH):
+        try:
+            with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to read receiver_config.json: {e}")
+    return {"hide_details": False}
+
+
+def save_receiver_config(config: dict):
+    """Saves receiver configuration to receiver_config.json."""
+    try:
+        with open(CONFIG_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4)
+        logger.debug("Receiver configuration saved successfully.")
+    except Exception as e:
+        logger.error(f"Failed to save receiver_config.json: {e}")
+
 
 # Optional Sound Support
 try:
@@ -468,6 +495,8 @@ class AudioServerThread(QThread):
 
 
 class ControlServerThread(QThread):
+    command_received = Signal(dict)
+
     def __init__(self, port: int = CONTROL_PORT):
         super().__init__()
         self.setObjectName("ControlServerThread")
@@ -475,6 +504,7 @@ class ControlServerThread(QThread):
         self.running = True
         self.client_conn: Optional[socket.socket] = None
         self.server_sock: Optional[socket.socket] = None
+        self._send_lock = threading.Lock()
 
     def run(self):
         logger.info(f"Control Server binding to 0.0.0.0:{self.port}...")
@@ -488,7 +518,9 @@ class ControlServerThread(QThread):
             try:
                 conn, addr = self.server_sock.accept()
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self.client_conn = conn
+                conn.settimeout(0.5)
+                with self._send_lock:
+                    self.client_conn = conn
                 logger.info(f"Control channel connected to {addr[0]}")
             except socket.timeout:
                 continue
@@ -496,6 +528,66 @@ class ControlServerThread(QThread):
                 if self.running:
                     logger.error(f"Control Server accept exception: {e}")
                 break
+
+            # Handle incoming commands (e.g. Remote Window Control) from sender
+            payload_size = struct.calcsize(">L")
+            data = bytearray()
+
+            while self.running and self.client_conn:
+                try:
+                    while len(data) < payload_size:
+                        if not self.running:
+                            break
+                        try:
+                            packet = conn.recv(2048)
+                            if not packet:
+                                raise ConnectionResetError
+                            data.extend(packet)
+                        except socket.timeout:
+                            continue
+
+                    if not self.running:
+                        break
+
+                    packed_size = data[:payload_size]
+                    data = data[payload_size:]
+                    msg_size = struct.unpack(">L", packed_size)[0]
+
+                    while len(data) < msg_size:
+                        if not self.running:
+                            break
+                        try:
+                            packet = conn.recv(min(msg_size - len(data), 4096))
+                            if not packet:
+                                raise ConnectionResetError
+                            data.extend(packet)
+                        except socket.timeout:
+                            continue
+
+                    if not self.running:
+                        break
+
+                    raw_msg = data[:msg_size]
+                    data = data[msg_size:]
+                    msg_obj = json.loads(raw_msg.decode("utf-8"))
+                    self.command_received.emit(msg_obj)
+
+                except (socket.timeout, BlockingIOError):
+                    continue
+                except ConnectionResetError:
+                    logger.info("Control client disconnected.")
+                    break
+                except Exception as ex:
+                    if self.running:
+                        logger.error(f"Control channel read error: {ex}")
+                    break
+
+            with self._send_lock:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self.client_conn = None
 
         if self.server_sock:
             try:
@@ -505,21 +597,24 @@ class ControlServerThread(QThread):
         logger.info("Control Server thread finished.")
 
     def send_event(self, event_data: dict):
-        if self.client_conn:
-            try:
-                msg = json.dumps(event_data).encode("utf-8")
-                self.client_conn.sendall(struct.pack(">L", len(msg)) + msg)
-            except Exception as e:
-                logger.warning(f"Failed to transmit control event: {e}")
-                self.client_conn = None
+        with self._send_lock:
+            if self.client_conn:
+                try:
+                    msg = json.dumps(event_data).encode("utf-8")
+                    self.client_conn.sendall(struct.pack(">L", len(msg)) + msg)
+                except Exception as e:
+                    logger.warning(f"Failed to transmit control event: {e}")
+                    self.client_conn = None
 
     def stop(self):
         self.running = False
-        if self.client_conn:
-            try:
-                self.client_conn.close()
-            except Exception:
-                pass
+        with self._send_lock:
+            if self.client_conn:
+                try:
+                    self.client_conn.close()
+                except Exception:
+                    pass
+                self.client_conn = None
         if self.server_sock:
             try:
                 self.server_sock.close()
@@ -658,9 +753,13 @@ class ReceiverMainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("MrCoopersScreenShare - Receiver")
 
-        # True Frameless Fullscreen Mode (No OS Title Bar)
+        # True Frameless Mode
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setStyleSheet("background-color: #0b0e14;")
+
+        # Load configuration
+        self.config = load_receiver_config()
+        self.hide_details = self.config.get("hide_details", False)
 
         # Generate 4-digit PIN for session
         self.pin = f"{random.randint(1000, 9999)}"
@@ -674,6 +773,7 @@ class ReceiverMainWindow(QMainWindow):
         self.video_thread.frame_received.connect(self.on_frame)
         self.video_thread.client_connected.connect(self.on_connected)
         self.video_thread.client_disconnected.connect(self.on_disconnected)
+        self.control_thread.command_received.connect(self.on_control_command)
 
         for th in (
             self.control_thread,
@@ -684,6 +784,7 @@ class ReceiverMainWindow(QMainWindow):
             th.start()
 
         self._setup_ui()
+        self._apply_details_visibility()
 
     def get_pin(self) -> str:
         return self.pin
@@ -702,9 +803,15 @@ class ReceiverMainWindow(QMainWindow):
         sb_layout.setAlignment(Qt.AlignCenter)
         sb_layout.setSpacing(18)
 
-        title = QLabel("MrCoopersScreenShare")
-        title.setFont(QFont("Segoe UI", 36, QFont.Bold))
-        title.setStyleSheet("color: #00a2ed;")
+        # Container for standby details that can be toggled hidden
+        self.details_container = QWidget()
+        self.details_layout = QVBoxLayout(self.details_container)
+        self.details_layout.setAlignment(Qt.AlignCenter)
+        self.details_layout.setSpacing(18)
+
+        self.title_lbl = QLabel("MrCoopersScreenShare")
+        self.title_lbl.setFont(QFont("Segoe UI", 36, QFont.Bold))
+        self.title_lbl.setStyleSheet("color: #00a2ed;")
 
         self.ip_lbl = QLabel(f"Display IP: {get_local_ip()}")
         self.ip_lbl.setFont(QFont("Segoe UI", 24))
@@ -721,22 +828,54 @@ class ReceiverMainWindow(QMainWindow):
         )
         self.pin_req_cb.stateChanged.connect(self.on_pin_req_changed)
 
-        hint_lbl = QLabel("Right-click anywhere for menu • Press ESC / F11 to toggle fullscreen")
-        hint_lbl.setStyleSheet("color: #4b5568; font-size: 13px; margin-top: 20px;")
+        self.hint_lbl = QLabel("Right-click anywhere for menu • Press ESC / F11 to toggle fullscreen")
+        self.hint_lbl.setStyleSheet("color: #4b5568; font-size: 13px; margin-top: 20px;")
 
-        sb_layout.addWidget(title, alignment=Qt.AlignCenter)
-        sb_layout.addWidget(self.ip_lbl, alignment=Qt.AlignCenter)
-        sb_layout.addWidget(self.pin_lbl, alignment=Qt.AlignCenter)
-        sb_layout.addWidget(self.pin_req_cb, alignment=Qt.AlignCenter)
-        sb_layout.addWidget(hint_lbl, alignment=Qt.AlignCenter)
+        self.details_layout.addWidget(self.title_lbl, alignment=Qt.AlignCenter)
+        self.details_layout.addWidget(self.ip_lbl, alignment=Qt.AlignCenter)
+        self.details_layout.addWidget(self.pin_lbl, alignment=Qt.AlignCenter)
+        self.details_layout.addWidget(self.pin_req_cb, alignment=Qt.AlignCenter)
+        self.details_layout.addWidget(self.hint_lbl, alignment=Qt.AlignCenter)
+
+        sb_layout.addWidget(self.details_container, alignment=Qt.AlignCenter)
 
         # Canvas View
         self.canvas = TouchDisplayCanvas(self.control_thread)
         self.stack.addWidget(self.standby)
         self.stack.addWidget(self.canvas)
 
+    def _apply_details_visibility(self):
+        self.details_container.setVisible(not self.hide_details)
+
+    def toggle_details_visibility(self):
+        self.hide_details = not self.hide_details
+        self._apply_details_visibility()
+        self.config["hide_details"] = self.hide_details
+        save_receiver_config(self.config)
+        logger.info(f"Standby details visibility toggled: Hidden={self.hide_details}")
+
+    def on_control_command(self, cmd: dict):
+        """Processes remote control commands (e.g. Window Management) received from Sender."""
+        cmd_type = cmd.get("type")
+        if cmd_type == "window_control":
+            action = cmd.get("action")
+            logger.info(f"Executing remote window control command: {action}")
+            if action == "maximize":
+                self.showFullScreen()
+            elif action == "normal":
+                self.showNormal()
+                screen_geom = QApplication.primaryScreen().geometry()
+                target_w = min(1280, int(screen_geom.width() * 0.8))
+                target_h = min(720, int(screen_geom.height() * 0.8))
+                self.resize(target_w, target_h)
+                self.move(
+                    (screen_geom.width() - target_w) // 2,
+                    (screen_geom.height() - target_h) // 2,
+                )
+            elif action == "minimize":
+                self.showMinimized()
+
     def keyPressEvent(self, event: QKeyEvent):
-        # Escape or F11 toggles / exits fullscreen
         if event.key() == Qt.Key_Escape:
             self.close()
         elif event.key() == Qt.Key_F11:
@@ -777,6 +916,14 @@ class ReceiverMainWindow(QMainWindow):
             }
         """
         )
+
+        # Visibility Toggle Option
+        info_toggle_text = "Show Standby Details (IP/PIN)" if self.hide_details else "Hide Standby Details (IP/PIN)"
+        toggle_info_act = QAction(info_toggle_text, self)
+        toggle_info_act.triggered.connect(self.toggle_details_visibility)
+        menu.addAction(toggle_info_act)
+
+        menu.addSeparator()
 
         if self.isFullScreen():
             fs_act = QAction("Exit Fullscreen (F11)", self)
