@@ -287,13 +287,25 @@ IID_IAudioClient = GUID(
 IID_IAudioCaptureClient = GUID(
     0xC8ADBD64, 0xE71E, 0x48A0, 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17
 )
+# Official Windows SDK IID for IAudioEndpointVolume
 IID_IAudioEndpointVolume = GUID(
-    0x5BC69FDE, 0x075F, 0x4D0B, 0x80, 0x4E, 0x40, 0x7E, 0x2A, 0x40, 0x1A, 0x3E
+    0x5CDF2C82, 0x841E, 0x4546, 0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A
 )
 
 AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
 AUDCLNT_SHAREMODE_SHARED = 0
 CLSCTX_ALL = 23
+
+
+def _release_com_ptr(ptr: c_void_p):
+    """Releases an IUnknown COM pointer."""
+    if ptr and ptr.value:
+        try:
+            vtbl = ctypes.cast(ptr, POINTER(POINTER(c_void_p))).contents
+            release_func = ctypes.WINFUNCTYPE(c_ulong, c_void_p)(vtbl[2])
+            release_func(ptr)
+        except Exception:
+            pass
 
 
 class HostAudioController:
@@ -303,10 +315,14 @@ class HostAudioController:
     def set_host_mute(mute: bool) -> bool:
         if sys.platform != "win32":
             return False
+
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitialize(None)
+        p_enum = c_void_p()
+        p_dev = c_void_p()
+        p_ep_vol = c_void_p()
+
         try:
-            ole32 = ctypes.windll.ole32
-            ole32.CoInitialize(None)
-            p_enum = c_void_p()
             hr = ole32.CoCreateInstance(
                 byref(CLSID_MMDeviceEnumerator),
                 None,
@@ -321,7 +337,6 @@ class HostAudioController:
             get_endpoint = ctypes.WINFUNCTYPE(
                 HRESULT, c_void_p, c_int, c_int, POINTER(c_void_p)
             )(enum_vtbl[4])
-            p_dev = c_void_p()
             hr = get_endpoint(p_enum, 0, 0, byref(p_dev))
             if hr != 0 or not p_dev.value:
                 return False
@@ -331,7 +346,6 @@ class HostAudioController:
                 HRESULT, c_void_p, POINTER(GUID), c_ulong, c_void_p, POINTER(c_void_p)
             )(dev_vtbl[3])
 
-            p_ep_vol = c_void_p()
             hr = activate(p_dev, byref(IID_IAudioEndpointVolume), CLSCTX_ALL, None, byref(p_ep_vol))
             if hr != 0 or not p_ep_vol.value:
                 return False
@@ -345,15 +359,23 @@ class HostAudioController:
         except Exception as ex:
             print(f"[DEBUG Host Audio] Set mute exception: {ex}")
             return False
+        finally:
+            _release_com_ptr(p_ep_vol)
+            _release_com_ptr(p_dev)
+            _release_com_ptr(p_enum)
 
     @staticmethod
     def get_host_mute() -> bool:
         if sys.platform != "win32":
             return False
+
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitialize(None)
+        p_enum = c_void_p()
+        p_dev = c_void_p()
+        p_ep_vol = c_void_p()
+
         try:
-            ole32 = ctypes.windll.ole32
-            ole32.CoInitialize(None)
-            p_enum = c_void_p()
             hr = ole32.CoCreateInstance(
                 byref(CLSID_MMDeviceEnumerator),
                 None,
@@ -363,32 +385,37 @@ class HostAudioController:
             )
             if hr != 0 or not p_enum.value:
                 return False
+
             enum_vtbl = ctypes.cast(p_enum, POINTER(POINTER(c_void_p))).contents
             get_endpoint = ctypes.WINFUNCTYPE(
                 HRESULT, c_void_p, c_int, c_int, POINTER(c_void_p)
             )(enum_vtbl[4])
-            p_dev = c_void_p()
             hr = get_endpoint(p_enum, 0, 0, byref(p_dev))
             if hr != 0 or not p_dev.value:
                 return False
+
             dev_vtbl = ctypes.cast(p_dev, POINTER(POINTER(c_void_p))).contents
             activate = ctypes.WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(GUID), c_ulong, c_void_p, POINTER(c_void_p)
             )(dev_vtbl[3])
 
-            p_ep_vol = c_void_p()
             hr = activate(p_dev, byref(IID_IAudioEndpointVolume), CLSCTX_ALL, None, byref(p_ep_vol))
             if hr != 0 or not p_ep_vol.value:
                 return False
+
             ep_vtbl = ctypes.cast(p_ep_vol, POINTER(POINTER(c_void_p))).contents
             get_mute = ctypes.WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(c_int)
             )(ep_vtbl[15])
             is_muted = c_int(0)
             hr = get_mute(p_ep_vol, byref(is_muted))
-            return bool(is_muted.value)
+            return bool(is_muted.value) if hr == 0 else False
         except Exception:
             return False
+        finally:
+            _release_com_ptr(p_ep_vol)
+            _release_com_ptr(p_dev)
+            _release_com_ptr(p_enum)
 
 
 class NativeWindowsWasapiLoopback:
@@ -1544,10 +1571,14 @@ class FloatingSenderWindow(QWidget):
 
     def toggle_host_mute(self):
         """Mutes/Unmutes physical PC speakers without affecting TV loopback capture."""
-        self.is_host_muted = not self.is_host_muted
-        HostAudioController.set_host_mute(self.is_host_muted)
+        new_state = not self.is_host_muted
+        success = HostAudioController.set_host_mute(new_state)
+        if success:
+            self.is_host_muted = new_state
+        else:
+            self.is_host_muted = HostAudioController.get_host_mute()
         self._update_host_mute_ui()
-        print(f"[DEBUG Sender] Host physical speaker mute state: {self.is_host_muted}")
+        print(f"[DEBUG Sender] Host physical speaker mute state: {self.is_host_muted} (success={success})")
 
     def _update_host_mute_ui(self):
         if self.is_host_muted:
