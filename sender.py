@@ -2,15 +2,16 @@
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Features: Ctrl+Click Mini Pill Pause/Resume Toggle, Native 64-bit Windows WASAPI
+Features: Host Speaker Mute Toggle (Mutes Host PC, Streams to Receiver TV),
+          TV Audio Volume Slider (0% - 150%), Live Mid-Stream FPS & Quality Switching,
+          Ctrl+Click Mini Pill Pause/Resume Toggle, Native 64-bit Windows WASAPI
           Desktop Audio Loopback (Driverless COM ctypes), Real-Time Hardware Mouse
           Cursor Overlay, Dynamic Audio Negotiation, Taskbar Click Toggle,
           Custom Application Icon, Enter Key Screenshare Trigger, Save IP to
           history.json ONLY on Success, Strict Always-On-Top Enforcer,
           Highly-Visible Collapsed Mini Pill (Hover-Illuminated, 30% Base Opacity),
           Ultra-Crisp Text Rendering (4:4:4 Chroma Subsampling, Optimized Matrices),
-          High-Throughput 2MB TCP Socket, Auto-Discovery, Robust Auto-Connect,
-          Optional PIN Auth, 60 FPS.
+          High-Throughput 2MB TCP Socket, Auto-Discovery, Robust Auto-Connect.
 """
 
 import ctypes
@@ -228,7 +229,6 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
 
     h, w, _ = bgr_image.shape
     if 0 <= cx < w and 0 <= cy < h:
-        # Standard cursor arrow polygon vertices
         pts = np.array(
             [
                 [cx, cy],
@@ -241,15 +241,13 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
             ],
             np.int32,
         )
-        # Black border outline for contrast against light backgrounds
         cv2.polylines(bgr_image, [pts], isClosed=True, color=(0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
-        # Crisp white fill for contrast against dark backgrounds
         cv2.fillPoly(bgr_image, [pts], color=(255, 255, 255), lineType=cv2.LINE_AA)
         cv2.polylines(bgr_image, [pts], isClosed=True, color=(20, 20, 20), thickness=1, lineType=cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
-# Native Windows WASAPI Audio Loopback Capture (ctypes COM Implementation)
+# Native Windows WASAPI Audio Loopback & Host Speaker Mute (ctypes COM)
 # ---------------------------------------------------------------------------
 
 
@@ -289,10 +287,108 @@ IID_IAudioClient = GUID(
 IID_IAudioCaptureClient = GUID(
     0xC8ADBD64, 0xE71E, 0x48A0, 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17
 )
+IID_IAudioEndpointVolume = GUID(
+    0x5BC69FDE, 0x075F, 0x4D0B, 0x80, 0x4E, 0x40, 0x7E, 0x2A, 0x40, 0x1A, 0x3E
+)
 
 AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
 AUDCLNT_SHAREMODE_SHARED = 0
 CLSCTX_ALL = 23
+
+
+class HostAudioController:
+    """Controls physical host speaker mute without affecting loopback capture."""
+
+    @staticmethod
+    def set_host_mute(mute: bool) -> bool:
+        if sys.platform != "win32":
+            return False
+        try:
+            ole32 = ctypes.windll.ole32
+            ole32.CoInitialize(None)
+            p_enum = c_void_p()
+            hr = ole32.CoCreateInstance(
+                byref(CLSID_MMDeviceEnumerator),
+                None,
+                CLSCTX_ALL,
+                byref(IID_IMMDeviceEnumerator),
+                byref(p_enum),
+            )
+            if hr != 0 or not p_enum.value:
+                return False
+
+            enum_vtbl = ctypes.cast(p_enum, POINTER(POINTER(c_void_p))).contents
+            get_endpoint = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, c_int, c_int, POINTER(c_void_p)
+            )(enum_vtbl[4])
+            p_dev = c_void_p()
+            hr = get_endpoint(p_enum, 0, 0, byref(p_dev))
+            if hr != 0 or not p_dev.value:
+                return False
+
+            dev_vtbl = ctypes.cast(p_dev, POINTER(POINTER(c_void_p))).contents
+            activate = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, POINTER(GUID), c_ulong, c_void_p, POINTER(c_void_p)
+            )(dev_vtbl[3])
+
+            p_ep_vol = c_void_p()
+            hr = activate(p_dev, byref(IID_IAudioEndpointVolume), CLSCTX_ALL, None, byref(p_ep_vol))
+            if hr != 0 or not p_ep_vol.value:
+                return False
+
+            ep_vtbl = ctypes.cast(p_ep_vol, POINTER(POINTER(c_void_p))).contents
+            set_mute = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, c_int, c_void_p
+            )(ep_vtbl[14])
+            hr = set_mute(p_ep_vol, 1 if mute else 0, None)
+            return hr == 0
+        except Exception as ex:
+            print(f"[DEBUG Host Audio] Set mute exception: {ex}")
+            return False
+
+    @staticmethod
+    def get_host_mute() -> bool:
+        if sys.platform != "win32":
+            return False
+        try:
+            ole32 = ctypes.windll.ole32
+            ole32.CoInitialize(None)
+            p_enum = c_void_p()
+            hr = ole32.CoCreateInstance(
+                byref(CLSID_MMDeviceEnumerator),
+                None,
+                CLSCTX_ALL,
+                byref(IID_IMMDeviceEnumerator),
+                byref(p_enum),
+            )
+            if hr != 0 or not p_enum.value:
+                return False
+            enum_vtbl = ctypes.cast(p_enum, POINTER(POINTER(c_void_p))).contents
+            get_endpoint = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, c_int, c_int, POINTER(c_void_p)
+            )(enum_vtbl[4])
+            p_dev = c_void_p()
+            hr = get_endpoint(p_enum, 0, 0, byref(p_dev))
+            if hr != 0 or not p_dev.value:
+                return False
+            dev_vtbl = ctypes.cast(p_dev, POINTER(POINTER(c_void_p))).contents
+            activate = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, POINTER(GUID), c_ulong, c_void_p, POINTER(c_void_p)
+            )(dev_vtbl[3])
+
+            p_ep_vol = c_void_p()
+            hr = activate(p_dev, byref(IID_IAudioEndpointVolume), CLSCTX_ALL, None, byref(p_ep_vol))
+            if hr != 0 or not p_ep_vol.value:
+                return False
+            ep_vtbl = ctypes.cast(p_ep_vol, POINTER(POINTER(c_void_p))).contents
+            get_mute = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, POINTER(c_int)
+            )(ep_vtbl[15])
+            is_muted = c_int(0)
+            hr = get_mute(p_ep_vol, byref(is_muted))
+            return bool(is_muted.value)
+        except Exception:
+            return False
 
 
 class NativeWindowsWasapiLoopback:
@@ -328,7 +424,6 @@ class NativeWindowsWasapiLoopback:
             if hr != 0 or not self.p_enumerator.value:
                 return False
 
-            # Vtbl call IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender=0, eConsole=0)
             enum_vtbl = ctypes.cast(
                 self.p_enumerator, POINTER(POINTER(c_void_p))
             ).contents
@@ -341,7 +436,6 @@ class NativeWindowsWasapiLoopback:
             if hr != 0 or not self.p_device.value:
                 return False
 
-            # Vtbl call IMMDevice::Activate(IID_IAudioClient)
             dev_vtbl = ctypes.cast(self.p_device, POINTER(POINTER(c_void_p))).contents
             activate_func = ctypes.WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(GUID), c_ulong, c_void_p, POINTER(c_void_p)
@@ -354,7 +448,6 @@ class NativeWindowsWasapiLoopback:
             if hr != 0 or not self.audio_client.value:
                 return False
 
-            # Vtbl call IAudioClient::GetMixFormat
             client_vtbl = ctypes.cast(
                 self.audio_client, POINTER(POINTER(c_void_p))
             ).contents
@@ -375,7 +468,7 @@ class NativeWindowsWasapiLoopback:
                 fmt.wFormatTag == 0xFFFE and self.bits_per_sample == 32
             )
 
-            # Vtbl call IAudioClient::Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, REFERENCE_TIME, REFERENCE_TIME)
+            # Initialize 64-bit REFERENCE_TIME values
             init_func = ctypes.WINFUNCTYPE(
                 HRESULT, c_void_p, c_int, c_ulong, c_int64, c_int64, c_void_p, c_void_p
             )(client_vtbl[3])
@@ -391,7 +484,6 @@ class NativeWindowsWasapiLoopback:
             if hr != 0:
                 return False
 
-            # Vtbl call IAudioClient::GetService(IID_IAudioCaptureClient)
             get_service_func = ctypes.WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(GUID), POINTER(c_void_p)
             )(client_vtbl[14])
@@ -402,7 +494,6 @@ class NativeWindowsWasapiLoopback:
             if hr != 0 or not self.capture_client.value:
                 return False
 
-            # Vtbl call IAudioClient::Start
             start_func = ctypes.WINFUNCTYPE(HRESULT, c_void_p)(client_vtbl[10])
             start_func(self.audio_client)
 
@@ -416,8 +507,8 @@ class NativeWindowsWasapiLoopback:
             print(f"[DEBUG Sender Audio] Native WASAPI loopback init failed: {ex}")
             return False
 
-    def read_pcm16_chunk(self) -> Optional[bytes]:
-        """Captures available PCM frames converted to 16-bit stereo PCM."""
+    def read_pcm16_chunk(self, volume: float = 1.0) -> Optional[bytes]:
+        """Captures available PCM frames converted to 16-bit stereo PCM with volume scaling."""
         if not self.initialized or not self.capture_client:
             return None
 
@@ -474,7 +565,9 @@ class NativeWindowsWasapiLoopback:
                         arr = arr[:, :2]
                     elif self.channels == 1:
                         arr = np.repeat(arr, 2, axis=1)
-                    pcm16 = (np.clip(arr, -1.0, 1.0) * 32767.0).astype(np.int16)
+
+                    scaled = arr * volume
+                    pcm16 = (np.clip(scaled, -1.0, 1.0) * 32767.0).astype(np.int16)
                     pcm_bytes = pcm16.tobytes()
                 elif self.bits_per_sample == 16:
                     short_buf = (c_short * total_samples).from_address(p_data.value)
@@ -483,7 +576,12 @@ class NativeWindowsWasapiLoopback:
                         arr = arr[:, :2]
                     elif self.channels == 1:
                         arr = np.repeat(arr, 2, axis=1)
-                    pcm_bytes = arr.astype(np.int16).tobytes()
+
+                    if volume != 1.0:
+                        scaled = np.clip(arr.astype(np.float32) * volume, -32768.0, 32767.0).astype(np.int16)
+                        pcm_bytes = scaled.tobytes()
+                    else:
+                        pcm_bytes = arr.astype(np.int16).tobytes()
                 else:
                     pcm_bytes = b"\x00" * (frame_count * CHANNELS * 2)
 
@@ -697,6 +795,15 @@ class ScreenSenderThread(QThread):
         self.running = True
         self.paused = False
 
+    def set_fps_limit(self, fps: int):
+        self.fps_limit = max(1, fps)
+        print(f"[DEBUG Sender Video] Dynamic framerate adjusted to: {self.fps_limit} FPS")
+
+    def set_quality_params(self, quality: int, use_444: bool):
+        self.quality = quality
+        self.use_444_chroma = use_444
+        print(f"[DEBUG Sender Video] Dynamic quality adjusted to: {self.quality}% (4:4:4={self.use_444_chroma})")
+
     def run(self):
         print(
             f"[DEBUG Sender Video] Connecting to {self.target_ip}:{VIDEO_PORT} "
@@ -745,19 +852,6 @@ class ScreenSenderThread(QThread):
             self.status_changed.emit(f"Connect Error: {e}", False)
             return
 
-        target_frame_time = 1.0 / max(1, self.fps_limit)
-
-        # High-Fidelity JPEG Encoding with Full Chroma Preservation
-        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-
-        if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
-            encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
-
-        if self.use_444_chroma:
-            sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
-            sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
-            encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
-
         with create_mss_instance() as sct:
             monitor = sct.monitors[1]
             mon_left = monitor["left"]
@@ -777,6 +871,16 @@ class ScreenSenderThread(QThread):
                 # Render mouse pointer overlay onto frame
                 render_cursor_on_frame(bgr, mon_left, mon_top)
 
+                # Dynamic encoding parameters
+                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
+                    encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
+
+                if self.use_444_chroma:
+                    sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
+                    sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
+                    encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+
                 success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
 
                 if success:
@@ -788,6 +892,7 @@ class ScreenSenderThread(QThread):
                         break
 
                 elapsed = time.perf_counter() - t_start
+                target_frame_time = 1.0 / max(1, self.fps_limit)
                 sleep_sec = target_frame_time - elapsed
                 if sleep_sec > 0:
                     self.msleep(int(sleep_sec * 1000))
@@ -806,12 +911,16 @@ class ScreenSenderThread(QThread):
 
 
 class AudioSenderThread(QThread):
-    def __init__(self, target_ip: str):
+    def __init__(self, target_ip: str, volume: float = 1.0):
         super().__init__()
         self.target_ip = target_ip
+        self.volume = volume
         self.running = True
         self.muted = False
         self.sock: Optional[socket.socket] = None
+
+    def set_volume(self, vol: float):
+        self.volume = max(0.0, min(1.5, vol))
 
     def run(self):
         wasapi = NativeWindowsWasapiLoopback()
@@ -820,7 +929,7 @@ class AudioSenderThread(QThread):
 
         print(
             f"[DEBUG Sender Audio] Connecting to {self.target_ip}:{AUDIO_PORT} "
-            f"(Native WASAPI: {use_native_wasapi}, Rate: {sample_rate} Hz)..."
+            f"(Native WASAPI: {use_native_wasapi}, Rate: {sample_rate} Hz, TV Volume: {int(self.volume * 100)}%)..."
         )
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -838,10 +947,9 @@ class AudioSenderThread(QThread):
             return
 
         if use_native_wasapi:
-            # Native direct loopback capture loop
             while self.running:
                 if not self.muted:
-                    chunk = wasapi.read_pcm16_chunk()
+                    chunk = wasapi.read_pcm16_chunk(volume=self.volume)
                     if chunk and self.sock:
                         try:
                             self.sock.sendall(chunk)
@@ -854,12 +962,15 @@ class AudioSenderThread(QThread):
                     self.msleep(50)
             wasapi.stop()
         else:
-            # Fallback for Linux or systems without native WASAPI
             if AUDIO_AVAILABLE:
                 def callback(indata, frames, time_info, status):
                     if self.running and not self.muted and self.sock:
                         try:
-                            self.sock.sendall(indata.tobytes())
+                            if self.volume != 1.0:
+                                scaled = np.clip(indata.astype(np.float32) * self.volume, -32768.0, 32767.0).astype(np.int16)
+                                self.sock.sendall(scaled.tobytes())
+                            else:
+                                self.sock.sendall(indata.tobytes())
                         except Exception:
                             pass
 
@@ -998,7 +1109,9 @@ class FloatingSenderWindow(QWidget):
 
         self.is_mini_mode = False
         self.is_paused = False
-        self.is_muted = False
+        self.is_stream_muted = False
+        self.is_host_muted = False
+        self.tv_volume = 1.0
         self.discovered_ip = ""
         self.pin_required = False
         self.status_color = "#8f9bb3"
@@ -1097,7 +1210,7 @@ class FloatingSenderWindow(QWidget):
             }
             QPushButton {
                 background-color: #0078d4; color: white; border: none;
-                border-radius: 6px; font-weight: bold; font-size: 11px; padding: 6px 12px;
+                border-radius: 6px; font-weight: bold; font-size: 11px; padding: 6px 10px;
             }
             QPushButton:hover { background-color: #106ebe; }
             QCheckBox { color: #8f9bb3; font-size: 11px; }
@@ -1157,15 +1270,18 @@ class FloatingSenderWindow(QWidget):
         ip_row.addWidget(self.connect_btn)
         self.card_layout.addLayout(ip_row)
 
-        # Row 2: FPS & Ultra-Quality Preset Selector
+        # Row 2: Live-Adjustable FPS & Ultra-Quality Preset Selector
         qual_row = QHBoxLayout()
         self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["60 FPS", "30 FPS"])
+        self.fps_combo.addItems(["60 FPS", "30 FPS", "120 FPS", "15 FPS"])
         self.fps_combo.setCurrentIndex(0)
+        self.fps_combo.currentIndexChanged.connect(self.on_fps_changed)
+        self.fps_combo.setToolTip("Framerate can be modified live at any time without stopping.")
 
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(["Ultra Crisp (98% 4:4:4)", "High Quality (90%)", "Balanced (75%)"])
         self.quality_combo.setCurrentIndex(0)
+        self.quality_combo.currentIndexChanged.connect(self.on_quality_changed)
         self.quality_combo.setToolTip("Ultra Crisp preserves 4:4:4 full color resolution for razor-sharp text.")
 
         qual_row.addWidget(self.fps_combo)
@@ -1189,30 +1305,61 @@ class FloatingSenderWindow(QWidget):
         auto_row.addWidget(self.pin_input)
         self.card_layout.addLayout(auto_row)
 
-        # Row 4: Action Buttons
+        # Row 4: Action Buttons (Pause, TV Stream Mute, Host Speaker Mute)
         btn_row = QHBoxLayout()
         self.pause_btn = QPushButton("⏸ Pause")
         self.pause_btn.clicked.connect(self.toggle_pause)
         self.pause_btn.setEnabled(False)
 
-        self.mute_btn = QPushButton("🔊 Audio On")
-        self.mute_btn.clicked.connect(self.toggle_mute)
-        self.mute_btn.setEnabled(False)
+        self.stream_mute_btn = QPushButton("🔊 TV Audio")
+        self.stream_mute_btn.clicked.connect(self.toggle_stream_mute)
+        self.stream_mute_btn.setEnabled(False)
+
+        self.host_mute_btn = QPushButton("🔇 Mute Host")
+        self.host_mute_btn.setToolTip("Mutes local PC speakers so audio only plays through the TV")
+        self.host_mute_btn.clicked.connect(self.toggle_host_mute)
 
         btn_row.addWidget(self.pause_btn)
-        btn_row.addWidget(self.mute_btn)
+        btn_row.addWidget(self.stream_mute_btn)
+        btn_row.addWidget(self.host_mute_btn)
         self.card_layout.addLayout(btn_row)
 
-        # Row 5: Opacity Slider
+        # Row 5: TV Volume Slider
+        tv_vol_row = QHBoxLayout()
+        tv_vol_lbl_title = QLabel("TV Vol:")
+        tv_vol_lbl_title.setFixedWidth(46)
+        self.tv_vol_slider = QSlider(Qt.Horizontal)
+        self.tv_vol_slider.setRange(0, 150)
+        self.tv_vol_slider.setValue(100)
+        self.tv_vol_slider.valueChanged.connect(self.on_tv_volume_changed)
+
+        self.tv_vol_val_lbl = QLabel("100%")
+        self.tv_vol_val_lbl.setFixedWidth(34)
+        self.tv_vol_val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        tv_vol_row.addWidget(tv_vol_lbl_title)
+        tv_vol_row.addWidget(self.tv_vol_slider)
+        tv_vol_row.addWidget(self.tv_vol_val_lbl)
+        self.card_layout.addLayout(tv_vol_row)
+
+        # Row 6: Opacity Slider
         trans_row = QHBoxLayout()
-        trans_row.addWidget(QLabel("Opacity:"))
+        op_lbl_title = QLabel("Opacity:")
+        op_lbl_title.setFixedWidth(46)
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(20, 100)
         self.opacity_slider.setValue(94)
         self.opacity_slider.valueChanged.connect(
             lambda v: self.setWindowOpacity(v / 100.0) if not self.is_mini_mode else None
         )
+        self.op_val_lbl = QLabel("94%")
+        self.op_val_lbl.setFixedWidth(34)
+        self.op_val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.opacity_slider.valueChanged.connect(lambda v: self.op_val_lbl.setText(f"{v}%"))
+
+        trans_row.addWidget(op_lbl_title)
         trans_row.addWidget(self.opacity_slider)
+        trans_row.addWidget(self.op_val_lbl)
         self.card_layout.addLayout(trans_row)
 
         # -------------------------------------------------------------------
@@ -1242,6 +1389,11 @@ class FloatingSenderWindow(QWidget):
 
         self.main_layout.addWidget(self.stack)
         self.expand_window()
+
+        # Initialize Host Audio Mute button status
+        if sys.platform == "win32":
+            self.is_host_muted = HostAudioController.get_host_mute()
+            self._update_host_mute_ui()
 
     def _load_saved_history(self):
         saved_ip = load_ip_from_history()
@@ -1329,7 +1481,6 @@ class FloatingSenderWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             if self.is_mini_mode and not self._is_dragging:
-                # Ctrl+Click triggers Pause / Resume
                 if event.modifiers() & Qt.ControlModifier:
                     self.toggle_pause()
                 else:
@@ -1366,8 +1517,46 @@ class FloatingSenderWindow(QWidget):
         menu.exec(event.globalPos())
 
     # -----------------------------------------------------------------------
-    # Streaming & Connection Logic
+    # Streaming & Dynamic Control Logic
     # -----------------------------------------------------------------------
+    def on_fps_changed(self, index: int):
+        fps_map = {0: 60, 1: 30, 2: 120, 3: 15}
+        chosen_fps = fps_map.get(index, 60)
+        if self.stream_thread:
+            self.stream_thread.set_fps_limit(chosen_fps)
+
+    def on_quality_changed(self, index: int):
+        if index == 0:
+            target_quality, use_444 = 98, True
+        elif index == 1:
+            target_quality, use_444 = 90, True
+        else:
+            target_quality, use_444 = 75, False
+
+        if self.stream_thread:
+            self.stream_thread.set_quality_params(target_quality, use_444)
+
+    def on_tv_volume_changed(self, val: int):
+        self.tv_vol_val_lbl.setText(f"{val}%")
+        self.tv_volume = val / 100.0
+        if self.audio_thread:
+            self.audio_thread.set_volume(self.tv_volume)
+
+    def toggle_host_mute(self):
+        """Mutes/Unmutes physical PC speakers without affecting TV loopback capture."""
+        self.is_host_muted = not self.is_host_muted
+        HostAudioController.set_host_mute(self.is_host_muted)
+        self._update_host_mute_ui()
+        print(f"[DEBUG Sender] Host physical speaker mute state: {self.is_host_muted}")
+
+    def _update_host_mute_ui(self):
+        if self.is_host_muted:
+            self.host_mute_btn.setText("🔊 Unmute Host")
+            self.host_mute_btn.setStyleSheet("background-color: #d83b01; color: white;")
+        else:
+            self.host_mute_btn.setText("🔇 Mute Host")
+            self.host_mute_btn.setStyleSheet("background-color: #262c3b; color: #ffffff;")
+
     def on_device_discovered(self, ip: str, pin_required: bool):
         self.discovered_ip = ip
         self.pin_required = pin_required
@@ -1404,31 +1593,27 @@ class FloatingSenderWindow(QWidget):
             print("[DEBUG Sender] Cannot start sharing: No target IP provided.")
             return
 
-        chosen_fps = 60 if self.fps_combo.currentIndex() == 0 else 30
+        fps_map = {0: 60, 1: 30, 2: 120, 3: 15}
+        chosen_fps = fps_map.get(self.fps_combo.currentIndex(), 60)
         pin_code = self.pin_input.text().strip()
 
         quality_idx = self.quality_combo.currentIndex()
         if quality_idx == 0:
-            target_quality = 98
-            use_444 = True
+            target_quality, use_444 = 98, True
         elif quality_idx == 1:
-            target_quality = 90
-            use_444 = True
+            target_quality, use_444 = 90, True
         else:
-            target_quality = 75
-            use_444 = False
+            target_quality, use_444 = 75, False
 
         print(
             f"[DEBUG Sender] Starting stream to {target_ip} (FPS: {chosen_fps}, "
-            f"Quality: {target_quality}, 4:4:4 Chroma: {use_444}, PIN: '{pin_code}')..."
+            f"Quality: {target_quality}, 4:4:4 Chroma: {use_444}, TV Volume: {int(self.tv_volume * 100)}%)..."
         )
 
-        self.fps_combo.setEnabled(False)
-        self.quality_combo.setEnabled(False)
         self.connect_btn.setText("Stop")
         self.connect_btn.setStyleSheet("background-color: #d83b01;")
         self.pause_btn.setEnabled(True)
-        self.mute_btn.setEnabled(True)
+        self.stream_mute_btn.setEnabled(True)
 
         self.stream_thread = ScreenSenderThread(
             target_ip=target_ip,
@@ -1440,7 +1625,7 @@ class FloatingSenderWindow(QWidget):
         self.stream_thread.status_changed.connect(self.on_stream_status)
         self.stream_thread.start()
 
-        self.audio_thread = AudioSenderThread(target_ip)
+        self.audio_thread = AudioSenderThread(target_ip, volume=self.tv_volume)
         self.audio_thread.start()
 
         self.input_thread = InputReceiverThread(target_ip)
@@ -1456,13 +1641,11 @@ class FloatingSenderWindow(QWidget):
         self.input_thread = None
         self.is_paused = False
 
-        self.fps_combo.setEnabled(True)
-        self.quality_combo.setEnabled(True)
         self.connect_btn.setText("Share")
         self.connect_btn.setStyleSheet("background-color: #0078d4;")
         self.pause_btn.setText("⏸ Pause")
         self.pause_btn.setEnabled(False)
-        self.mute_btn.setEnabled(False)
+        self.stream_mute_btn.setEnabled(False)
 
         self._update_status_color("#8f9bb3")
 
@@ -1479,12 +1662,12 @@ class FloatingSenderWindow(QWidget):
 
             print(f"[DEBUG Sender] Screen pause state toggled to: {self.is_paused}")
 
-    def toggle_mute(self):
+    def toggle_stream_mute(self):
         if self.audio_thread:
-            self.is_muted = not self.is_muted
-            self.audio_thread.muted = self.is_muted
-            self.mute_btn.setText("🔇 Muted" if self.is_muted else "🔊 Audio On")
-            print(f"[DEBUG Sender] Audio mute state: {self.is_muted}")
+            self.is_stream_muted = not self.is_stream_muted
+            self.audio_thread.muted = self.is_stream_muted
+            self.stream_mute_btn.setText("🔇 TV Muted" if self.is_stream_muted else "🔊 TV Audio")
+            print(f"[DEBUG Sender] TV stream audio mute state: {self.is_stream_muted}")
 
     def on_stream_status(self, text: str, active: bool):
         print(f"[DEBUG Sender] Stream status updated: '{text}' (active={active})")
