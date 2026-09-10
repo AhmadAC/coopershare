@@ -2,7 +2,8 @@
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Features: Host Speaker Mute Toggle (Mutes Host PC, Streams to Receiver TV),
+Features: Persistent Always-On-Top Collapsed Mini Pill (WS_EX_TOPMOST + Non-Intrusive Guard),
+          Host Speaker Mute Toggle (Mutes Host PC, Streams to Receiver TV),
           TV Audio Volume Slider (0% - 150%), Live Mid-Stream FPS & Quality Switching,
           Ctrl+Click Mini Pill Pause/Resume Toggle, Native 64-bit Windows WASAPI
           Desktop Audio Loopback (Driverless COM ctypes), Real-Time Hardware Mouse
@@ -44,7 +45,7 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP") != "
 import cv2
 import mss
 import numpy as np
-from PySide6.QtCore import QEvent, QPoint, Qt, QThread, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -287,7 +288,6 @@ IID_IAudioClient = GUID(
 IID_IAudioCaptureClient = GUID(
     0xC8ADBD64, 0xE71E, 0x48A0, 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17
 )
-# Official Windows SDK IID for IAudioEndpointVolume
 IID_IAudioEndpointVolume = GUID(
     0x5CDF2C82, 0x841E, 0x4546, 0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A
 )
@@ -1147,6 +1147,12 @@ class FloatingSenderWindow(QWidget):
         self._setup_ui()
         self._load_saved_history()
 
+        # Non-intrusive Topmost Enforcer Timer for Collapsed Mini Pill
+        self.topmost_timer = QTimer(self)
+        self.topmost_timer.setInterval(500)
+        self.topmost_timer.timeout.connect(self._on_topmost_timer)
+        self.topmost_timer.start()
+
         # Start listening for auto-discovery beacon
         self.discovery_thread = DiscoveryListenerThread()
         self.discovery_thread.device_found.connect(self.on_device_discovered)
@@ -1182,6 +1188,14 @@ class FloatingSenderWindow(QWidget):
         if sys.platform == "win32":
             try:
                 hwnd = int(self.winId())
+                GWL_EXSTYLE = -20
+                WS_EX_TOPMOST = 0x00000008
+                ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                if not (ex_style & WS_EX_TOPMOST):
+                    ctypes.windll.user32.SetWindowLongW(
+                        hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOPMOST
+                    )
+
                 HWND_TOPMOST = -1
                 SWP_NOMOVE = 0x0002
                 SWP_NOSIZE = 0x0001
@@ -1199,6 +1213,11 @@ class FloatingSenderWindow(QWidget):
             except Exception:
                 pass
         self.raise_()
+
+    def _on_topmost_timer(self):
+        """Periodically ensures the collapsed mini pill stays on top without taking focus."""
+        if self.is_mini_mode and not self.isMinimized():
+            self.enforce_always_on_top()
 
     def changeEvent(self, event: QEvent):
         """Handles taskbar minimize and restore state toggling cleanly."""
@@ -1489,6 +1508,7 @@ class FloatingSenderWindow(QWidget):
     def leaveEvent(self, event):
         if self.is_mini_mode:
             self.setWindowOpacity(0.35)
+            self.enforce_always_on_top()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
@@ -1504,6 +1524,8 @@ class FloatingSenderWindow(QWidget):
             if diff.manhattanLength() > 2:
                 self._is_dragging = True
                 self.move(self._window_start_pos + diff)
+                if self.is_mini_mode:
+                    self.enforce_always_on_top()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
