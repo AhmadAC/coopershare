@@ -2,11 +2,11 @@
 
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
-Features: Fullscreen Frameless Mode (No Title Bar), Dynamic Audio Playback,
-          Onedir Hot-Replaceable Script Bootstrap, UDP Broadcast Beacon,
-          4-Digit PIN Authentication, Multi-Touch Canvas, Direct Bilinear
-          GPU-Accelerated Blitting, 2MB Socket Buffers, Rotating File Logging,
-          Non-blocking Clean Thread Shutdown.
+Features: Fullscreen Frameless Mode, Right-Click Context Menu (Exit Fullscreen / Exit App),
+          Dynamic Audio Playback, Onedir Hot-Replaceable Script Bootstrap,
+          UDP Broadcast Beacon, 4-Digit PIN Authentication, Multi-Touch Canvas,
+          Direct Bilinear GPU-Accelerated Blitting, 2MB Socket Buffers,
+          Rotating File Logging, Non-blocking Clean Thread Shutdown.
 """
 
 import json
@@ -39,13 +39,14 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP_REC") 
 import cv2
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QThread, Signal
-from PySide6.QtGui import QFont, QImage, QKeyEvent, QPainter, QPixmap
+from PySide6.QtGui import QAction, QFont, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -594,6 +595,10 @@ class TouchDisplayCanvas(QWidget):
         return super().event(event)
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            event.ignore()
+            return
+
         norm = self._normalize_pos(event.position())
         if norm:
             self.control_server.send_event(
@@ -601,11 +606,7 @@ class TouchDisplayCanvas(QWidget):
                     "type": "mouse_down",
                     "x": norm[0],
                     "y": norm[1],
-                    "button": (
-                        "left"
-                        if event.button() == Qt.LeftButton
-                        else "right"
-                    ),
+                    "button": "left",
                 }
             )
 
@@ -617,6 +618,10 @@ class TouchDisplayCanvas(QWidget):
             )
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton:
+            event.ignore()
+            return
+
         norm = self._normalize_pos(event.position())
         if norm:
             self.control_server.send_event(
@@ -624,11 +629,7 @@ class TouchDisplayCanvas(QWidget):
                     "type": "mouse_up",
                     "x": norm[0],
                     "y": norm[1],
-                    "button": (
-                        "left"
-                        if event.button() == Qt.LeftButton
-                        else "right"
-                    ),
+                    "button": "left",
                 }
             )
 
@@ -636,6 +637,13 @@ class TouchDisplayCanvas(QWidget):
         self.control_server.send_event(
             {"type": "scroll", "dy": event.angleDelta().y()}
         )
+
+    def contextMenuEvent(self, event):
+        main_win = self.window()
+        if hasattr(main_win, "show_context_menu"):
+            main_win.show_context_menu(event.globalPos())
+        else:
+            event.ignore()
 
 
 class ReceiverMainWindow(QMainWindow):
@@ -707,8 +715,8 @@ class ReceiverMainWindow(QMainWindow):
         )
         self.pin_req_cb.stateChanged.connect(self.on_pin_req_changed)
 
-        hint_lbl = QLabel("Press ESC or F11 to toggle fullscreen / exit")
-        hint_lbl.setStyleSheet("color: #4b5568; font-size: 12px; margin-top: 20px;")
+        hint_lbl = QLabel("Right-click anywhere for menu • Press ESC / F11 to toggle fullscreen")
+        hint_lbl.setStyleSheet("color: #4b5568; font-size: 13px; margin-top: 20px;")
 
         sb_layout.addWidget(title, alignment=Qt.AlignCenter)
         sb_layout.addWidget(self.ip_lbl, alignment=Qt.AlignCenter)
@@ -731,6 +739,59 @@ class ReceiverMainWindow(QMainWindow):
             else:
                 self.showFullScreen()
         super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event):
+        self.show_context_menu(event.globalPos())
+
+    def show_context_menu(self, global_pos):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            """
+            QMenu {
+                background-color: #1a1e29;
+                color: #ffffff;
+                border: 1px solid #3d475f;
+                border-radius: 8px;
+                padding: 4px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 13px;
+            }
+            QMenu::item {
+                padding: 7px 24px 7px 12px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #333c4d;
+                margin: 4px 6px;
+            }
+        """
+        )
+
+        if self.isFullScreen():
+            fs_act = QAction("Exit Fullscreen (F11)", self)
+            fs_act.triggered.connect(self.showNormal)
+        else:
+            fs_act = QAction("Enter Fullscreen (F11)", self)
+            fs_act.triggered.connect(self.showFullScreen)
+        menu.addAction(fs_act)
+
+        if self.stack.currentWidget() == self.canvas:
+            disc_act = QAction("Disconnect Stream", self)
+            disc_act.triggered.connect(self.on_disconnected)
+            menu.addAction(disc_act)
+
+        menu.addSeparator()
+
+        exit_act = QAction("Exit Application (Esc)", self)
+        exit_act.triggered.connect(self.close)
+        menu.addAction(exit_act)
+
+        menu.exec(global_pos)
 
     def on_pin_req_changed(self, state):
         req = self.is_pin_required()
