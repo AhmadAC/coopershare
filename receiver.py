@@ -1,6 +1,3 @@
-
-#################### START OF FILE: receiver.py ####################
-
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
 Features: Fullscreen Frameless Mode, Remote Window Management (Maximize, Make Smaller,
@@ -860,18 +857,32 @@ class ReceiverMainWindow(QMainWindow):
         if cmd_type == "window_control":
             action = cmd.get("action")
             logger.info(f"Executing remote window control command: {action}")
+            screen = self.screen() or QApplication.primaryScreen()
+            geom = screen.geometry() if screen else QRect(0, 0, 1920, 1080)
+
             if action == "maximize":
+                if self.isMinimized():
+                    self.showNormal()
+                self.setWindowState(Qt.WindowFullScreen)
+                self.setGeometry(geom)
                 self.showFullScreen()
+                self.raise_()
+                self.activateWindow()
             elif action == "normal":
+                if self.isMinimized():
+                    self.showNormal()
+                self.setWindowState(Qt.WindowNoState)
                 self.showNormal()
-                screen_geom = QApplication.primaryScreen().geometry()
-                target_w = min(1280, int(screen_geom.width() * 0.8))
-                target_h = min(720, int(screen_geom.height() * 0.8))
-                self.resize(target_w, target_h)
-                self.move(
-                    (screen_geom.width() - target_w) // 2,
-                    (screen_geom.height() - target_h) // 2,
+                target_w = min(1280, int(geom.width() * 0.8))
+                target_h = min(720, int(geom.height() * 0.8))
+                self.setGeometry(
+                    geom.x() + (geom.width() - target_w) // 2,
+                    geom.y() + (geom.height() - target_h) // 2,
+                    target_w,
+                    target_h,
                 )
+                self.raise_()
+                self.activateWindow()
             elif action == "minimize":
                 self.showMinimized()
 
