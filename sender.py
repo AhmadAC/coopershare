@@ -2,8 +2,8 @@
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Features: Ctrl+Click Mini Pill Pause/Resume Toggle, Native Windows WASAPI Desktop
-          Audio Loopback Capture (Driverless COM ctypes), Real-Time Hardware Mouse
+Features: Ctrl+Click Mini Pill Pause/Resume Toggle, Native 64-bit Windows WASAPI
+          Desktop Audio Loopback (Driverless COM ctypes), Real-Time Hardware Mouse
           Cursor Overlay, Dynamic Audio Negotiation, Taskbar Click Toggle,
           Custom Application Icon, Enter Key Screenshare Trigger, Save IP to
           history.json ONLY on Success, Strict Always-On-Top Enforcer,
@@ -14,7 +14,7 @@ Features: Ctrl+Click Mini Pill Pause/Resume Toggle, Native Windows WASAPI Deskto
 """
 
 import ctypes
-from ctypes import HRESULT, POINTER, Structure, byref, c_float, c_int, c_long, c_short, c_ubyte, c_uint, c_ulong, c_ushort, c_void_p
+from ctypes import HRESULT, POINTER, Structure, byref, c_float, c_int, c_int64, c_long, c_short, c_ubyte, c_uint, c_uint64, c_ulong, c_ushort, c_void_p
 import json
 import os
 import runpy
@@ -277,15 +277,6 @@ class WAVEFORMATEX(Structure):
     ]
 
 
-class WAVEFORMATEXTENSIBLE(Structure):
-    _fields_ = [
-        ("Format", WAVEFORMATEX),
-        ("Samples", c_ushort),
-        ("dwChannelMask", c_ulong),
-        ("SubFormat", GUID),
-    ]
-
-
 CLSID_MMDeviceEnumerator = GUID(
     0xBCDE0395, 0xE52F, 0x467C, 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E
 )
@@ -305,7 +296,7 @@ CLSCTX_ALL = 23
 
 
 class NativeWindowsWasapiLoopback:
-    """Zero-dependency direct Windows WASAPI desktop speaker loopback capture."""
+    """Zero-dependency direct 64-bit Windows WASAPI desktop speaker loopback capture."""
 
     def __init__(self):
         self.initialized = False
@@ -384,9 +375,9 @@ class NativeWindowsWasapiLoopback:
                 fmt.wFormatTag == 0xFFFE and self.bits_per_sample == 32
             )
 
-            # Vtbl call IAudioClient::Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK)
+            # Vtbl call IAudioClient::Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, REFERENCE_TIME, REFERENCE_TIME)
             init_func = ctypes.WINFUNCTYPE(
-                HRESULT, c_void_p, c_int, c_ulong, c_long, c_long, c_void_p, c_void_p
+                HRESULT, c_void_p, c_int, c_ulong, c_int64, c_int64, c_void_p, c_void_p
             )(client_vtbl[3])
             hr = init_func(
                 self.audio_client,
@@ -440,8 +431,8 @@ class NativeWindowsWasapiLoopback:
                 POINTER(c_void_p),
                 POINTER(c_uint),
                 POINTER(c_ulong),
-                POINTER(c_ulong),
-                POINTER(c_ulong),
+                POINTER(c_uint64),
+                POINTER(c_uint64),
             )(cap_vtbl[3])
             release_buffer_func = ctypes.WINFUNCTYPE(HRESULT, c_void_p, c_uint)(
                 cap_vtbl[4]
@@ -854,10 +845,11 @@ class AudioSenderThread(QThread):
                     if chunk and self.sock:
                         try:
                             self.sock.sendall(chunk)
-                        except Exception:
+                        except Exception as ex:
+                            print(f"[DEBUG Sender Audio] Transmit error: {ex}")
                             break
                     else:
-                        self.msleep(5)
+                        self.msleep(4)
                 else:
                     self.msleep(50)
             wasapi.stop()

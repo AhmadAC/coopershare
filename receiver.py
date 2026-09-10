@@ -3,10 +3,11 @@
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
 Features: Fullscreen Frameless Mode, Right-Click Context Menu (Exit Fullscreen / Exit App),
-          Dynamic Audio Playback, Onedir Hot-Replaceable Script Bootstrap,
-          UDP Broadcast Beacon, 4-Digit PIN Authentication, Multi-Touch Canvas,
-          Direct Bilinear GPU-Accelerated Blitting, 2MB Socket Buffers,
-          Rotating File Logging, Non-blocking Clean Thread Shutdown.
+          Dynamic Multi-Channel Audio Playback (Reshaped 2D Stereo Stream),
+          Onedir Hot-Replaceable Script Bootstrap, UDP Broadcast Beacon,
+          4-Digit PIN Authentication, Multi-Touch Canvas, Direct Bilinear
+          GPU-Accelerated Blitting, 2MB Socket Buffers, Rotating File Logging,
+          Non-blocking Clean Thread Shutdown.
 """
 
 import json
@@ -404,29 +405,34 @@ class AudioServerThread(QThread):
                         latency="low",
                     )
                     out_stream.start()
-                    logger.info("Audio output playback stream active.")
+                    logger.info(f"Audio output playback stream active ({sample_rate} Hz, {CHANNELS} channels).")
                 except Exception as ex:
                     logger.error(f"Failed to open audio playback stream: {ex}")
                     conn.close()
                     continue
 
                 audio_buf = bytearray()
+                frame_bytes = CHANNELS * 2  # 4 bytes per frame in int16 stereo
+
                 while self.running:
                     try:
-                        pcm_data = conn.recv(4096)
+                        pcm_data = conn.recv(8192)
                         if not pcm_data:
+                            logger.info(f"Audio stream closed by sender {addr[0]}")
                             break
                         audio_buf.extend(pcm_data)
 
-                        # Align to 4-byte frame boundaries (2 channels * 2 bytes per int16)
-                        valid_bytes = len(audio_buf) - (len(audio_buf) % (CHANNELS * 2))
-                        if valid_bytes > 0:
-                            samples = np.frombuffer(audio_buf[:valid_bytes], dtype=np.int16)
+                        # Align to 4-byte frame boundaries and reshape to 2D (frames, channels)
+                        valid_bytes = len(audio_buf) - (len(audio_buf) % frame_bytes)
+                        if valid_bytes >= frame_bytes:
+                            samples = np.frombuffer(audio_buf[:valid_bytes], dtype=np.int16).reshape(-1, CHANNELS)
                             audio_buf = audio_buf[valid_bytes:]
                             out_stream.write(samples)
                     except socket.timeout:
                         continue
-                    except Exception:
+                    except Exception as ex:
+                        if self.running:
+                            logger.error(f"Audio playback exception: {ex}")
                         break
 
                 try:
@@ -436,7 +442,7 @@ class AudioServerThread(QThread):
                     pass
 
                 conn.close()
-                logger.info(f"Audio connection with {addr[0]} closed.")
+                logger.info(f"Audio session with {addr[0]} concluded.")
             except socket.timeout:
                 continue
             except Exception as e:
