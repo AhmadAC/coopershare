@@ -2,16 +2,18 @@
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
-Features: Onedir Hot-Replaceable Script Bootstrap, Taskbar Click Toggle,
-          Custom Application Icon, Enter Key Screenshare Trigger,
+Features: Native Windows WASAPI Desktop Audio Loopback Capture (Driverless COM ctypes),
+          Real-Time Hardware Mouse Cursor Overlay, Dynamic Audio Negotiation,
+          Taskbar Click Toggle, Custom Application Icon, Enter Key Screenshare Trigger,
           Save IP to history.json ONLY on Success, Strict Always-On-Top Enforcer,
           Highly-Visible Collapsed Mini Pill (Hover-Illuminated, 30% Base Opacity),
-          RDP-Level Quality (4:4:4 Chroma Subsampling, Crisp Text Rendering),
+          Ultra-Crisp Text Rendering (4:4:4 Chroma Subsampling, Optimized Matrices),
           High-Throughput 2MB TCP Socket, Auto-Discovery, Robust Auto-Connect,
           Optional PIN Auth, 60 FPS.
 """
 
 import ctypes
+from ctypes import HRESULT, POINTER, Structure, byref, c_float, c_int, c_long, c_short, c_ubyte, c_uint, c_ulong, c_ushort, c_void_p
 import json
 import os
 import runpy
@@ -67,7 +69,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# Optional Sound Support
+# Optional Sound Support Fallback
 try:
     import sounddevice as sd
 
@@ -97,9 +99,9 @@ VIDEO_PORT = 9988
 CONTROL_PORT = 9989
 AUDIO_PORT = 9990
 DISCOVERY_PORT = 9991
-SAMPLE_RATE = 44100
+DEFAULT_SAMPLE_RATE = 48000
 CHANNELS = 2
-SOCKET_BUFFER_SIZE = 2 * 1024 * 1024  # 2MB High-Fidelity Buffer
+SOCKET_BUFFER_SIZE = 2 * 1024 * 1024  # 2MB High-Throughput Buffer
 
 # Ensure proper Windows Taskbar Grouping & Icon
 if sys.platform == "win32":
@@ -154,20 +156,16 @@ def create_application_icon() -> QIcon:
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.Antialiasing, True)
 
-    # Blue Rounded Background Badge
     painter.setBrush(QColor("#0078d4"))
     painter.setPen(Qt.NoPen)
     painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
 
-    # White Screen Frame
     painter.setBrush(QColor("#ffffff"))
     painter.drawRoundedRect(14, 15, 36, 24, 4, 4)
 
-    # Screen Display Area
     painter.setBrush(QColor("#1a1e29"))
     painter.drawRect(18, 19, 28, 16)
 
-    # Screen Stand & Base
     painter.setBrush(QColor("#ffffff"))
     painter.drawRect(29, 41, 6, 4)
     painter.drawRoundedRect(22, 45, 20, 3, 1, 1)
@@ -197,6 +195,322 @@ def create_mss_instance():
     if hasattr(mss, "MSS"):
         return mss.MSS()
     return mss.mss()
+
+
+# ---------------------------------------------------------------------------
+# Mouse Cursor Overlay Renderer
+# ---------------------------------------------------------------------------
+
+
+class POINT(Structure):
+    _fields_ = [("x", c_long), ("y", c_long)]
+
+
+def get_system_cursor_position() -> tuple[int, int]:
+    """Retrieves absolute global mouse cursor screen coordinates."""
+    if sys.platform == "win32":
+        try:
+            pt = POINT()
+            ctypes.windll.user32.GetCursorPos(byref(pt))
+            return int(pt.x), int(pt.y)
+        except Exception:
+            pass
+    pos = QCursor.pos()
+    return pos.x(), pos.y()
+
+
+def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top: int):
+    """Draws a high-contrast anti-aliased mouse pointer onto the frame."""
+    gx, gy = get_system_cursor_position()
+    cx = gx - monitor_left
+    cy = gy - monitor_top
+
+    h, w, _ = bgr_image.shape
+    if 0 <= cx < w and 0 <= cy < h:
+        # Standard cursor arrow polygon vertices
+        pts = np.array(
+            [
+                [cx, cy],
+                [cx, cy + 18],
+                [cx + 4, cy + 14],
+                [cx + 8, cy + 22],
+                [cx + 11, cy + 21],
+                [cx + 7, cy + 13],
+                [cx + 14, cy + 13],
+            ],
+            np.int32,
+        )
+        # Black border outline for contrast against light backgrounds
+        cv2.polylines(bgr_image, [pts], isClosed=True, color=(0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
+        # Crisp white fill for contrast against dark backgrounds
+        cv2.fillPoly(bgr_image, [pts], color=(255, 255, 255), lineType=cv2.LINE_AA)
+        cv2.polylines(bgr_image, [pts], isClosed=True, color=(20, 20, 20), thickness=1, lineType=cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# Native Windows WASAPI Audio Loopback Capture (ctypes COM Implementation)
+# ---------------------------------------------------------------------------
+
+
+class GUID(Structure):
+    _fields_ = [
+        ("Data1", c_ulong),
+        ("Data2", c_ushort),
+        ("Data3", c_ushort),
+        ("Data4", c_ubyte * 8),
+    ]
+
+    def __init__(self, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8):
+        super().__init__(l, w1, w2, (c_ubyte * 8)(b1, b2, b3, b4, b5, b6, b7, b8))
+
+
+class WAVEFORMATEX(Structure):
+    _fields_ = [
+        ("wFormatTag", c_ushort),
+        ("nChannels", c_ushort),
+        ("nSamplesPerSec", c_ulong),
+        ("nAvgBytesPerSec", c_ulong),
+        ("nBlockAlign", c_ushort),
+        ("wBitsPerSample", c_ushort),
+        ("cbSize", c_ushort),
+    ]
+
+
+class WAVEFORMATEXTENSIBLE(Structure):
+    _fields_ = [
+        ("Format", WAVEFORMATEX),
+        ("Samples", c_ushort),
+        ("dwChannelMask", c_ulong),
+        ("SubFormat", GUID),
+    ]
+
+
+CLSID_MMDeviceEnumerator = GUID(
+    0xBCDE0395, 0xE52F, 0x467C, 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E
+)
+IID_IMMDeviceEnumerator = GUID(
+    0xA95664D2, 0x9614, 0x4F35, 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6
+)
+IID_IAudioClient = GUID(
+    0x1CB9AD4C, 0xDBFA, 0x4C32, 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2
+)
+IID_IAudioCaptureClient = GUID(
+    0xC8ADBD64, 0xE71E, 0x48A0, 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17
+)
+
+AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
+AUDCLNT_SHAREMODE_SHARED = 0
+CLSCTX_ALL = 23
+
+
+class NativeWindowsWasapiLoopback:
+    """Zero-dependency direct Windows WASAPI desktop speaker loopback capture."""
+
+    def __init__(self):
+        self.initialized = False
+        self.sample_rate = DEFAULT_SAMPLE_RATE
+        self.channels = CHANNELS
+        self.bits_per_sample = 32
+        self.is_float = True
+        self.audio_client = None
+        self.capture_client = None
+        self.p_enumerator = None
+        self.p_device = None
+
+    def start(self) -> bool:
+        if sys.platform != "win32":
+            return False
+
+        try:
+            ole32 = ctypes.windll.ole32
+            ole32.CoInitialize(None)
+
+            self.p_enumerator = c_void_p()
+            hr = ole32.CoCreateInstance(
+                byref(CLSID_MMDeviceEnumerator),
+                None,
+                CLSCTX_ALL,
+                byref(IID_IMMDeviceEnumerator),
+                byref(self.p_enumerator),
+            )
+            if hr != 0 or not self.p_enumerator.value:
+                return False
+
+            # Vtbl call IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender=0, eConsole=0)
+            enum_vtbl = ctypes.cast(
+                self.p_enumerator, POINTER(POINTER(c_void_p))
+            ).contents
+            get_endpoint_func = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, c_int, c_int, POINTER(c_void_p)
+            )(enum_vtbl[4])
+
+            self.p_device = c_void_p()
+            hr = get_endpoint_func(self.p_enumerator, 0, 0, byref(self.p_device))
+            if hr != 0 or not self.p_device.value:
+                return False
+
+            # Vtbl call IMMDevice::Activate(IID_IAudioClient)
+            dev_vtbl = ctypes.cast(self.p_device, POINTER(POINTER(c_void_p))).contents
+            activate_func = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, POINTER(GUID), c_ulong, c_void_p, POINTER(c_void_p)
+            )(dev_vtbl[3])
+
+            self.audio_client = c_void_p()
+            hr = activate_func(
+                self.p_device, byref(IID_IAudioClient), CLSCTX_ALL, None, byref(self.audio_client)
+            )
+            if hr != 0 or not self.audio_client.value:
+                return False
+
+            # Vtbl call IAudioClient::GetMixFormat
+            client_vtbl = ctypes.cast(
+                self.audio_client, POINTER(POINTER(c_void_p))
+            ).contents
+            get_format_func = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, POINTER(POINTER(WAVEFORMATEX))
+            )(client_vtbl[8])
+
+            pwfx = POINTER(WAVEFORMATEX)()
+            hr = get_format_func(self.audio_client, byref(pwfx))
+            if hr != 0 or not pwfx:
+                return False
+
+            fmt = pwfx.contents
+            self.sample_rate = int(fmt.nSamplesPerSec)
+            self.channels = int(fmt.nChannels)
+            self.bits_per_sample = int(fmt.wBitsPerSample)
+            self.is_float = (fmt.wFormatTag == 3) or (
+                fmt.wFormatTag == 0xFFFE and self.bits_per_sample == 32
+            )
+
+            # Vtbl call IAudioClient::Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK)
+            init_func = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, c_int, c_ulong, c_long, c_long, c_void_p, c_void_p
+            )(client_vtbl[3])
+            hr = init_func(
+                self.audio_client,
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                2000000,
+                0,
+                pwfx,
+                None,
+            )
+            if hr != 0:
+                return False
+
+            # Vtbl call IAudioClient::GetService(IID_IAudioCaptureClient)
+            get_service_func = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, POINTER(GUID), POINTER(c_void_p)
+            )(client_vtbl[14])
+            self.capture_client = c_void_p()
+            hr = get_service_func(
+                self.audio_client, byref(IID_IAudioCaptureClient), byref(self.capture_client)
+            )
+            if hr != 0 or not self.capture_client.value:
+                return False
+
+            # Vtbl call IAudioClient::Start
+            start_func = ctypes.WINFUNCTYPE(HRESULT, c_void_p)(client_vtbl[10])
+            start_func(self.audio_client)
+
+            self.initialized = True
+            print(
+                f"[DEBUG Sender Audio] Native WASAPI loopback active. Rate: {self.sample_rate} Hz, "
+                f"Channels: {self.channels}, Bits: {self.bits_per_sample}"
+            )
+            return True
+        except Exception as ex:
+            print(f"[DEBUG Sender Audio] Native WASAPI loopback init failed: {ex}")
+            return False
+
+    def read_pcm16_chunk(self) -> Optional[bytes]:
+        """Captures available PCM frames converted to 16-bit stereo PCM."""
+        if not self.initialized or not self.capture_client:
+            return None
+
+        try:
+            cap_vtbl = ctypes.cast(
+                self.capture_client, POINTER(POINTER(c_void_p))
+            ).contents
+            get_buffer_func = ctypes.WINFUNCTYPE(
+                HRESULT,
+                c_void_p,
+                POINTER(c_void_p),
+                POINTER(c_uint),
+                POINTER(c_ulong),
+                POINTER(c_ulong),
+                POINTER(c_ulong),
+            )(cap_vtbl[3])
+            release_buffer_func = ctypes.WINFUNCTYPE(HRESULT, c_void_p, c_uint)(
+                cap_vtbl[4]
+            )
+            get_next_packet_func = ctypes.WINFUNCTYPE(
+                HRESULT, c_void_p, POINTER(c_uint)
+            )(cap_vtbl[5])
+
+            pkt_size = c_uint(0)
+            get_next_packet_func(self.capture_client, byref(pkt_size))
+            if pkt_size.value == 0:
+                return None
+
+            p_data = c_void_p()
+            num_frames = c_uint(0)
+            flags = c_ulong(0)
+
+            hr = get_buffer_func(
+                self.capture_client,
+                byref(p_data),
+                byref(num_frames),
+                byref(flags),
+                None,
+                None,
+            )
+            if hr != 0 or num_frames.value == 0 or not p_data.value:
+                return None
+
+            frame_count = num_frames.value
+            total_samples = frame_count * self.channels
+
+            if flags.value & 0x01:  # AUDCLNT_BUFFERFLAGS_SILENT
+                pcm_bytes = b"\x00" * (frame_count * CHANNELS * 2)
+            else:
+                if self.is_float:
+                    float_buf = (c_float * total_samples).from_address(p_data.value)
+                    arr = np.ctypeslib.as_array(float_buf).reshape(-1, self.channels)
+                    if self.channels > 2:
+                        arr = arr[:, :2]
+                    elif self.channels == 1:
+                        arr = np.repeat(arr, 2, axis=1)
+                    pcm16 = (np.clip(arr, -1.0, 1.0) * 32767.0).astype(np.int16)
+                    pcm_bytes = pcm16.tobytes()
+                elif self.bits_per_sample == 16:
+                    short_buf = (c_short * total_samples).from_address(p_data.value)
+                    arr = np.ctypeslib.as_array(short_buf).reshape(-1, self.channels)
+                    if self.channels > 2:
+                        arr = arr[:, :2]
+                    elif self.channels == 1:
+                        arr = np.repeat(arr, 2, axis=1)
+                    pcm_bytes = arr.astype(np.int16).tobytes()
+                else:
+                    pcm_bytes = b"\x00" * (frame_count * CHANNELS * 2)
+
+            release_buffer_func(self.capture_client, num_frames)
+            return pcm_bytes
+        except Exception:
+            return None
+
+    def stop(self):
+        if self.audio_client:
+            try:
+                client_vtbl = ctypes.cast(
+                    self.audio_client, POINTER(POINTER(c_void_p))
+                ).contents
+                stop_func = ctypes.WINFUNCTYPE(HRESULT, c_void_p)(client_vtbl[11])
+                stop_func(self.audio_client)
+            except Exception:
+                pass
+        self.initialized = False
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +692,7 @@ class ScreenSenderThread(QThread):
         self,
         target_ip: str,
         pin: str = "",
-        quality: int = 95,
+        quality: int = 98,
         fps_limit: int = 60,
         use_444_chroma: bool = True,
     ):
@@ -432,7 +746,7 @@ class ScreenSenderThread(QThread):
                 return
 
             sock.settimeout(None)
-            print(f"[DEBUG Sender Video] Connected & Authorized. Streaming at {self.fps_limit} FPS (RDP Ultra Quality)...")
+            print(f"[DEBUG Sender Video] Connected & Authorized. Streaming at {self.fps_limit} FPS (Ultra Crisp)...")
             self.status_changed.emit(f"Streaming ({self.fps_limit} FPS)", True)
         except Exception as e:
             print(f"[DEBUG Sender Video] Connection error: {e}")
@@ -441,7 +755,7 @@ class ScreenSenderThread(QThread):
 
         target_frame_time = 1.0 / max(1, self.fps_limit)
 
-        # Build High-Fidelity RDP-Level Encoding Parameters
+        # High-Fidelity JPEG Encoding with Full Chroma Preservation
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
         if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
@@ -454,6 +768,8 @@ class ScreenSenderThread(QThread):
 
         with create_mss_instance() as sct:
             monitor = sct.monitors[1]
+            mon_left = monitor["left"]
+            mon_top = monitor["top"]
 
             while self.running:
                 t_start = time.perf_counter()
@@ -462,8 +778,13 @@ class ScreenSenderThread(QThread):
                     self.msleep(100)
                     continue
 
-                img = np.array(sct.grab(monitor))
+                raw_frame = sct.grab(monitor)
+                img = np.array(raw_frame)
                 bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+                # Render mouse pointer overlay onto frame
+                render_cursor_on_frame(bgr, mon_left, mon_top)
+
                 success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
 
                 if success:
@@ -501,38 +822,65 @@ class AudioSenderThread(QThread):
         self.sock: Optional[socket.socket] = None
 
     def run(self):
-        if not AUDIO_AVAILABLE:
-            return
-        print(f"[DEBUG Sender Audio] Connecting to {self.target_ip}:{AUDIO_PORT}...")
+        wasapi = NativeWindowsWasapiLoopback()
+        use_native_wasapi = wasapi.start()
+        sample_rate = wasapi.sample_rate if use_native_wasapi else DEFAULT_SAMPLE_RATE
+
+        print(
+            f"[DEBUG Sender Audio] Connecting to {self.target_ip}:{AUDIO_PORT} "
+            f"(Native WASAPI: {use_native_wasapi}, Rate: {sample_rate} Hz)..."
+        )
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.sock.settimeout(3.0)
             self.sock.connect((self.target_ip, AUDIO_PORT))
+
+            # Send 4-byte sample rate header to receiver
+            self.sock.sendall(struct.pack(">I", sample_rate))
             self.sock.settimeout(None)
-            print("[DEBUG Sender Audio] Connected to audio receiver.")
+            print("[DEBUG Sender Audio] Connected & streaming live desktop audio.")
         except Exception as e:
             print(f"[DEBUG Sender Audio] Connection failed: {e}")
+            wasapi.stop()
             return
 
-        def callback(indata, frames, time_info, status):
-            if self.running and not self.muted and self.sock:
-                try:
-                    self.sock.sendall(indata.tobytes())
-                except Exception:
-                    pass
+        if use_native_wasapi:
+            # Native direct loopback capture loop
+            while self.running:
+                if not self.muted:
+                    chunk = wasapi.read_pcm16_chunk()
+                    if chunk and self.sock:
+                        try:
+                            self.sock.sendall(chunk)
+                        except Exception:
+                            break
+                    else:
+                        self.msleep(5)
+                else:
+                    self.msleep(50)
+            wasapi.stop()
+        else:
+            # Fallback for Linux or systems without native WASAPI
+            if AUDIO_AVAILABLE:
+                def callback(indata, frames, time_info, status):
+                    if self.running and not self.muted and self.sock:
+                        try:
+                            self.sock.sendall(indata.tobytes())
+                        except Exception:
+                            pass
 
-        try:
-            with sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-                callback=callback,
-            ):
-                while self.running:
-                    self.msleep(100)
-        except Exception as e:
-            print(f"[DEBUG Sender Audio] InputStream error: {e}")
+                try:
+                    with sd.InputStream(
+                        samplerate=sample_rate,
+                        channels=CHANNELS,
+                        dtype="int16",
+                        callback=callback,
+                    ):
+                        while self.running:
+                            self.msleep(100)
+                except Exception as ex:
+                    print(f"[DEBUG Sender Audio] Audio capture notice: {ex}")
 
         if self.sock:
             try:
@@ -816,16 +1164,16 @@ class FloatingSenderWindow(QWidget):
         ip_row.addWidget(self.connect_btn)
         self.card_layout.addLayout(ip_row)
 
-        # Row 2: FPS & RDP-Quality Preset Selector
+        # Row 2: FPS & Ultra-Quality Preset Selector
         qual_row = QHBoxLayout()
         self.fps_combo = QComboBox()
         self.fps_combo.addItems(["60 FPS", "30 FPS"])
         self.fps_combo.setCurrentIndex(0)
 
         self.quality_combo = QComboBox()
-        self.quality_combo.addItems(["Ultra (RDP 4:4:4)", "High Quality (85)", "Balanced (70)"])
+        self.quality_combo.addItems(["Ultra Crisp (98% 4:4:4)", "High Quality (90%)", "Balanced (75%)"])
         self.quality_combo.setCurrentIndex(0)
-        self.quality_combo.setToolTip("Ultra uses full 4:4:4 chroma subsampling for crisp RDP-tier text.")
+        self.quality_combo.setToolTip("Ultra Crisp preserves 4:4:4 full color resolution for razor-sharp text.")
 
         qual_row.addWidget(self.fps_combo)
         qual_row.addWidget(self.quality_combo)
@@ -1022,7 +1370,6 @@ class FloatingSenderWindow(QWidget):
         if not self.ip_input.text().strip():
             self.ip_input.setText(ip)
 
-        # Trigger auto-connect if enabled and not already streaming
         if (
             self.auto_connect_cb.isChecked()
             and (not self.stream_thread or not self.stream_thread.isRunning())
@@ -1055,16 +1402,15 @@ class FloatingSenderWindow(QWidget):
         chosen_fps = 60 if self.fps_combo.currentIndex() == 0 else 30
         pin_code = self.pin_input.text().strip()
 
-        # Quality Preset Mapping
         quality_idx = self.quality_combo.currentIndex()
         if quality_idx == 0:
-            target_quality = 95
+            target_quality = 98
             use_444 = True
         elif quality_idx == 1:
-            target_quality = 85
+            target_quality = 90
             use_444 = True
         else:
-            target_quality = 70
+            target_quality = 75
             use_444 = False
 
         print(

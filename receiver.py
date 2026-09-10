@@ -2,10 +2,11 @@
 
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
-Features: Onedir Hot-Replaceable Script Bootstrap, UDP Broadcast Beacon,
-          4-Digit PIN Authentication, Multi-Touch Canvas, High-Fidelity
-          RDP-Tier Direct Pixel Rendering, 2MB Socket Buffers,
-          Rotating File Logging, Non-blocking Clean Thread Shutdown.
+Features: Fullscreen Frameless Mode (No Title Bar), Dynamic Audio Playback,
+          Onedir Hot-Replaceable Script Bootstrap, UDP Broadcast Beacon,
+          4-Digit PIN Authentication, Multi-Touch Canvas, Direct Bilinear
+          GPU-Accelerated Blitting, 2MB Socket Buffers, Rotating File Logging,
+          Non-blocking Clean Thread Shutdown.
 """
 
 import json
@@ -37,14 +38,15 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP_REC") 
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QEvent, QPointF, Qt, QThread, Signal
-from PySide6.QtGui import QFont, QImage, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QThread, Signal
+from PySide6.QtGui import QFont, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPushButton,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -88,9 +90,9 @@ VIDEO_PORT = 9988
 CONTROL_PORT = 9989
 AUDIO_PORT = 9990
 DISCOVERY_PORT = 9991
-SAMPLE_RATE = 44100
+DEFAULT_SAMPLE_RATE = 48000
 CHANNELS = 2
-SOCKET_BUFFER_SIZE = 2 * 1024 * 1024  # 2MB High Throughput Buffer
+SOCKET_BUFFER_SIZE = 2 * 1024 * 1024  # 2MB High-Throughput Buffer
 
 
 def get_local_ip() -> str:
@@ -188,7 +190,7 @@ class VideoServerThread(QThread):
         self.server_sock: Optional[socket.socket] = None
 
     def run(self):
-        logger.info(f"Video Server binding to 0.0.0.0:{self.port} (RDP-Quality mode)...")
+        logger.info(f"Video Server binding to 0.0.0.0:{self.port} (Ultra-Quality mode)...")
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -230,7 +232,6 @@ class VideoServerThread(QThread):
         logger.info("Video Server thread finished.")
 
     def _verify_handshake(self, conn: socket.socket, client_ip: str) -> bool:
-        """Verifies 4-digit PIN if PIN requirement is active."""
         try:
             conn.settimeout(5.0)
             header = recv_exact(conn, 4)
@@ -323,9 +324,8 @@ class VideoServerThread(QThread):
                 np_arr = np.frombuffer(frame_data, np.uint8)
                 img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if img is not None:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    h, w, ch = img_rgb.shape
-                    qimg = QImage(img_rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+                    h, w, ch = img.shape
+                    qimg = QImage(img.data, w, h, ch * w, QImage.Format_BGR888).copy()
                     self.frame_received.emit(qimg)
                     frames_count += 1
 
@@ -380,32 +380,60 @@ class AudioServerThread(QThread):
         self.server_sock.listen(1)
         self.server_sock.settimeout(0.5)
 
-        try:
-            out_stream = sd.OutputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16"
-            )
-            out_stream.start()
-            logger.info("Audio output stream started.")
-        except Exception as e:
-            logger.error(f"Failed to open audio output stream: {e}")
-            return
-
         while self.running:
             try:
                 conn, addr = self.server_sock.accept()
                 logger.info(f"Audio connection established with {addr[0]}")
+                conn.settimeout(3.0)
+
+                # Read 4-byte sample rate header
+                hdr = recv_exact(conn, 4)
+                sample_rate = DEFAULT_SAMPLE_RATE
+                if hdr:
+                    sample_rate = struct.unpack(">I", hdr)[0]
+                    logger.info(f"Negotiated audio sample rate: {sample_rate} Hz")
+
                 conn.settimeout(0.5)
+
+                try:
+                    out_stream = sd.OutputStream(
+                        samplerate=sample_rate,
+                        channels=CHANNELS,
+                        dtype="int16",
+                        latency="low",
+                    )
+                    out_stream.start()
+                    logger.info("Audio output playback stream active.")
+                except Exception as ex:
+                    logger.error(f"Failed to open audio playback stream: {ex}")
+                    conn.close()
+                    continue
+
+                audio_buf = bytearray()
                 while self.running:
                     try:
                         pcm_data = conn.recv(4096)
                         if not pcm_data:
                             break
-                        samples = np.frombuffer(pcm_data, dtype=np.int16)
-                        out_stream.write(samples)
+                        audio_buf.extend(pcm_data)
+
+                        # Align to 4-byte frame boundaries (2 channels * 2 bytes per int16)
+                        valid_bytes = len(audio_buf) - (len(audio_buf) % (CHANNELS * 2))
+                        if valid_bytes > 0:
+                            samples = np.frombuffer(audio_buf[:valid_bytes], dtype=np.int16)
+                            audio_buf = audio_buf[valid_bytes:]
+                            out_stream.write(samples)
                     except socket.timeout:
                         continue
                     except Exception:
                         break
+
+                try:
+                    out_stream.stop()
+                    out_stream.close()
+                except Exception:
+                    pass
+
                 conn.close()
                 logger.info(f"Audio connection with {addr[0]} closed.")
             except socket.timeout:
@@ -414,12 +442,6 @@ class AudioServerThread(QThread):
                 if self.running:
                     logger.error(f"Audio Server exception: {e}")
                 break
-
-        try:
-            out_stream.stop()
-            out_stream.close()
-        except Exception:
-            pass
 
         if self.server_sock:
             try:
@@ -500,7 +522,7 @@ class ControlServerThread(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Canvas & Main Window
+# Canvas & Fullscreen Main Window
 # ---------------------------------------------------------------------------
 
 
@@ -518,12 +540,12 @@ class TouchDisplayCanvas(QWidget):
         self.current_frame = QPixmap.fromImage(qimage)
         self.update()
 
-    def _get_video_rect(self):
+    def _get_video_rect(self) -> QRect:
         if not self.current_frame:
             return self.rect()
         pix_size = self.current_frame.size()
         pix_size.scale(self.size(), Qt.KeepAspectRatio)
-        return (
+        return QRect(
             (self.width() - pix_size.width()) // 2,
             (self.height() - pix_size.height()) // 2,
             pix_size.width(),
@@ -531,10 +553,10 @@ class TouchDisplayCanvas(QWidget):
         )
 
     def _normalize_pos(self, pos: QPointF) -> Optional[tuple[float, float]]:
-        vx, vy, vw, vh = self._get_video_rect()
-        if vw == 0 or vh == 0:
+        r = self._get_video_rect()
+        if r.width() == 0 or r.height() == 0:
             return None
-        nx, ny = (pos.x() - vx) / vw, (pos.y() - vy) / vh
+        nx, ny = (pos.x() - r.x()) / r.width(), (pos.y() - r.y()) / r.height()
         return (nx, ny) if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0 else None
 
     def paintEvent(self, event):
@@ -543,14 +565,8 @@ class TouchDisplayCanvas(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
         if self.current_frame:
-            vx, vy, vw, vh = self._get_video_rect()
-            if vw == self.current_frame.width() and vh == self.current_frame.height():
-                painter.drawPixmap(vx, vy, self.current_frame)
-            else:
-                scaled = self.current_frame.scaled(
-                    vw, vh, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-                painter.drawPixmap(vx, vy, scaled)
+            target_rect = self._get_video_rect()
+            painter.drawPixmap(target_rect, self.current_frame)
 
     def event(self, event: QEvent) -> bool:
         if event.type() in (
@@ -626,8 +642,11 @@ class ReceiverMainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MrCoopersScreenShare - Receiver (RDP Quality)")
-        self.resize(1280, 800)
+        self.setWindowTitle("MrCoopersScreenShare - Receiver")
+
+        # True Frameless Fullscreen Mode (No OS Title Bar)
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self.setStyleSheet("background-color: #0b0e14;")
 
         # Generate 4-digit PIN for session
         self.pin = f"{random.randint(1000, 9999)}"
@@ -664,39 +683,54 @@ class ReceiverMainWindow(QMainWindow):
 
         # Standby View
         self.standby = QWidget()
-        self.standby.setStyleSheet("background-color: #12161f;")
+        self.standby.setStyleSheet("background-color: #0d111a;")
         sb_layout = QVBoxLayout(self.standby)
         sb_layout.setAlignment(Qt.AlignCenter)
-        sb_layout.setSpacing(14)
+        sb_layout.setSpacing(18)
 
         title = QLabel("MrCoopersScreenShare")
-        title.setFont(QFont("Segoe UI", 34, QFont.Bold))
+        title.setFont(QFont("Segoe UI", 36, QFont.Bold))
         title.setStyleSheet("color: #00a2ed;")
 
         self.ip_lbl = QLabel(f"Display IP: {get_local_ip()}")
-        self.ip_lbl.setFont(QFont("Segoe UI", 22))
+        self.ip_lbl.setFont(QFont("Segoe UI", 24))
         self.ip_lbl.setStyleSheet("color: #ffffff;")
 
         self.pin_lbl = QLabel(f"PIN: {self.pin}")
-        self.pin_lbl.setFont(QFont("Segoe UI", 28, QFont.Bold))
+        self.pin_lbl.setFont(QFont("Segoe UI", 30, QFont.Bold))
         self.pin_lbl.setStyleSheet("color: #00d084; letter-spacing: 4px;")
 
         self.pin_req_cb = QCheckBox("Require 4-digit PIN to Connect")
         self.pin_req_cb.setChecked(False)
         self.pin_req_cb.setStyleSheet(
-            "color: #8f9bb3; font-size: 14px; margin-top: 10px;"
+            "color: #8f9bb3; font-size: 15px; margin-top: 10px;"
         )
         self.pin_req_cb.stateChanged.connect(self.on_pin_req_changed)
+
+        hint_lbl = QLabel("Press ESC or F11 to toggle fullscreen / exit")
+        hint_lbl.setStyleSheet("color: #4b5568; font-size: 12px; margin-top: 20px;")
 
         sb_layout.addWidget(title, alignment=Qt.AlignCenter)
         sb_layout.addWidget(self.ip_lbl, alignment=Qt.AlignCenter)
         sb_layout.addWidget(self.pin_lbl, alignment=Qt.AlignCenter)
         sb_layout.addWidget(self.pin_req_cb, alignment=Qt.AlignCenter)
+        sb_layout.addWidget(hint_lbl, alignment=Qt.AlignCenter)
 
         # Canvas View
         self.canvas = TouchDisplayCanvas(self.control_thread)
         self.stack.addWidget(self.standby)
         self.stack.addWidget(self.canvas)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        # Escape or F11 toggles / exits fullscreen
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        elif event.key() == Qt.Key_F11:
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self.showFullScreen()
+        super().keyPressEvent(event)
 
     def on_pin_req_changed(self, state):
         req = self.is_pin_required()
@@ -727,5 +761,5 @@ class ReceiverMainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = ReceiverMainWindow()
-    win.show()
+    win.showFullScreen()
     sys.exit(app.exec())
