@@ -1,7 +1,9 @@
 """
-MrCoopersScreenShare - Sender (PC Presenter & Control Executor)
+MrCoopersScreenShare - Sender (PC Presenter & Remote Controller)
 Features: Persistent Always-On-Top Collapsed Mini Pill (WS_EX_TOPMOST + Non-Intrusive Guard),
-          Remote Receiver Window Management (Maximize, Make Smaller, Minimize via Right-Click Context Menu),
+          Interactive Remote Receiver Screen Viewer & Mouse Controller (Bi-directional Screen Share),
+          Remote Script & Executable Launcher with Sys Arguments Dialog,
+          Remote Timer Dispatch Dialog, Remote Receiver Window Management,
           Device Name & IP Manager (Friendly Name Selection from Dropdown & Right-Click Context Menu),
           Receiver Touch / Input Injection Toggle, Host Speaker Mute Toggle,
           TV Audio Volume Slider (0% - 150%) with True Zero Silence Output on Mute,
@@ -13,7 +15,23 @@ Features: Persistent Always-On-Top Collapsed Mini Pill (WS_EX_TOPMOST + Non-Intr
 """
 
 import ctypes
-from ctypes import HRESULT, POINTER, Structure, byref, c_float, c_int, c_int64, c_long, c_short, c_ubyte, c_uint, c_uint64, c_ulong, c_ushort, c_void_p
+from ctypes import (
+    HRESULT,
+    POINTER,
+    Structure,
+    byref,
+    c_float,
+    c_int,
+    c_int64,
+    c_long,
+    c_short,
+    c_ubyte,
+    c_uint,
+    c_uint64,
+    c_ulong,
+    c_ushort,
+    c_void_p,
+)
 import json
 import math
 import os
@@ -44,13 +62,14 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP") != "
 import cv2
 import mss
 import numpy as np
-from PySide6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
     QCursor,
     QFont,
     QIcon,
+    QImage,
     QKeyEvent,
     QPainter,
     QPixmap,
@@ -59,11 +78,14 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
+    QMainWindow,
     QMenu,
     QPushButton,
     QSlider,
@@ -102,6 +124,7 @@ VIDEO_PORT = 9988
 CONTROL_PORT = 9989
 AUDIO_PORT = 9990
 DISCOVERY_PORT = 9991
+REVERSE_VIDEO_PORT = 9992
 DEFAULT_SAMPLE_RATE = 48000
 CHANNELS = 2
 SOCKET_BUFFER_SIZE = 2 * 1024 * 1024  # 2MB High-Throughput Buffer
@@ -192,7 +215,7 @@ def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
 
 
 def create_mss_instance():
-    """Returns a mss instance without deprecation warnings."""
+    """Returns an mss instance without deprecation warnings."""
     if hasattr(mss, "MSS"):
         return mss.MSS()
     return mss.mss()
@@ -493,7 +516,6 @@ class NativeWindowsWasapiLoopback:
                 fmt.wFormatTag == 0xFFFE and self.bits_per_sample == 32
             )
 
-            # Initialize 64-bit REFERENCE_TIME values
             init_func = ctypes.WINFUNCTYPE(
                 HRESULT, c_void_p, c_int, c_ulong, c_int64, c_int64, c_void_p, c_void_p
             )(client_vtbl[3])
@@ -580,7 +602,7 @@ class NativeWindowsWasapiLoopback:
             frame_count = num_frames.value
             total_samples = frame_count * self.channels
 
-            if flags.value & 0x01 or volume <= 0.0:  # Muted / Silent
+            if flags.value & 0x01 or volume <= 0.0:
                 pcm_bytes = b"\x00" * (frame_count * CHANNELS * 2)
             else:
                 if self.is_float:
@@ -746,7 +768,7 @@ class UniversalInputInjector:
 
 
 # ---------------------------------------------------------------------------
-# Background Threads (Discovery, Screen, Audio, Input)
+# Background Threads (Discovery, Screen, Audio, Input, Reverse Screen Receiver)
 # ---------------------------------------------------------------------------
 
 
@@ -845,11 +867,9 @@ class ScreenSenderThread(QThread):
             sock.settimeout(4.0)
             sock.connect((self.target_ip, VIDEO_PORT))
 
-            # Handshake with PIN
             handshake = json.dumps({"pin": self.pin}).encode("utf-8")
             sock.sendall(struct.pack(">L", len(handshake)) + handshake)
 
-            # Wait for handshake response
             resp_raw = recv_exact(sock, 4)
             if not resp_raw:
                 raise ConnectionError("Server rejected connection or closed socket.")
@@ -893,10 +913,8 @@ class ScreenSenderThread(QThread):
                 img = np.array(raw_frame)
                 bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-                # Render mouse pointer overlay onto frame
                 render_cursor_on_frame(bgr, mon_left, mon_top)
 
-                # Dynamic encoding parameters
                 encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
                 if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
                     encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
@@ -962,7 +980,6 @@ class AudioSenderThread(QThread):
             self.sock.settimeout(3.0)
             self.sock.connect((self.target_ip, AUDIO_PORT))
 
-            # Send 4-byte sample rate header to receiver
             self.sock.sendall(struct.pack(">I", sample_rate))
             self.sock.settimeout(None)
             print("[DEBUG Sender Audio] Connected & streaming live desktop audio.")
@@ -1040,7 +1057,7 @@ class InputReceiverThread(QThread):
         self._send_lock = threading.Lock()
 
     def send_command(self, cmd: dict):
-        """Sends remote control commands (e.g. Window Management) to the receiver."""
+        """Sends remote control commands (Window Management, Run Script, Timer, Remote Input) to receiver."""
         with self._send_lock:
             if self.sock:
                 try:
@@ -1110,7 +1127,6 @@ class InputReceiverThread(QThread):
                 data = data[msg_size:]
                 event = json.loads(raw_msg.decode("utf-8"))
 
-                # Check if input execution is enabled
                 if self.is_input_enabled_func():
                     injector.execute(event)
             except ConnectionResetError:
@@ -1126,7 +1142,7 @@ class InputReceiverThread(QThread):
                 sock.close()
             except Exception:
                 pass
-            self.sock = None
+                self.sock = None
         print("[DEBUG Sender Control] Input receiver thread stopped.")
 
     def stop(self):
@@ -1139,6 +1155,396 @@ class InputReceiverThread(QThread):
                     pass
                 self.sock = None
         self.wait(1000)
+
+
+class ReverseScreenReceiverThread(QThread):
+    """Receives and decodes the live screen stream from the Receiver to display in the viewer."""
+
+    frame_received = Signal(QImage)
+    disconnected = Signal()
+
+    def __init__(self, target_ip: str, port: int = REVERSE_VIDEO_PORT):
+        super().__init__()
+        self.target_ip = target_ip
+        self.port = port
+        self.running = True
+
+    def run(self):
+        print(f"[DEBUG Sender Viewer] Connecting to reverse screen stream at {self.target_ip}:{self.port}...")
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(4.0)
+            sock.connect((self.target_ip, self.port))
+            sock.settimeout(0.5)
+            print("[DEBUG Sender Viewer] Connected to Receiver Screen Stream.")
+        except Exception as e:
+            print(f"[DEBUG Sender Viewer] Connection to receiver stream failed: {e}")
+            self.disconnected.emit()
+            return
+
+        payload_size = struct.calcsize(">L")
+        data = bytearray()
+
+        while self.running:
+            try:
+                while len(data) < payload_size:
+                    if not self.running:
+                        break
+                    try:
+                        packet = sock.recv(131072)
+                        if not packet:
+                            raise ConnectionResetError
+                        data.extend(packet)
+                    except socket.timeout:
+                        continue
+
+                if not self.running:
+                    break
+
+                msg_size = struct.unpack(">L", data[:payload_size])[0]
+                data = data[payload_size:]
+
+                while len(data) < msg_size:
+                    if not self.running:
+                        break
+                    try:
+                        packet = sock.recv(min(msg_size - len(data), 131072))
+                        if not packet:
+                            raise ConnectionResetError
+                        data.extend(packet)
+                    except socket.timeout:
+                        continue
+
+                if not self.running:
+                    break
+
+                frame_data = data[:msg_size]
+                data = data[msg_size:]
+
+                np_arr = np.frombuffer(frame_data, np.uint8)
+                img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    h, w, ch = img.shape
+                    qimg = QImage(img.data, w, h, ch * w, QImage.Format_BGR888).copy()
+                    self.frame_received.emit(qimg)
+
+            except ConnectionResetError:
+                print("[DEBUG Sender Viewer] Receiver screen stream disconnected.")
+                break
+            except Exception as e:
+                if self.running:
+                    print(f"[DEBUG Sender Viewer] Frame processing error: {e}")
+                break
+
+        try:
+            sock.close()
+        except Exception:
+            pass
+        self.disconnected.emit()
+
+    def stop(self):
+        self.running = False
+        self.wait(1000)
+
+
+# ---------------------------------------------------------------------------
+# Interactive Remote Receiver Viewer & Controller Window
+# ---------------------------------------------------------------------------
+
+
+class RemoteReceiverCanvas(QWidget):
+    """Canvas widget rendering the receiver's screen and capturing interactive control events."""
+
+    def __init__(self, send_command_func, parent=None):
+        super().__init__(parent)
+        self.send_command_func = send_command_func
+        self.current_frame: Optional[QPixmap] = None
+        self.setMouseTracking(True)
+        self.setStyleSheet("background-color: #0d111a;")
+
+    def update_frame(self, qimage: QImage):
+        self.current_frame = QPixmap.fromImage(qimage)
+        self.update()
+
+    def _get_video_rect(self) -> QRect:
+        if not self.current_frame:
+            return self.rect()
+        pix_size = self.current_frame.size()
+        pix_size.scale(self.size(), Qt.KeepAspectRatio)
+        return QRect(
+            (self.width() - pix_size.width()) // 2,
+            (self.height() - pix_size.height()) // 2,
+            pix_size.width(),
+            pix_size.height(),
+        )
+
+    def _normalize_pos(self, pos: QPointF) -> Optional[tuple[float, float]]:
+        r = self._get_video_rect()
+        if r.width() == 0 or r.height() == 0:
+            return None
+        nx, ny = (pos.x() - r.x()) / r.width(), (pos.y() - r.y()) / r.height()
+        return (nx, ny) if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0 else None
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+
+        if self.current_frame:
+            target_rect = self._get_video_rect()
+            painter.drawPixmap(target_rect, self.current_frame)
+        else:
+            painter.setPen(QColor("#8f9bb3"))
+            painter.setFont(QFont("Segoe UI", 14))
+            painter.drawText(self.rect(), Qt.AlignCenter, "Connecting to Receiver Screen Stream...")
+
+    def mousePressEvent(self, event):
+        norm = self._normalize_pos(event.position())
+        if norm:
+            btn = "right" if event.button() == Qt.RightButton else "left"
+            self.send_command_func(
+                {"type": "remote_input", "event": {"type": "mouse_down", "x": norm[0], "y": norm[1], "button": btn}}
+            )
+
+    def mouseMoveEvent(self, event):
+        norm = self._normalize_pos(event.position())
+        if norm:
+            self.send_command_func(
+                {"type": "remote_input", "event": {"type": "mouse_move", "x": norm[0], "y": norm[1]}}
+            )
+
+    def mouseReleaseEvent(self, event):
+        norm = self._normalize_pos(event.position())
+        if norm:
+            btn = "right" if event.button() == Qt.RightButton else "left"
+            self.send_command_func(
+                {"type": "remote_input", "event": {"type": "mouse_up", "x": norm[0], "y": norm[1], "button": btn}}
+            )
+
+    def wheelEvent(self, event):
+        self.send_command_func(
+            {"type": "remote_input", "event": {"type": "scroll", "dy": event.angleDelta().y()}}
+        )
+
+
+class RemoteReceiverViewerWindow(QMainWindow):
+    """Full window displaying the live stream from the Receiver with interactive mouse control."""
+
+    def __init__(self, target_ip: str, send_command_func, parent=None):
+        super().__init__(parent)
+        self.target_ip = target_ip
+        self.send_command_func = send_command_func
+        self.setWindowTitle(f"Receiver Desktop Viewer & Controller ({target_ip})")
+        self.resize(1280, 720)
+        self.setStyleSheet("background-color: #0b0e14;")
+
+        self.canvas = RemoteReceiverCanvas(self.send_command_func, self)
+        self.setCentralWidget(self.canvas)
+
+        self.stream_thread = ReverseScreenReceiverThread(target_ip)
+        self.stream_thread.frame_received.connect(self.canvas.update_frame)
+        self.stream_thread.disconnected.connect(self.on_stream_disconnected)
+        self.stream_thread.start()
+
+    def on_stream_disconnected(self):
+        self.setWindowTitle(f"Receiver Desktop Viewer ({self.target_ip}) - Disconnected")
+
+    def closeEvent(self, event):
+        if self.stream_thread:
+            self.stream_thread.stop()
+        event.accept()
+
+
+# ---------------------------------------------------------------------------
+# Dialogs: Run Script / Executable & Timer Dispatch
+# ---------------------------------------------------------------------------
+
+
+class RunScriptDialog(QDialog):
+    """Dialog allowing the user to select an executable/shortcut and enter optional arguments."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Run Script / Executable on Receiver")
+        self.setFixedWidth(460)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #1a1e29;
+                border: 1px solid #3d475f;
+                border-radius: 10px;
+            }
+            QLabel {
+                color: #ffffff;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 12px;
+            }
+            QLineEdit {
+                background: #262c3b;
+                border: 1px solid #3d475f;
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-size: 12px;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 7px 14px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton#browse_btn {
+                background-color: #262c3b;
+                border: 1px solid #3d475f;
+            }
+            QPushButton#browse_btn:hover {
+                background-color: #333c4d;
+            }
+            QPushButton#cancel_btn {
+                background-color: #333c4d;
+            }
+            QPushButton#cancel_btn:hover {
+                background-color: #3f4a5e;
+            }
+            """
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel("Select Executable or Shortcut to Run on Receiver")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #00a2ed;")
+        layout.addWidget(title_lbl)
+
+        path_label = QLabel("Executable / Shortcut Path:")
+        layout.addWidget(path_label)
+
+        path_layout = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Select .exe, .lnk, .bat, or enter path...")
+        self.browse_btn = QPushButton("Browse...")
+        self.browse_btn.setObjectName("browse_btn")
+        self.browse_btn.clicked.connect(self._browse_file)
+        path_layout.addWidget(self.path_edit)
+        path_layout.addWidget(self.browse_btn)
+        layout.addLayout(path_layout)
+
+        args_label = QLabel("Optional Arguments (sys argv):")
+        layout.addWidget(args_label)
+
+        self.args_edit = QLineEdit()
+        self.args_edit.setPlaceholderText("e.g. -v --fullscreen /quiet (optional)")
+        self.args_edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.args_edit)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("cancel_btn")
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self.run_btn = QPushButton("Run Script")
+        self.run_btn.clicked.connect(self.accept)
+
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addWidget(self.run_btn)
+        layout.addLayout(btn_layout)
+
+    def _browse_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Executable or Shortcut",
+            "",
+            "Executables & Shortcuts (*.exe *.lnk *.bat *.cmd *.py);;All Files (*.*)",
+        )
+        if file_path:
+            self.path_edit.setText(file_path)
+
+    def get_data(self) -> tuple[str, str]:
+        return self.path_edit.text().strip(), self.args_edit.text().strip()
+
+
+class TimerDialog(QDialog):
+    """Dialog allowing the user to enter timer arguments and dispatch to the receiver."""
+
+    def __init__(parent=None, self=None):
+        pass  # Signature placeholder avoided below:
+
+
+class TimerDialog(QDialog):
+    """Dialog allowing the user to enter timer arguments and dispatch to the receiver."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Receiver Timer")
+        self.setFixedWidth(340)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #1a1e29;
+                border: 1px solid #3d475f;
+                border-radius: 10px;
+            }
+            QLabel {
+                color: #ffffff;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 12px;
+            }
+            QLineEdit {
+                background: #262c3b;
+                border: 1px solid #3d475f;
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 13px;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 7px 18px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            """
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title_lbl = QLabel("Set Receiver Timer")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #00d084;")
+        layout.addWidget(title_lbl)
+
+        desc_lbl = QLabel("Enter timer arguments (e.g. '30', '5m', '10:00'):")
+        layout.addWidget(desc_lbl)
+
+        input_layout = QHBoxLayout()
+        self.timer_edit = QLineEdit()
+        self.timer_edit.setPlaceholderText("30, 5m...")
+        self.timer_edit.returnPressed.connect(self.accept)
+
+        self.timer_btn = QPushButton("Timer")
+        self.timer_btn.clicked.connect(self.accept)
+
+        input_layout.addWidget(self.timer_edit)
+        input_layout.addWidget(self.timer_btn)
+        layout.addLayout(input_layout)
+
+    def get_args(self) -> str:
+        return self.timer_edit.text().strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1156,6 +1562,7 @@ class FloatingSenderWindow(QWidget):
         self.stream_thread: Optional[ScreenSenderThread] = None
         self.audio_thread: Optional[AudioSenderThread] = None
         self.input_thread: Optional[InputReceiverThread] = None
+        self.viewer_window: Optional[RemoteReceiverViewerWindow] = None
 
         self._drag_start_pos = QPoint()
         self._window_start_pos = QPoint()
@@ -1274,7 +1681,6 @@ class FloatingSenderWindow(QWidget):
             self._update_mini_bar_style()
             return
 
-        # Sinusoidal oscillation between 0.30 and 0.90 opacity
         osc = (math.sin(elapsed * math.pi * 3.5) + 1.0) / 2.0
         current_op = 0.30 + (0.60 * osc)
         self.setWindowOpacity(current_op)
@@ -1543,7 +1949,6 @@ class FloatingSenderWindow(QWidget):
         if data_val:
             return str(data_val).strip()
 
-        # Check if formatted like "Friendly Name (192.168.1.5)"
         if "(" in raw_text and ")" in raw_text:
             return raw_text.split("(")[-1].replace(")", "").strip()
         return raw_text
@@ -1588,7 +1993,7 @@ class FloatingSenderWindow(QWidget):
         print("[DEBUG Sender GUI] Expanded to full always-on-top controller card.")
 
     # -----------------------------------------------------------------------
-    # Friendly Name & Remote Window Management
+    # Friendly Name, Remote Window & Execution Commands
     # -----------------------------------------------------------------------
     def prompt_set_friendly_name(self):
         """Allows assigning or updating a friendly name for the current target IP."""
@@ -1631,6 +2036,59 @@ class FloatingSenderWindow(QWidget):
             print(f"[DEBUG Sender] Transmitted remote TV window command: '{action}'")
         else:
             print("[DEBUG Sender] Cannot send TV window command: Not connected to receiver.")
+
+    def open_run_script_dialog(self):
+        """Opens dialog to select an executable/shortcut and specify optional sys arguments."""
+        dlg = RunScriptDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            path, args = dlg.get_data()
+            if path:
+                self.send_receiver_run_script(path, args)
+
+    def send_receiver_run_script(self, path: str, args: str):
+        """Sends a run script command to execute an application on the receiver."""
+        if self.input_thread and self.input_thread.isRunning():
+            self.input_thread.send_command({"type": "run_script", "path": path, "args": args})
+            print(f"[DEBUG Sender] Sent run_script command: path='{path}', args='{args}'")
+        else:
+            print("[DEBUG Sender] Cannot run script: Not connected to receiver.")
+
+    def open_timer_dialog(self):
+        """Opens the timer dialog to input timer arguments."""
+        dlg = TimerDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            args = dlg.get_args()
+            if args:
+                self.send_receiver_timer(args)
+
+    def send_receiver_timer(self, args: str):
+        """Dispatches timer sys arguments to the receiver application."""
+        if self.input_thread and self.input_thread.isRunning():
+            self.input_thread.send_command({"type": "timer", "args": args})
+            print(f"[DEBUG Sender] Sent timer command with args: '{args}'")
+        else:
+            print("[DEBUG Sender] Cannot send timer: Not connected to receiver.")
+
+    def open_receiver_viewer(self):
+        """Opens a live window to view and control the receiver desktop."""
+        target_ip = self.get_selected_target_ip() or self.discovered_ip
+        if not target_ip:
+            print("[DEBUG Sender Viewer] Cannot open viewer: No target IP provided.")
+            return
+
+        def send_remote_cmd(cmd: dict):
+            if self.input_thread and self.input_thread.isRunning():
+                self.input_thread.send_command(cmd)
+
+        if self.viewer_window:
+            try:
+                self.viewer_window.close()
+            except Exception:
+                pass
+
+        self.viewer_window = RemoteReceiverViewerWindow(target_ip, send_remote_cmd)
+        self.viewer_window.show()
+        print(f"[DEBUG Sender Viewer] Launched interactive remote viewer window for {target_ip}.")
 
     def on_touch_input_toggled(self, checked: bool):
         self.input_enabled = checked
@@ -1720,6 +2178,33 @@ class FloatingSenderWindow(QWidget):
         """
         )
 
+        is_connected = bool(self.input_thread and self.input_thread.isRunning())
+
+        # View & Control Receiver Screen Option
+        view_rec_act = QAction("🖥️ View & Control TV Screen", self)
+        view_rec_act.setToolTip("Open a live window to view and control the remote receiver desktop")
+        view_rec_act.triggered.connect(self.open_receiver_viewer)
+        view_rec_act.setEnabled(is_connected)
+        menu.addAction(view_rec_act)
+
+        menu.addSeparator()
+
+        # Run Script Option
+        run_script_act = QAction("🚀 Run Script...", self)
+        run_script_act.setToolTip("Select an .exe or shortcut with optional arguments to run on the receiver")
+        run_script_act.triggered.connect(self.open_run_script_dialog)
+        run_script_act.setEnabled(is_connected)
+        menu.addAction(run_script_act)
+
+        # Show Timer Option
+        timer_act = QAction("⏱️ Show Timer", self)
+        timer_act.setToolTip("Send timer arguments (e.g. 30, 5m) to the timer app on the receiver")
+        timer_act.triggered.connect(self.open_timer_dialog)
+        timer_act.setEnabled(is_connected)
+        menu.addAction(timer_act)
+
+        menu.addSeparator()
+
         # Remote Receiver Window Management
         win_menu = menu.addMenu("📺 TV Window Control")
         max_act = QAction("🗖 Maximize / Fullscreen TV", self)
@@ -1733,8 +2218,6 @@ class FloatingSenderWindow(QWidget):
         min_act = QAction("🗕 Minimize TV Window", self)
         min_act.triggered.connect(lambda: self.send_receiver_window_command("minimize"))
         win_menu.addAction(min_act)
-
-        is_connected = bool(self.input_thread and self.input_thread.isRunning())
         win_menu.setEnabled(is_connected)
 
         menu.addSeparator()
@@ -1829,7 +2312,6 @@ class FloatingSenderWindow(QWidget):
         self.discovered_ip = ip
         self.pin_required = pin_required
 
-        # If dropdown is empty, populate discovered ip
         if not self.device_combo.currentText().strip():
             self.device_combo.setEditText(ip)
 
@@ -1910,6 +2392,13 @@ class FloatingSenderWindow(QWidget):
         self.input_thread = None
         self.is_paused = False
 
+        if self.viewer_window:
+            try:
+                self.viewer_window.close()
+            except Exception:
+                pass
+            self.viewer_window = None
+
         self.connect_btn.setText("Share")
         self.connect_btn.setStyleSheet("background-color: #0078d4;")
         self.pause_btn.setText("⏸ Pause")
@@ -1926,7 +2415,6 @@ class FloatingSenderWindow(QWidget):
 
             if self.is_paused:
                 self.pause_btn.setText("▶ Resume")
-                # Resume Button: Orange Color styling
                 self.pause_btn.setStyleSheet("background-color: #f37021; color: white; font-weight: bold;")
                 self._update_status_color("#f37021")
             else:
@@ -1943,7 +2431,6 @@ class FloatingSenderWindow(QWidget):
 
             if self.is_stream_muted:
                 self.stream_mute_btn.setText("🔇 TV Muted")
-                # TV Muted Button: Red Color styling
                 self.stream_mute_btn.setStyleSheet("background-color: #d83b01; color: white; font-weight: bold;")
             else:
                 self.stream_mute_btn.setText("🔊 TV Audio")

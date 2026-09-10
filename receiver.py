@@ -1,14 +1,17 @@
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
-Features: Fullscreen Frameless Mode, Remote Window Management (Maximize, Make Smaller,
-          Minimize from Sender Context Menu), Right-Click Context Menu (Exit Fullscreen /
+Features: Fullscreen Frameless Mode, Reverse Screen Streaming & Remote Control Server,
+          Remote Window Management (Maximize, Make Smaller, Minimize from Sender),
+          Remote Script & Timer Launcher, Right-Click Context Menu (Exit Fullscreen /
           Exit App / Toggle Standby Details Visibility with JSON persistence),
-          Dynamic Multi-Channel Audio Playback, Onedir Hot-Replaceable Script Bootstrap,
-          UDP Broadcast Beacon, 4-Digit PIN Authentication, Multi-Touch Canvas,
-          Direct Bilinear GPU Blitting, 2MB Socket Buffers, Rotating File Logging,
-          Non-blocking Clean Thread Shutdown.
+          Dynamic Multi-Channel Audio Playback, Universal Input Injection (pynput/evdev),
+          Onedir Hot-Replaceable Script Bootstrap, UDP Broadcast Beacon,
+          4-Digit PIN Authentication, Multi-Touch Canvas, Direct Bilinear GPU Blitting,
+          2MB Socket Buffers, Rotating File Logging, Non-blocking Clean Thread Shutdown.
 """
 
+import ctypes
+from ctypes import Structure, byref, c_long
 import json
 import logging
 import os
@@ -16,6 +19,7 @@ import random
 import runpy
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -38,9 +42,18 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP_REC") 
             print(f"[BOOTSTRAP ERROR] Failed to run external receiver.py: {_ex}")
 
 import cv2
+import mss
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QFont, QImage, QKeyEvent, QPainter, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QCursor,
+    QFont,
+    QImage,
+    QKeyEvent,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -112,10 +125,28 @@ except Exception as e:
     AUDIO_AVAILABLE = False
     logger.warning(f"sounddevice audio subsystem unavailable: {e}")
 
+# Input Injection Backends (evdev for Linux/Wayland, pynput fallback for Windows)
+USE_EVDEV = False
+if sys.platform.startswith("linux"):
+    try:
+        import evdev
+        from evdev import AbsInfo, UInput, ecodes as e
+
+        USE_EVDEV = True
+    except Exception:
+        USE_EVDEV = False
+
+if not USE_EVDEV:
+    try:
+        from pynput.mouse import Button, Controller as MouseController
+    except Exception as e:
+        logger.warning(f"pynput mouse controller unavailable: {e}")
+
 VIDEO_PORT = 9988
 CONTROL_PORT = 9989
 AUDIO_PORT = 9990
 DISCOVERY_PORT = 9991
+REVERSE_VIDEO_PORT = 9992
 DEFAULT_SAMPLE_RATE = 48000
 CHANNELS = 2
 SOCKET_BUFFER_SIZE = 2 * 1024 * 1024  # 2MB High-Throughput Buffer
@@ -149,6 +180,159 @@ def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
         except Exception:
             return None
     return bytes(buf)
+
+
+def create_mss_instance():
+    """Returns an mss screen capture instance."""
+    if hasattr(mss, "MSS"):
+        return mss.MSS()
+    return mss.mss()
+
+
+# ---------------------------------------------------------------------------
+# Mouse Cursor Overlay Renderer
+# ---------------------------------------------------------------------------
+
+
+class POINT(Structure):
+    _fields_ = [("x", c_long), ("y", c_long)]
+
+
+def get_system_cursor_position() -> tuple[int, int]:
+    """Retrieves absolute global mouse cursor screen coordinates."""
+    if sys.platform == "win32":
+        try:
+            pt = POINT()
+            ctypes.windll.user32.GetCursorPos(byref(pt))
+            return int(pt.x), int(pt.y)
+        except Exception:
+            pass
+    pos = QCursor.pos()
+    return pos.x(), pos.y()
+
+
+def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top: int):
+    """Draws a high-contrast anti-aliased mouse pointer onto the frame."""
+    gx, gy = get_system_cursor_position()
+    cx = gx - monitor_left
+    cy = gy - monitor_top
+
+    h, w, _ = bgr_image.shape
+    if 0 <= cx < w and 0 <= cy < h:
+        pts = np.array(
+            [
+                [cx, cy],
+                [cx, cy + 18],
+                [cx + 4, cy + 14],
+                [cx + 8, cy + 22],
+                [cx + 11, cy + 21],
+                [cx + 7, cy + 13],
+                [cx + 14, cy + 13],
+            ],
+            np.int32,
+        )
+        cv2.polylines(bgr_image, [pts], isClosed=True, color=(0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
+        cv2.fillPoly(bgr_image, [pts], color=(255, 255, 255), lineType=cv2.LINE_AA)
+        cv2.polylines(bgr_image, [pts], isClosed=True, color=(20, 20, 20), thickness=1, lineType=cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# Universal Input Injector (Controls Receiver Desktop on Remote Sender Input)
+# ---------------------------------------------------------------------------
+
+
+class UniversalInputInjector:
+    """Injects mouse and touch input events into the local receiver OS."""
+
+    def __init__(self, screen_w: int, screen_h: int):
+        self.screen_w = screen_w
+        self.screen_h = screen_h
+        self.mode = "none"
+
+        if USE_EVDEV:
+            try:
+                cap = {
+                    e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+                    e.EV_ABS: [
+                        (
+                            e.ABS_X,
+                            AbsInfo(
+                                value=0,
+                                min=0,
+                                max=screen_w,
+                                fuzz=0,
+                                flat=0,
+                                resolution=0,
+                            ),
+                        ),
+                        (
+                            e.ABS_Y,
+                            AbsInfo(
+                                value=0,
+                                min=0,
+                                max=screen_h,
+                                fuzz=0,
+                                flat=0,
+                                resolution=0,
+                            ),
+                        ),
+                    ],
+                    e.EV_REL: [e.REL_WHEEL],
+                }
+                self.ui = UInput(cap, name="mrcoopers-receiver-virtual-input")
+                self.mode = "evdev"
+                logger.info("UniversalInputInjector using Linux evdev virtual input.")
+            except Exception as ex:
+                logger.warning(f"evdev initialization failed: {ex}")
+                self.mode = "none"
+
+        if self.mode == "none":
+            try:
+                self.mouse = MouseController()
+                self.mode = "pynput"
+                logger.info("UniversalInputInjector using pynput mouse controller.")
+            except Exception as ex:
+                logger.warning(f"pynput initialization failed: {ex}")
+                self.mode = "unsupported"
+
+    def execute(self, event: dict):
+        ev_type = event.get("type")
+        nx = event.get("x")
+        ny = event.get("y")
+
+        if self.mode == "evdev":
+            if nx is not None and ny is not None:
+                self.ui.write(e.EV_ABS, e.ABS_X, int(nx * self.screen_w))
+                self.ui.write(e.EV_ABS, e.ABS_Y, int(ny * self.screen_h))
+            if ev_type in ("touch_down", "mouse_down"):
+                btn = e.BTN_RIGHT if event.get("button") == "right" else e.BTN_LEFT
+                self.ui.write(e.EV_KEY, btn, 1)
+            elif ev_type in ("touch_up", "mouse_up"):
+                btn = e.BTN_RIGHT if event.get("button") == "right" else e.BTN_LEFT
+                self.ui.write(e.EV_KEY, btn, 0)
+            elif ev_type == "scroll":
+                dy = 1 if event.get("dy", 0) > 0 else -1
+                self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
+            self.ui.syn()
+
+        elif self.mode == "pynput":
+            if nx is not None and ny is not None:
+                self.mouse.position = (int(nx * self.screen_w), int(ny * self.screen_h))
+            if ev_type in ("touch_down", "mouse_down"):
+                btn = Button.right if event.get("button") == "right" else Button.left
+                self.mouse.press(btn)
+            elif ev_type in ("touch_up", "mouse_up"):
+                btn = Button.right if event.get("button") == "right" else Button.left
+                self.mouse.release(btn)
+            elif ev_type == "scroll":
+                self.mouse.scroll(0, 1 if event.get("dy", 0) > 0 else -1)
+
+    def close(self):
+        if self.mode == "evdev":
+            try:
+                self.ui.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +386,8 @@ class DiscoveryBeaconThread(QThread):
 
 
 class VideoServerThread(QThread):
+    """Receives screen video from Sender to show on Receiver Display."""
+
     frame_received = Signal(QImage)
     client_connected = Signal(str)
     client_disconnected = Signal()
@@ -386,6 +572,106 @@ class VideoServerThread(QThread):
         self.wait(1000)
 
 
+class ReverseVideoServerThread(QThread):
+    """Captures and streams the Receiver's screen to the Sender when requested."""
+
+    def __init__(self, port: int = REVERSE_VIDEO_PORT, quality: int = 85, fps: int = 30):
+        super().__init__()
+        self.setObjectName("ReverseVideoServerThread")
+        self.port = port
+        self.quality = quality
+        self.fps = fps
+        self.running = True
+        self.server_sock: Optional[socket.socket] = None
+
+    def run(self):
+        logger.info(f"Reverse Video Server binding to 0.0.0.0:{self.port}...")
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_SIZE)
+        except Exception as e:
+            logger.warning(f"Could not expand reverse video send buffer: {e}")
+
+        self.server_sock.bind(("0.0.0.0", self.port))
+        self.server_sock.listen(1)
+        self.server_sock.settimeout(0.5)
+
+        logger.info("Reverse Video Server listening for incoming viewer connections from Sender.")
+
+        while self.running:
+            try:
+                conn, addr = self.server_sock.accept()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    logger.error(f"Reverse Video accept error: {e}")
+                break
+
+            logger.info(f"Sender viewer connected from {addr[0]}:{addr[1]} to view receiver screen.")
+            self._stream_to_viewer(conn, addr[0])
+
+        if self.server_sock:
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+        logger.info("Reverse Video Server thread finished.")
+
+    def _stream_to_viewer(self, conn: socket.socket, client_ip: str):
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.settimeout(None)
+
+        with create_mss_instance() as sct:
+            monitor = sct.monitors[1]
+            mon_left = monitor["left"]
+            mon_top = monitor["top"]
+
+            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+
+            while self.running:
+                t_start = time.perf_counter()
+
+                try:
+                    raw_frame = sct.grab(monitor)
+                    img = np.array(raw_frame)
+                    bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+                    render_cursor_on_frame(bgr, mon_left, mon_top)
+                    success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
+
+                    if success:
+                        data = enc_img.tobytes()
+                        conn.sendall(struct.pack(">L", len(data)) + data)
+                except (BrokenPipeError, ConnectionResetError):
+                    logger.info(f"Sender viewer disconnected ({client_ip}).")
+                    break
+                except Exception as ex:
+                    logger.error(f"Reverse frame stream error to {client_ip}: {ex}")
+                    break
+
+                elapsed = time.perf_counter() - t_start
+                target_time = 1.0 / max(1, self.fps)
+                sleep_sec = target_time - elapsed
+                if sleep_sec > 0:
+                    self.msleep(int(sleep_sec * 1000))
+
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def stop(self):
+        self.running = False
+        if self.server_sock:
+            try:
+                self.server_sock.close()
+            except Exception:
+                pass
+        self.wait(1000)
+
+
 class AudioServerThread(QThread):
     def __init__(self, port: int = AUDIO_PORT):
         super().__init__()
@@ -412,7 +698,6 @@ class AudioServerThread(QThread):
                 logger.info(f"Audio connection established with {addr[0]}")
                 conn.settimeout(3.0)
 
-                # Read 4-byte sample rate header
                 hdr = recv_exact(conn, 4)
                 sample_rate = DEFAULT_SAMPLE_RATE
                 if hdr:
@@ -436,7 +721,7 @@ class AudioServerThread(QThread):
                     continue
 
                 audio_buf = bytearray()
-                frame_bytes = CHANNELS * 2  # 4 bytes per frame in int16 stereo
+                frame_bytes = CHANNELS * 2
 
                 while self.running:
                     try:
@@ -446,7 +731,6 @@ class AudioServerThread(QThread):
                             break
                         audio_buf.extend(pcm_data)
 
-                        # Align to 4-byte frame boundaries and reshape to 2D (frames, channels)
                         valid_bytes = len(audio_buf) - (len(audio_buf) % frame_bytes)
                         if valid_bytes >= frame_bytes:
                             samples = np.frombuffer(audio_buf[:valid_bytes], dtype=np.int16).reshape(-1, CHANNELS)
@@ -526,7 +810,6 @@ class ControlServerThread(QThread):
                     logger.error(f"Control Server accept exception: {e}")
                 break
 
-            # Handle incoming commands (e.g. Remote Window Control) from sender
             payload_size = struct.calcsize(">L")
             data = bytearray()
 
@@ -762,10 +1045,17 @@ class ReceiverMainWindow(QMainWindow):
         self.pin = f"{random.randint(1000, 9999)}"
         logger.info(f"Initialized Receiver. Local IP: {get_local_ip()} | Session PIN: {self.pin}")
 
+        # Initialize input injector for remote sender control
+        with create_mss_instance() as sct:
+            mon = sct.monitors[1]
+            scr_w, scr_h = mon["width"], mon["height"]
+        self.input_injector = UniversalInputInjector(scr_w, scr_h)
+
         self.control_thread = ControlServerThread()
         self.audio_thread = AudioServerThread()
         self.video_thread = VideoServerThread(self.get_pin, self.is_pin_required)
         self.beacon_thread = DiscoveryBeaconThread(self.get_pin, self.is_pin_required)
+        self.reverse_video_thread = ReverseVideoServerThread()
 
         self.video_thread.frame_received.connect(self.on_frame)
         self.video_thread.client_connected.connect(self.on_connected)
@@ -777,6 +1067,7 @@ class ReceiverMainWindow(QMainWindow):
             self.audio_thread,
             self.video_thread,
             self.beacon_thread,
+            self.reverse_video_thread,
         ):
             th.start()
 
@@ -852,8 +1143,15 @@ class ReceiverMainWindow(QMainWindow):
         logger.info(f"Standby details visibility toggled: Hidden={self.hide_details}")
 
     def on_control_command(self, cmd: dict):
-        """Processes remote control commands (e.g. Window Management) received from Sender."""
+        """Processes remote control commands (Window Management, Script Execution, Timer, Remote Input)."""
         cmd_type = cmd.get("type")
+
+        # Remote Control of Receiver OS Desktop
+        if cmd_type == "remote_input":
+            event_data = cmd.get("event", {})
+            self.input_injector.execute(event_data)
+            return
+
         if cmd_type == "window_control":
             action = cmd.get("action")
             logger.info(f"Executing remote window control command: {action}")
@@ -885,6 +1183,61 @@ class ReceiverMainWindow(QMainWindow):
                 self.activateWindow()
             elif action == "minimize":
                 self.showMinimized()
+
+        elif cmd_type == "run_script":
+            target_path = cmd.get("path", "").strip()
+            args_str = cmd.get("args", "").strip()
+            logger.info(f"Remote run script request: path='{target_path}', args='{args_str}'")
+            if target_path:
+                try:
+                    cmd_line = f'"{target_path}" {args_str}'.strip() if args_str else f'"{target_path}"'
+                    if sys.platform == "win32":
+                        subprocess.Popen(
+                            cmd_line,
+                            shell=True,
+                            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                        )
+                    else:
+                        subprocess.Popen(cmd_line, shell=True, start_new_session=True)
+                    logger.info(f"Successfully initiated remote process: {cmd_line}")
+                except Exception as ex:
+                    logger.error(f"Failed to execute remote script: {ex}")
+
+        elif cmd_type == "timer":
+            args_str = cmd.get("args", "").strip()
+            logger.info(f"Remote timer request with args: '{args_str}'")
+            timer_candidates = [
+                os.path.join(APP_DIR, "timer.exe"),
+                os.path.join(APP_DIR, "timer.py"),
+                "timer.exe",
+                "timer",
+            ]
+            target_bin = None
+            for cand in timer_candidates:
+                if os.path.exists(cand):
+                    target_bin = cand
+                    break
+
+            try:
+                if target_bin:
+                    if target_bin.endswith(".py"):
+                        cmd_line = f'"{sys.executable}" "{target_bin}" {args_str}'.strip()
+                    else:
+                        cmd_line = f'"{target_bin}" {args_str}'.strip()
+                else:
+                    cmd_line = f"timer {args_str}".strip()
+
+                if sys.platform == "win32":
+                    subprocess.Popen(
+                        cmd_line,
+                        shell=True,
+                        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    )
+                else:
+                    subprocess.Popen(cmd_line, shell=True, start_new_session=True)
+                logger.info(f"Successfully initiated timer process: {cmd_line}")
+            except Exception as ex:
+                logger.error(f"Failed to execute timer command: {ex}")
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Escape:
@@ -928,7 +1281,6 @@ class ReceiverMainWindow(QMainWindow):
         """
         )
 
-        # Visibility Toggle Option
         info_toggle_text = "Show Standby Details (IP/PIN)" if self.hide_details else "Hide Standby Details (IP/PIN)"
         toggle_info_act = QAction(info_toggle_text, self)
         toggle_info_act.triggered.connect(self.toggle_details_visibility)
@@ -977,8 +1329,10 @@ class ReceiverMainWindow(QMainWindow):
         logger.info("Receiver shutting down. Terminating worker threads cleanly...")
         self.beacon_thread.stop()
         self.video_thread.stop()
+        self.reverse_video_thread.stop()
         self.audio_thread.stop()
         self.control_thread.stop()
+        self.input_injector.close()
         logger.info("All threads terminated. Goodbye.")
         event.accept()
 
