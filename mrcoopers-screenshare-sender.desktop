@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=MrCoopersScreenShare Sender
+Comment=MrCoopersScreenShare Sender (Python Source)
+Exec="/usr/bin/python" "/var/mnt/shared-drive/2027/coopershare/sender.py"
+Path=/var/mnt/shared-drive/2027/coopershare
+Icon=/var/mnt/shared-drive/2027/coopershare/icon.png
+Terminal=false
+StartupNotify=true
+Categories=Utility;Network;
