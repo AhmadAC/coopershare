@@ -1,5 +1,3 @@
-#################### START OF FILE: .github/workflows/build.yml ####################
-
 name: Build MrCoopersScreenShare Executables
 
 on:
@@ -22,10 +20,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.14.6
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14.6"
           cache: "pip"
 
       - name: Install Python Dependencies
@@ -43,6 +41,7 @@ jobs:
             --hidden-import "pynput.mouse._win32" `
             --hidden-import "mss" `
             --hidden-import "cv2" `
+            --hidden-import "PySide6.QtSvg" `
             sender.py
 
       - name: Build receiver (onedir) with PyInstaller
@@ -50,17 +49,16 @@ jobs:
           pyinstaller --noconsole --onedir `
             --name "receiver" `
             --hidden-import "sounddevice" `
+            --hidden-import "pynput" `
             --hidden-import "mss" `
             --hidden-import "cv2" `
+            --hidden-import "PySide6.QtSvg" `
             receiver.py
 
       - name: Bundle raw scripts & create portable ZIP archives
         run: |
-          # Copy source scripts into output folders so users can directly edit/replace them
           Copy-Item "sender.py" -Destination "dist\sender\sender.py"
           Copy-Item "receiver.py" -Destination "dist\receiver\receiver.py"
-
-          # Compress to zip files for distribution
           Compress-Archive -Path "dist\sender" -DestinationPath "dist\MrCoopersScreenShare-Sender-Windows.zip"
           Compress-Archive -Path "dist\receiver" -DestinationPath "dist\MrCoopersScreenShare-Receiver-Windows.zip"
 
@@ -74,7 +72,7 @@ jobs:
           retention-days: 14
 
   # =========================================================================
-  # 2. Build Linux Standalone Packages (Sender Script)
+  # 2. Build Linux Standalone Packages & Fedora Kinoite-Ready AppImage
   # =========================================================================
   build-linux:
     name: Build Linux Onedir & AppImage
@@ -87,12 +85,12 @@ jobs:
       - name: Install Linux System Libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libportaudio2 libpulse-dev wget file zip
+          sudo apt-get install -y libasound2-dev libportaudio2 libpulse-dev wget file zip libfuse2
 
-      - name: Set up Python
+      - name: Set up Python 3.14.6
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14.6"
           cache: "pip"
 
       - name: Install Python Dependencies
@@ -108,51 +106,93 @@ jobs:
             --hidden-import "evdev" \
             --hidden-import "mss" \
             --hidden-import "cv2" \
+            --hidden-import "PySide6.QtDBus" \
+            --hidden-import "PySide6.QtSvg" \
             sender.py
 
-          # Copy editable script into directory
+          # Copy editable script into directory for onedir portable archive
           cp sender.py dist/sender/sender.py
           cd dist && zip -r MrCoopersScreenShare-Sender-Linux.zip sender/ && cd ..
 
-      - name: Package as AppImage
+      - name: Package Standalone AppImage for Fedora 44 Kinoite (FUSE3 Native)
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
+          # 1. Structure AppDir tree
           mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/lib
+          mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+
+          # Copy PyInstaller bundled onedir payload
           cp -r dist/sender/* AppDir/usr/bin/
 
-          cat << 'EOF' > AppDir/mrcoopers-sender.desktop
+          # 2. Generate crisp SVG application icon
+          cat << 'EOF' > AppDir/mrcoopers-screenshare-sender.svg
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+            <rect width="64" height="64" rx="14" fill="#0078d4"/>
+            <rect x="14" y="15" width="36" height="24" rx="4" fill="#ffffff"/>
+            <rect x="18" y="19" width="28" height="16" fill="#1a1e29"/>
+            <rect x="29" y="41" width="6" height="4" fill="#ffffff"/>
+            <rect x="22" y="45" width="20" height="3" rx="1.5" fill="#ffffff"/>
+          </svg>
+          EOF
+          cp AppDir/mrcoopers-screenshare-sender.svg AppDir/.DirIcon
+          cp AppDir/mrcoopers-screenshare-sender.svg AppDir/usr/share/icons/hicolor/256x256/apps/mrcoopers-screenshare-sender.svg
+
+          # 3. Create desktop file with mandatory KDE Plasma 6 Wayland permission interfaces
+          cat << 'EOF' > AppDir/mrcoopers-screenshare-sender.desktop
           [Desktop Entry]
           Type=Application
           Name=MrCoopersScreenShare Sender
           Comment=Screen sharing and touch controller
           Exec=sender
-          Icon=mrcoopers-sender
+          Icon=mrcoopers-screenshare-sender
           Categories=Utility;Network;
           Terminal=false
+          StartupNotify=false
+          X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
+          X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,zkde_screencast_unstable_v1
           EOF
 
-          cat << 'EOF' > AppDir/mrcoopers-sender.svg
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-            <rect width="64" height="64" rx="14" fill="#0078d4"/>
-            <polygon points="24,18 46,32 24,46" fill="#ffffff"/>
-          </svg>
-          EOF
-          cp AppDir/mrcoopers-sender.svg AppDir/.DirIcon
-          cp AppDir/mrcoopers-sender.svg AppDir/usr/share/icons/hicolor/256x256/apps/mrcoopers-sender.svg
+          # Ensure AppDir root has desktop file symlinked for AppImageKit metadata linter
+          cp AppDir/mrcoopers-screenshare-sender.desktop AppDir/usr/share/applications/mrcoopers-screenshare-sender.desktop
 
+          # 4. AppRun bootstrap: set up Wayland, Qt platform paths, and shared libs
           cat << 'EOF' > AppDir/AppRun
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "${0}")")"
+          export PATH="${HERE}/usr/bin:${PATH}"
+          export LD_LIBRARY_PATH="${HERE}/usr/bin:${HERE}/usr/lib:${LD_LIBRARY_PATH}"
+
+          # Automatically resolve PySide6 Wayland and platform plugins
+          if [ -d "${HERE}/usr/bin/PySide6/Qt/plugins" ]; then
+              export QT_PLUGIN_PATH="${HERE}/usr/bin/PySide6/Qt/plugins:${QT_PLUGIN_PATH}"
+          elif [ -d "${HERE}/usr/bin/_internal/PySide6/Qt/plugins" ]; then
+              export QT_PLUGIN_PATH="${HERE}/usr/bin/_internal/PySide6/Qt/plugins:${QT_PLUGIN_PATH}"
+          fi
+
+          # Sensible defaults for modern Wayland environments
+          if [ -z "${QT_QPA_PLATFORM}" ] && [ -n "${WAYLAND_DISPLAY}" ]; then
+              export QT_QPA_PLATFORM="wayland;xcb"
+          fi
+
           exec "${HERE}/usr/bin/sender" "$@"
           EOF
           chmod +x AppDir/AppRun
 
-          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          # 5. Fetch appimagetool and the modern type-2 runtime (eliminates libfuse2 dependency for Fedora 44)
+          wget -q -O appimagetool-x86_64.AppImage https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
 
-          ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir MrCoopersScreenShare-Sender-x86_64.AppImage
+          wget -q -O runtime-x86_64 https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+
+          # 6. Build AppImage using the modern standalone runtime
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage \
+            --runtime-file runtime-x86_64 \
+            --no-appstream \
+            AppDir \
+            dist/MrCoopersScreenShare-Sender-x86_64.AppImage
 
       - name: Upload Linux Artifacts
         uses: actions/upload-artifact@v4
@@ -160,7 +200,7 @@ jobs:
           name: linux-packages
           path: |
             dist/MrCoopersScreenShare-Sender-Linux.zip
-            MrCoopersScreenShare-Sender-x86_64.AppImage
+            dist/MrCoopersScreenShare-Sender-x86_64.AppImage
           retention-days: 14
 
   # =========================================================================

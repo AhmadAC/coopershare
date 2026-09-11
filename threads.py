@@ -1,7 +1,7 @@
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 Supports native Windows WASAPI loopback, KDE Plasma 6 KWin D-Bus ScreenShot2 kernel pipe capture,
-pipelined asynchronous streaming, KDE Spectacle fallback, and MSS hardware capture.
+pipelined parallel multi-worker streaming, KDE Spectacle fallback, and MSS hardware capture.
 """
 
 import fcntl
@@ -41,6 +41,15 @@ from video_backend import render_cursor_on_frame
 
 if AUDIO_AVAILABLE:
     import sounddevice as sd
+
+# Optional PyTurboJPEG SIMD hardware accelerator
+try:
+    from turbojpeg import TJPF_BGR, TJPF_BGRX, TJSAMP_420, TurboJPEG
+
+    _TURBO_JPEG = TurboJPEG()
+    print("[DEBUG Sender Video] PyTurboJPEG SIMD hardware acceleration detected and active.")
+except Exception:
+    _TURBO_JPEG = None
 
 
 def _is_dbus_error(msg: QDBusMessage) -> bool:
@@ -184,7 +193,7 @@ class KWinScreenShot2Grabber:
             self.iface = _get_interface()
             if self.iface.isValid():
                 for attempt in range(2):
-                    test_frame = self.grab(include_cursor=True, native_resolution=True, init_timeout=1.5)
+                    test_frame = self.grab(include_cursor=False, native_resolution=True, init_timeout=1.5)
                     if test_frame is not None and test_frame.size > 0:
                         self.available = True
                         print(
@@ -206,7 +215,7 @@ class KWinScreenShot2Grabber:
 
     def grab(
         self,
-        include_cursor: bool = True,
+        include_cursor: bool = False,
         native_resolution: bool = True,
         init_timeout: float = 0.25,
     ) -> Optional[np.ndarray]:
@@ -304,7 +313,6 @@ class KWinScreenShot2Grabber:
             if len(raw_mv) < total_expected_bytes:
                 return None
 
-            # Instant zero-copy memory wrap of raw 4-channel BGRA frame
             arr = np.frombuffer(raw_mv, dtype=np.uint8, count=total_expected_bytes).reshape((height, width, 4))
             return arr
 
@@ -377,37 +385,6 @@ class SpectacleGrabber:
                 pass
 
 
-def probe_grim(grim_bin: str) -> tuple[bool, list[str]]:
-    """Probes grim for supported formats."""
-    try:
-        r = subprocess.run(
-            [grim_bin, "-t", "jpeg", "-q", "75", "-"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=0.8,
-        )
-        if r.returncode == 0 and len(r.stdout) > 100:
-            print("[DEBUG Sender Video] Wayland screencopy active via grim (JPEG).")
-            return True, ["-t", "jpeg"]
-    except Exception:
-        pass
-
-    try:
-        r = subprocess.run(
-            [grim_bin, "-t", "ppm", "-"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=0.8,
-        )
-        if r.returncode == 0 and len(r.stdout) > 100:
-            print("[DEBUG Sender Video] Wayland screencopy active via grim (PPM).")
-            return True, ["-t", "ppm"]
-    except Exception:
-        pass
-
-    return False, []
-
-
 class DiscoveryListenerThread(QThread):
     device_found = Signal(str, bool)
 
@@ -462,9 +439,10 @@ class ScreenSenderThread(QThread):
         self,
         target_ip: str,
         pin: str = "",
-        quality: int = 92,
+        quality: int = 78,
         fps_limit: int = 60,
         use_444_chroma: bool = False,
+        scale_ratio: float = 1.0,
     ):
         super().__init__()
         self.target_ip = target_ip
@@ -472,39 +450,49 @@ class ScreenSenderThread(QThread):
         self.quality = quality
         self.fps_limit = fps_limit
         self.use_444_chroma = use_444_chroma
+        self.scale_ratio = max(0.5, min(1.0, float(scale_ratio)))
         self.running = True
         self.paused = False
         self.send_cursorless_frame_once = False
 
-        # Asynchronous frame queue
-        self.frame_queue = queue.Queue(maxsize=1)
+        # Asynchronous frame queue and twin encoder workers
+        self.frame_queue = queue.Queue(maxsize=2)
         self.pipeline_running = False
+
+        # Telemetry locks
+        self._stats_lock = threading.Lock()
+        self.fps_frame_counter = 0
+        self.total_capture_dur = 0.0
+        self.total_encode_dur = 0.0
+        self.total_send_dur = 0.0
+        self.fps_last_report_time = time.perf_counter()
 
     def set_fps_limit(self, fps: int):
         self.fps_limit = max(1, fps)
         print(f"[DEBUG Sender Video] Dynamic framerate adjusted to: {self.fps_limit} FPS")
 
-    def set_quality_params(self, quality: int, use_444: bool):
+    def set_quality_params(self, quality: int, use_444: bool, scale_ratio: float = 1.0):
         self.quality = quality
         self.use_444_chroma = use_444
+        self.scale_ratio = max(0.5, min(1.0, float(scale_ratio)))
         print(
-            f"[DEBUG Sender Video] Dynamic quality adjusted to: {self.quality}% (4:4:4={self.use_444_chroma})"
+            f"[DEBUG Sender Video] Quality: {self.quality}%, 4:4:4: {self.use_444_chroma}, Scale: {self.scale_ratio:.2f}x"
         )
 
     def trigger_cursorless_frame(self):
         self.send_cursorless_frame_once = True
 
-    def _encoder_network_worker(self, sock: socket.socket):
-        """Dedicated concurrent worker for parallel JPEG encoding and socket transmission."""
-        fps_frame_counter = 0
-        fps_last_report_time = time.perf_counter()
-        total_capture_dur = 0.0
-        total_encode_dur = 0.0
-        total_send_dur = 0.0
+    def _parallel_encoder_worker(self, sock: socket.socket, worker_id: int):
+        """Concurrent worker that pulls raw buffers, compresses to JPEG, and sends to socket."""
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+        if self.use_444_chroma:
+            sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
+            sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
+            encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
 
         while self.pipeline_running:
             try:
-                item = self.frame_queue.get(timeout=0.04)
+                item = self.frame_queue.get(timeout=0.03)
             except queue.Empty:
                 continue
 
@@ -512,24 +500,57 @@ class ScreenSenderThread(QThread):
 
             t_enc_start = time.perf_counter()
 
-            # Offload BGRA -> BGR conversion to encoder thread
-            if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
-                frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
+            # Fast downscale if requested
+            if self.scale_ratio < 0.99:
+                h, w = frame_raw.shape[:2]
+                new_w = int(w * self.scale_ratio)
+                new_h = int(h * self.scale_ratio)
+                frame_to_encode = cv2.resize(frame_raw, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             else:
-                frame_bgr = frame_raw
+                frame_to_encode = frame_raw
 
-            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+            data = None
 
-            if self.use_444_chroma:
-                sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
-                sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
-                encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+            # Fast path 1: libjpeg-turbo SIMD directly on 4-channel BGRX
+            if _TURBO_JPEG is not None:
+                try:
+                    if frame_to_encode.ndim == 3 and frame_to_encode.shape[2] == 4:
+                        data = _TURBO_JPEG.encode(
+                            frame_to_encode,
+                            quality=self.quality,
+                            pixel_format=TJPF_BGRX,
+                            jpeg_subsample=TJSAMP_420,
+                        )
+                    else:
+                        data = _TURBO_JPEG.encode(
+                            frame_to_encode,
+                            quality=self.quality,
+                            pixel_format=TJPF_BGR,
+                            jpeg_subsample=TJSAMP_420,
+                        )
+                except Exception:
+                    data = None
 
-            success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
-            data = enc_img.tobytes() if success else None
+            # Fast path 2: Standard OpenCV multi-channel encoding
+            if data is None:
+                if frame_to_encode.ndim == 3 and frame_to_encode.shape[2] == 4:
+                    frame_bgr = cv2.cvtColor(frame_to_encode, cv2.COLOR_BGRA2BGR)
+                else:
+                    frame_bgr = frame_to_encode
+
+                cur_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                if self.use_444_chroma:
+                    sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
+                    sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
+                    cur_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+
+                success, enc_img = cv2.imencode(".jpg", frame_bgr, cur_params)
+                if success:
+                    data = enc_img.tobytes()
+
             t_enc_end = time.perf_counter()
 
-            # Concurrent Network Transmission
+            # Concurrent network send
             t_send_start = time.perf_counter()
             if data and self.pipeline_running:
                 try:
@@ -539,37 +560,38 @@ class ScreenSenderThread(QThread):
                     break
             t_send_end = time.perf_counter()
 
-            # Telemetry Tracking
-            fps_frame_counter += 1
-            total_capture_dur += t_cap_ms
-            total_encode_dur += (t_enc_end - t_enc_start) * 1000.0
-            total_send_dur += (t_send_end - t_send_start) * 1000.0
+            # Aggregate stats across both workers
+            with self._stats_lock:
+                self.fps_frame_counter += 1
+                self.total_capture_dur += t_cap_ms
+                self.total_encode_dur += (t_enc_end - t_enc_start) * 1000.0
+                self.total_send_dur += (t_send_end - t_send_start) * 1000.0
 
-            now = time.perf_counter()
-            if now - fps_last_report_time >= 1.0:
-                elapsed_report = now - fps_last_report_time
-                measured_fps = fps_frame_counter / elapsed_report
-                avg_cap_ms = total_capture_dur / fps_frame_counter
-                avg_enc_ms = total_encode_dur / fps_frame_counter
-                avg_send_ms = total_send_dur / fps_frame_counter
-                avg_cycle_ms = 1000.0 / measured_fps if measured_fps > 0 else 0.0
+                now = time.perf_counter()
+                if now - self.fps_last_report_time >= 1.0:
+                    elapsed_report = now - self.fps_last_report_time
+                    measured_fps = self.fps_frame_counter / elapsed_report
+                    avg_cap_ms = self.total_capture_dur / self.fps_frame_counter
+                    avg_enc_ms = self.total_encode_dur / self.fps_frame_counter
+                    avg_send_ms = self.total_send_dur / self.fps_frame_counter
+                    avg_cycle_ms = 1000.0 / measured_fps if measured_fps > 0 else 0.0
 
-                print(
-                    f"[DEBUG Sender Video] Live: {measured_fps:5.1f} FPS "
-                    f"(Target: {self.fps_limit} FPS | Cycle: {avg_cycle_ms:4.1f}ms "
-                    f"[Cap: {avg_cap_ms:4.1f}ms, Enc: {avg_enc_ms:4.1f}ms, Net: {avg_send_ms:4.1f}ms])"
-                )
+                    print(
+                        f"[DEBUG Sender Video] Live: {measured_fps:5.1f} FPS "
+                        f"(Target: {self.fps_limit} FPS | Cycle: {avg_cycle_ms:4.1f}ms "
+                        f"[Cap: {avg_cap_ms:4.1f}ms, Enc: {avg_enc_ms:4.1f}ms, Net: {avg_send_ms:4.1f}ms])"
+                    )
 
-                fps_frame_counter = 0
-                total_capture_dur = 0.0
-                total_encode_dur = 0.0
-                total_send_dur = 0.0
-                fps_last_report_time = now
+                    self.fps_frame_counter = 0
+                    self.total_capture_dur = 0.0
+                    self.total_encode_dur = 0.0
+                    self.total_send_dur = 0.0
+                    self.fps_last_report_time = now
 
     def run(self):
         print(
             f"[DEBUG Sender Video] Connecting to {self.target_ip}:{VIDEO_PORT} "
-            f"(PIN: '{self.pin}', Quality: {self.quality}, 4:4:4 Chroma: {self.use_444_chroma})..."
+            f"(PIN: '{self.pin}', Quality: {self.quality}, Scale: {self.scale_ratio:.2f}x)..."
         )
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -577,7 +599,7 @@ class ScreenSenderThread(QThread):
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_SIZE)
             except Exception as e:
-                print(f"[DEBUG Sender Video] SO_SNDBUF setting notice: {e}")
+                print(f"[DEBUG Sender Video] SO_SNDBUF notice: {e}")
 
             sock.settimeout(4.0)
             sock.connect((self.target_ip, VIDEO_PORT))
@@ -624,12 +646,12 @@ class ScreenSenderThread(QThread):
             spectacle_grabber = SpectacleGrabber()
             use_spectacle = spectacle_grabber.available
 
-        # Start concurrent encoder/transmitter worker
+        # Start twin parallel encoder workers for 120 FPS capable throughput
         self.pipeline_running = True
-        encoder_worker_thread = threading.Thread(
-            target=self._encoder_network_worker, args=(sock,), daemon=True
-        )
-        encoder_worker_thread.start()
+        w1 = threading.Thread(target=self._parallel_encoder_worker, args=(sock, 1), daemon=True)
+        w2 = threading.Thread(target=self._parallel_encoder_worker, args=(sock, 2), daemon=True)
+        w1.start()
+        w2.start()
 
         screen = QGuiApplication.primaryScreen()
         screen_dpr = float(screen.devicePixelRatio()) if screen else 1.0
@@ -641,7 +663,7 @@ class ScreenSenderThread(QThread):
 
             while self.running and self.pipeline_running:
                 if self.paused and not self.send_cursorless_frame_once:
-                    time.sleep(0.04)
+                    time.sleep(0.03)
                     continue
 
                 t_frame_start = time.perf_counter()
@@ -650,12 +672,19 @@ class ScreenSenderThread(QThread):
                     t_cap_start = time.perf_counter()
 
                     if use_kwin:
-                        use_native_res = bool(self.quality >= 95)
-                        want_cursor = not (self.paused or self.send_cursorless_frame_once)
+                        use_native_res = bool(self.quality >= 90)
+                        # Offload cursor from KWin compositor for faster capture
                         frame_raw = kwin_grabber.grab(
-                            include_cursor=want_cursor,
+                            include_cursor=False,
                             native_resolution=use_native_res,
                         )
+                        if frame_raw is not None and not (self.paused or self.send_cursorless_frame_once):
+                            render_cursor_on_frame(
+                                frame_raw,
+                                monitor_left=mon_left,
+                                monitor_top=mon_top,
+                                scale_factor=screen_dpr,
+                            )
                     elif use_spectacle and spectacle_grabber:
                         frame_raw = spectacle_grabber.grab()
                         if frame_raw is not None and not (self.paused or self.send_cursorless_frame_once):
@@ -690,7 +719,6 @@ class ScreenSenderThread(QThread):
                     if self.send_cursorless_frame_once:
                         self.send_cursorless_frame_once = False
 
-                    # Push frame directly into the parallel encode queue without blocking
                     if self.frame_queue.full():
                         try:
                             self.frame_queue.get_nowait()
@@ -710,15 +738,18 @@ class ScreenSenderThread(QThread):
                     time.sleep(0.002)
                     continue
 
-                # Clock pacing
-                frame_elapsed = time.perf_counter() - t_frame_start
+                # Hybrid clock pacing (sleep + spin-wait for exact 16.6ms frame cadence)
                 target_frame_time = 1.0 / max(1, self.fps_limit)
+                frame_elapsed = time.perf_counter() - t_frame_start
                 sleep_sec = target_frame_time - frame_elapsed
-                if sleep_sec > 0.001:
-                    time.sleep(sleep_sec)
+                if sleep_sec > 0.002:
+                    time.sleep(sleep_sec - 0.001)
+                while (time.perf_counter() - t_frame_start) < target_frame_time:
+                    pass
 
         self.pipeline_running = False
-        encoder_worker_thread.join(timeout=0.5)
+        w1.join(timeout=0.3)
+        w2.join(timeout=0.3)
 
         if kwin_grabber:
             kwin_grabber.cleanup()

@@ -1,8 +1,8 @@
 """
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
-Features persistent state loading and debounced saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
+Features persistent state loading and debounced saving to history.json,
 with vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
-and a toggleable Remote TV Viewer session controller.
+Resolution presets (Native 1080p, High 900p, Fast 720p), and a toggleable Remote TV Viewer session controller.
 """
 
 import ctypes
@@ -173,23 +173,20 @@ class FloatingSenderWindow(QWidget):
         self.current_opacity = 0.94
         self.was_streaming_before_viewing = False
 
-        # Pulsing Animation attributes for Collapsed Taskbar Click
         self.is_pulsing = False
         self.pulse_start_time = 0.0
 
-        # Debounced disk saver timer to prevent slider disk thrashing
+        # Debounced disk saver
         self._save_debounce_timer = QTimer(self)
         self._save_debounce_timer.setSingleShot(True)
         self._save_debounce_timer.setInterval(400)
         self._save_debounce_timer.timeout.connect(self._flush_history_save)
 
-        # Non-intrusive Topmost Enforcer Timer for Collapsed Mini Pill
         self.topmost_timer = QTimer(self)
         self.topmost_timer.setInterval(500)
         self.topmost_timer.timeout.connect(self._on_topmost_timer)
         self.topmost_timer.start()
 
-        # 3-Second Red Pulse Timer for taskbar clicks in mini mode
         self.pulse_timer = QTimer(self)
         self.pulse_timer.setInterval(40)
         self.pulse_timer.timeout.connect(self._on_pulse_step)
@@ -198,7 +195,6 @@ class FloatingSenderWindow(QWidget):
         self._setup_ui()
         self._populate_device_list()
 
-        # Start listening for auto-discovery beacon
         self.discovery_thread = DiscoveryListenerThread()
         self.discovery_thread.device_found.connect(self.on_device_discovered)
         self.discovery_thread.start()
@@ -239,11 +235,8 @@ class FloatingSenderWindow(QWidget):
         self.enforce_always_on_top()
 
     def apply_opacity(self, opacity: float):
-        """Cross-platform opacity applicator supporting Wayland, X11, and Windows."""
         self.current_opacity = max(0.1, min(1.0, float(opacity)))
-
-        is_wayland = QApplication.platformName() == "wayland"
-        if not is_wayland:
+        if QApplication.platformName() != "wayland":
             try:
                 super().setWindowOpacity(self.current_opacity)
             except Exception:
@@ -266,10 +259,6 @@ class FloatingSenderWindow(QWidget):
                     )
 
                 HWND_TOPMOST = -1
-                SWP_NOMOVE = 0x0002
-                SWP_NOSIZE = 0x0001
-                SWP_NOACTIVATE = 0x0010
-                SWP_SHOWWINDOW = 0x0040
                 ctypes.windll.user32.SetWindowPos(
                     hwnd,
                     HWND_TOPMOST,
@@ -277,7 +266,7 @@ class FloatingSenderWindow(QWidget):
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    0x0002 | 0x0001 | 0x0010 | 0x0040,
                 )
             except Exception:
                 pass
@@ -355,7 +344,6 @@ class FloatingSenderWindow(QWidget):
 
         self.stack = QStackedWidget(self)
 
-        # View 1: Expanded Controller Card
         self.card = QFrame()
         self.card.setObjectName("card")
         self._update_card_style()
@@ -409,9 +397,6 @@ class FloatingSenderWindow(QWidget):
         self.device_combo = QComboBox()
         self.device_combo.setEditable(True)
         self.device_combo.setPlaceholderText("Select TV or Enter IP...")
-        self.device_combo.setToolTip(
-            "Select a TV by name or enter an IP. Right-click to assign friendly names."
-        )
         self.device_combo.lineEdit().returnPressed.connect(self.toggle_connect)
 
         self.connect_btn = QPushButton("Share")
@@ -421,7 +406,7 @@ class FloatingSenderWindow(QWidget):
         ip_row.addWidget(self.connect_btn)
         self.card_layout.addLayout(ip_row)
 
-        # Row 2: Live-Adjustable FPS & Ultra-Quality Preset Selector (with Persistence)
+        # Row 2: FPS, Quality Preset, and Resolution Scaling Selector
         qual_row = QHBoxLayout()
         self.fps_combo = QComboBox()
         self.fps_combo.addItems(["60 FPS", "30 FPS", "120 FPS", "15 FPS"])
@@ -437,18 +422,17 @@ class FloatingSenderWindow(QWidget):
         else:
             self.fps_combo.setCurrentIndex(0)
         self.fps_combo.currentIndexChanged.connect(self.on_fps_changed)
-        self.fps_combo.setToolTip("Framerate can be modified live at any time without stopping.")
 
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(
-            ["Ultra Crisp (92%)", "High Quality (82%)", "Balanced (72%)", "Studio 4:4:4 (88%)"]
+            ["Balanced (75%)", "High Quality (85%)", "Ultra Crisp (92%)", "Fast 60 FPS (70% 900p)"]
         )
         saved_quality = self.history_data.get("quality_preset", "")
         if saved_quality:
             matched_q = -1
             for i in range(self.quality_combo.count()):
                 txt = self.quality_combo.itemText(i)
-                if "4:4:4" in str(saved_quality) and "4:4:4" in txt:
+                if "fast" in str(saved_quality).lower() and "fast" in txt.lower():
                     matched_q = i
                     break
                 elif "ultra" in str(saved_quality).lower() and "ultra" in txt.lower():
@@ -464,15 +448,12 @@ class FloatingSenderWindow(QWidget):
         else:
             self.quality_combo.setCurrentIndex(0)
         self.quality_combo.currentIndexChanged.connect(self.on_quality_changed)
-        self.quality_combo.setToolTip(
-            "Ultra Crisp (92%) maintains razor-sharp text while ensuring high network throughput."
-        )
 
         qual_row.addWidget(self.fps_combo)
         qual_row.addWidget(self.quality_combo)
         self.card_layout.addLayout(qual_row)
 
-        # Row 3: Auto-connect & Touch Input toggles + Optional PIN input (with Persistence)
+        # Row 3: Auto-connect, Touch Input, and PIN Code
         auto_row = QHBoxLayout()
         self.auto_connect_cb = QCheckBox("Auto-Connect")
         saved_auto = self.history_data.get("auto_connect", True)
@@ -483,9 +464,6 @@ class FloatingSenderWindow(QWidget):
         saved_touch = self.history_data.get("touch_input", True)
         self.touch_input_cb.setChecked(bool(saved_touch))
         self.input_enabled = bool(saved_touch)
-        self.touch_input_cb.setToolTip(
-            "When enabled, touching the TV screen controls this PC."
-        )
         self.touch_input_cb.toggled.connect(self.on_touch_input_toggled)
 
         self.pin_input = QLineEdit()
@@ -504,7 +482,7 @@ class FloatingSenderWindow(QWidget):
         auto_row.addWidget(self.pin_input)
         self.card_layout.addLayout(auto_row)
 
-        # Row 4: Action Buttons (Pause/Resume, TV Audio Mute, Host Speaker Mute)
+        # Row 4: Action Buttons
         btn_row = QHBoxLayout()
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.setIcon(svg_to_icon(SVG_PAUSE, 14, "#ffffff"))
@@ -518,9 +496,6 @@ class FloatingSenderWindow(QWidget):
 
         self.host_mute_btn = QPushButton("Mute Host")
         self.host_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_MUTE, 14, "#ffffff"))
-        self.host_mute_btn.setToolTip(
-            "Mutes local PC speakers so audio only plays through the TV"
-        )
         self.host_mute_btn.clicked.connect(self.toggle_host_mute)
 
         btn_row.addWidget(self.pause_btn)
@@ -528,7 +503,7 @@ class FloatingSenderWindow(QWidget):
         btn_row.addWidget(self.host_mute_btn)
         self.card_layout.addLayout(btn_row)
 
-        # Row 5: TV Volume Slider (with Persistence)
+        # Row 5: TV Volume Slider
         tv_vol_row = QHBoxLayout()
         tv_vol_lbl_title = QLabel("TV Vol:")
         tv_vol_lbl_title.setFixedWidth(46)
@@ -549,7 +524,7 @@ class FloatingSenderWindow(QWidget):
         tv_vol_row.addWidget(self.tv_vol_val_lbl)
         self.card_layout.addLayout(tv_vol_row)
 
-        # Row 6: Opacity Slider (with Persistence)
+        # Row 6: Opacity Slider
         trans_row = QHBoxLayout()
         op_lbl_title = QLabel("Opacity:")
         op_lbl_title.setFixedWidth(46)
@@ -569,14 +544,11 @@ class FloatingSenderWindow(QWidget):
         trans_row.addWidget(self.op_val_lbl)
         self.card_layout.addLayout(trans_row)
 
-        # View 2: Collapsed Mini Pill Indicator (48x16 Hitbox, 30x5 Bar)
+        # Mini Pill
         self.mini_container = QFrame()
         self.mini_container.setObjectName("mini_container")
         self.mini_container.setFixedSize(48, 16)
         self.mini_container.setCursor(Qt.PointingHandCursor)
-        self.mini_container.setToolTip(
-            "MrCoopersScreenShare (Ctrl+Click: Pause/Resume | Click: Expand | Drag: Move)"
-        )
 
         mini_layout = QVBoxLayout(self.mini_container)
         mini_layout.setContentsMargins(0, 0, 0, 0)
@@ -708,7 +680,6 @@ class FloatingSenderWindow(QWidget):
             self._populate_device_list()
 
     def ensure_control_channel(self, target_ip: str) -> bool:
-        """Ensures a dedicated control channel is running to the target receiver."""
         if not self.control_thread or not self.control_thread.isRunning():
             print(f"[DEBUG Sender UI] Starting control thread for {target_ip}...")
             self.control_thread = InputReceiverThread(target_ip, self.is_input_enabled)
@@ -735,7 +706,6 @@ class FloatingSenderWindow(QWidget):
                 self.send_receiver_timer(args)
 
     def send_receiver_timer(self, args: str):
-        """Sends clean duration/argument string directly to receiver's linked timer."""
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         clean_args = args.strip().strip('"').strip("'")
         if target_ip and self.ensure_control_channel(target_ip):
@@ -743,7 +713,6 @@ class FloatingSenderWindow(QWidget):
             self.control_thread.send_command({"type": "timer", "args": clean_args})
 
     def toggle_receiver_viewer(self):
-        """Toggles the remote TV viewing and interactive control session on/off."""
         if self.viewer_window and self.viewer_window.isVisible():
             self.close_receiver_viewer()
         else:
@@ -787,7 +756,6 @@ class FloatingSenderWindow(QWidget):
         self.viewer_window.show()
 
     def close_receiver_viewer(self):
-        """Explicitly shuts down the remote viewer window and reverts GUI state."""
         if self.viewer_window:
             try:
                 self.viewer_window.close()
@@ -829,7 +797,6 @@ class FloatingSenderWindow(QWidget):
         self.history_data["allow_audio_when_paused"] = self.allow_audio_when_paused
         self._schedule_history_save()
         self._update_audio_pause_state()
-        print(f"[DEBUG Sender UI] Audio when paused toggled: {self.allow_audio_when_paused}")
 
     def on_allow_audio_when_paused_toggled(self, checked: bool):
         self.allow_audio_when_paused = checked
@@ -1047,20 +1014,21 @@ class FloatingSenderWindow(QWidget):
             self.stream_thread.set_fps_limit(chosen_fps)
 
     def on_quality_changed(self, index: int):
+        # 0: Balanced (75% @ 1080p), 1: High (85% @ 1080p), 2: Ultra (92% @ 1080p), 3: Fast 60 (70% @ 900p)
         if index == 0:
-            target_quality, use_444 = 92, False
+            target_quality, use_444, scale = 75, False, 1.0
         elif index == 1:
-            target_quality, use_444 = 82, False
+            target_quality, use_444, scale = 85, False, 1.0
         elif index == 2:
-            target_quality, use_444 = 72, False
+            target_quality, use_444, scale = 92, False, 1.0
         else:
-            target_quality, use_444 = 88, True
+            target_quality, use_444, scale = 70, False, 0.833  # 1600x900
 
         self.history_data["quality_preset"] = self.quality_combo.currentText()
         self._schedule_history_save()
 
         if self.stream_thread:
-            self.stream_thread.set_quality_params(target_quality, use_444)
+            self.stream_thread.set_quality_params(target_quality, use_444, scale_ratio=scale)
 
     def on_tv_volume_changed(self, val: int):
         self.tv_vol_val_lbl.setText(f"{val}%")
@@ -1131,13 +1099,13 @@ class FloatingSenderWindow(QWidget):
 
         quality_idx = self.quality_combo.currentIndex()
         if quality_idx == 0:
-            target_quality, use_444 = 92, False
+            target_quality, use_444, scale = 75, False, 1.0
         elif quality_idx == 1:
-            target_quality, use_444 = 82, False
+            target_quality, use_444, scale = 85, False, 1.0
         elif quality_idx == 2:
-            target_quality, use_444 = 72, False
+            target_quality, use_444, scale = 92, False, 1.0
         else:
-            target_quality, use_444 = 88, True
+            target_quality, use_444, scale = 70, False, 0.833
 
         self.connect_btn.setText("Stop")
         self.connect_btn.setStyleSheet("background-color: #d83b01;")
@@ -1150,6 +1118,7 @@ class FloatingSenderWindow(QWidget):
             quality=target_quality,
             fps_limit=chosen_fps,
             use_444_chroma=use_444,
+            scale_ratio=scale,
         )
         self.stream_thread.status_changed.connect(self.on_stream_status)
         self.stream_thread.start()
