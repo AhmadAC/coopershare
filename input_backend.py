@@ -1,11 +1,10 @@
-#################### START OF FILE: input_backend.py ####################
-
 """
 Cross-Platform Universal Input Injector supporting native Win32 API (Windows),
-evdev (Linux), and pynput fallback.
+evdev direct touchscreen and pointer injection (Linux Wayland / X11), and pynput fallback.
 """
 
 import ctypes
+import os
 import sys
 import numpy as np
 
@@ -51,37 +50,50 @@ class UniversalInputInjector:
             print(f"[DEBUG Injector] Using native Win32 hardware input injection on bounds ({mon_left},{mon_top},{screen_w}x{screen_h}).")
         elif USE_EVDEV:
             try:
+                min_x = min(0, mon_left)
+                max_x = max(self.screen_w, mon_left + self.screen_w)
+                min_y = min(0, mon_top)
+                max_y = max(self.screen_h, mon_top + self.screen_h)
+
                 cap = {
-                    e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
-                    e.EV_ABS: [
-                        (
-                            e.ABS_X,
-                            AbsInfo(
-                                value=0,
-                                min=0,
-                                max=screen_w,
-                                fuzz=0,
-                                flat=0,
-                                resolution=0,
-                            ),
-                        ),
-                        (
-                            e.ABS_Y,
-                            AbsInfo(
-                                value=0,
-                                min=0,
-                                max=screen_h,
-                                fuzz=0,
-                                flat=0,
-                                resolution=0,
-                            ),
-                        ),
+                    e.EV_KEY: [
+                        e.BTN_LEFT,
+                        e.BTN_RIGHT,
+                        e.BTN_MIDDLE,
+                        e.BTN_TOUCH,
+                        e.BTN_TOOL_FINGER,
                     ],
-                    e.EV_REL: [e.REL_WHEEL],
+                    e.EV_ABS: [
+                        (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=0)),
+                        (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=0)),
+                        (e.ABS_PRESSURE, AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)),
+                    ],
+                    e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL],
                 }
-                self.ui = UInput(cap, name="mrcoopers-virtual-input")
+
+                input_props = []
+                if hasattr(e, "INPUT_PROP_DIRECT"):
+                    input_props.append(e.INPUT_PROP_DIRECT)
+                if hasattr(e, "INPUT_PROP_POINTER"):
+                    input_props.append(e.INPUT_PROP_POINTER)
+
+                self.ui = UInput(
+                    events=cap,
+                    name="mrcoopers-virtual-touch",
+                    input_props=input_props if input_props else None,
+                )
                 self.mode = "evdev"
-                print("[DEBUG Injector] Using Linux evdev virtual input.")
+                print(f"[DEBUG Injector] Linux evdev kernel virtual touch & pointer active ({max_x}x{max_y}).")
+            except PermissionError:
+                print(
+                    "\n" + "=" * 70 + "\n"
+                    "[ERROR Injector] Permission denied on /dev/uinput!\n"
+                    "Wayland requires kernel uinput permissions for touch and mouse injection.\n"
+                    "Please run the following command in terminal on Fedora:\n\n"
+                    "  echo 'KERNEL==\"uinput\", MODE=\"0660\", TAG+=\"uaccess\"' | sudo tee /etc/udev/rules.d/99-uinput.rules && sudo udevadm trigger\n"
+                    + "=" * 70 + "\n"
+                )
+                self.mode = "none"
             except Exception as ex:
                 print(f"[DEBUG Injector] evdev init failed: {ex}")
                 self.mode = "none"
@@ -137,27 +149,48 @@ class UniversalInputInjector:
                 print(f"[DEBUG Injector Win32] Execution failed: {ex}")
 
         elif self.mode == "evdev" and self.ui:
-            if px is not None and py is not None:
-                self.ui.write(e.EV_ABS, e.ABS_X, int(px))
-                self.ui.write(e.EV_ABS, e.ABS_Y, int(py))
-            if ev_type in ("touch_down", "mouse_down"):
-                btn = (
-                    e.BTN_RIGHT
-                    if event.get("button") == "right"
-                    else (e.BTN_MIDDLE if event.get("button") == "middle" else e.BTN_LEFT)
-                )
-                self.ui.write(e.EV_KEY, btn, 1)
-            elif ev_type in ("touch_up", "mouse_up"):
-                btn = (
-                    e.BTN_RIGHT
-                    if event.get("button") == "right"
-                    else (e.BTN_MIDDLE if event.get("button") == "middle" else e.BTN_LEFT)
-                )
-                self.ui.write(e.EV_KEY, btn, 0)
-            elif ev_type == "scroll":
-                dy = 1 if event.get("dy", 0) > 0 else -1
-                self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
-            self.ui.syn()
+            try:
+                if px is not None and py is not None:
+                    self.ui.write(e.EV_ABS, e.ABS_X, int(px))
+                    self.ui.write(e.EV_ABS, e.ABS_Y, int(py))
+
+                if ev_type in ("touch_down", "mouse_down"):
+                    btn_type = event.get("button", "left")
+                    btn_code = (
+                        e.BTN_RIGHT
+                        if btn_type == "right"
+                        else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    )
+                    self.ui.write(e.EV_ABS, e.ABS_PRESSURE, 200)
+                    if btn_code == e.BTN_LEFT:
+                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
+                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 1)
+                    self.ui.write(e.EV_KEY, btn_code, 1)
+                    self.ui.syn()
+
+                elif ev_type in ("touch_up", "mouse_up"):
+                    btn_type = event.get("button", "left")
+                    btn_code = (
+                        e.BTN_RIGHT
+                        if btn_type == "right"
+                        else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    )
+                    self.ui.write(e.EV_ABS, e.ABS_PRESSURE, 0)
+                    if btn_code == e.BTN_LEFT:
+                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
+                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 0)
+                    self.ui.write(e.EV_KEY, btn_code, 0)
+                    self.ui.syn()
+
+                elif ev_type in ("touch_move", "mouse_move"):
+                    self.ui.syn()
+
+                elif ev_type == "scroll":
+                    dy = 1 if event.get("dy", 0) > 0 else -1
+                    self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
+                    self.ui.syn()
+            except Exception as ex:
+                print(f"[DEBUG Injector evdev] Execution failed: {ex}")
 
         elif self.mode == "pynput" and self.mouse:
             if px is not None and py is not None:

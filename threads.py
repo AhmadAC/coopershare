@@ -1,3 +1,4 @@
+
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 Supports native Windows WASAPI loopback, KDE Plasma 6 KWin D-Bus ScreenShot2 kernel pipe capture,
@@ -885,10 +886,20 @@ class InputReceiverThread(QThread):
         print(f"[DEBUG Sender Control] Connecting to {self.target_ip}:{CONTROL_PORT}...")
         self._ensure_socket_connected()
 
-        with create_mss_instance() as sct:
-            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-            scr_w, scr_h = monitor["width"], monitor["height"]
-            mon_l, mon_t = monitor["left"], monitor["top"]
+        # Extract native screen geometry (handles Wayland fractional scaling)
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            geom = screen.geometry()
+            dpr = float(screen.devicePixelRatio())
+            scr_w = int(round(geom.width() * dpr))
+            scr_h = int(round(geom.height() * dpr))
+            mon_l = int(round(geom.x() * dpr))
+            mon_t = int(round(geom.y() * dpr))
+        else:
+            with create_mss_instance() as sct:
+                monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                scr_w, scr_h = monitor["width"], monitor["height"]
+                mon_l, mon_t = monitor["left"], monitor["top"]
 
         injector = UniversalInputInjector(scr_w, scr_h, mon_left=mon_l, mon_top=mon_t)
         payload_size = struct.calcsize(">L")

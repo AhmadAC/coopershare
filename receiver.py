@@ -5,9 +5,10 @@ Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSO
           Reverse Desktop Screen Streaming & Interactive Remote Input (Mouse + Keyboard / Hotkeys),
           Remote Window Management (Maximize, Normal, Minimize),
           Right-Click Context Menu (Run Script, Show Timer, Fullscreen, Standby Details Visibility),
-          Dynamic Audio Playback, Native Win32 / Universal Input Injection (pynput/evdev),
+          Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput),
           UDP Discovery Beacon, 4-Digit PIN Authentication,
-          Vector SVG Icons replacing emojis.
+          Vector SVG Icons replacing emojis,
+          Native Multi-Touch Event Interception.
 """
 
 import ctypes
@@ -132,17 +133,11 @@ def svg_to_icon(svg_str: str, size: int = 16, color: Optional[str] = "#ffffff") 
 
 # Clean Vector SVGs for Receiver
 REC_SVG_ROCKET = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/></svg>"""
-
 REC_SVG_TIMER = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>"""
-
 REC_SVG_INFO = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>"""
-
 REC_SVG_FULLSCREEN = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><polyline points="21 15 21 21 15 21"/><polyline points="3 9 3 3 9 3"/></svg>"""
-
 REC_SVG_EXIT_FULLSCREEN = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><polyline points="14 14 20 14 20 20"/><polyline points="10 10 4 10 4 4"/></svg>"""
-
 REC_SVG_DISCONNECT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="2" x2="22" y2="22"/></svg>"""
-
 REC_SVG_LOGOUT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>"""
 
 
@@ -182,7 +177,21 @@ except Exception as e:
     AUDIO_AVAILABLE = False
     logger.warning(f"sounddevice audio unavailable: {e}")
 
-# Universal Input Injection (pynput fallback)
+# Universal Input Injection (evdev / pynput)
+USE_EVDEV = False
+if sys.platform.startswith("linux"):
+    try:
+        import evdev
+        from evdev import AbsInfo, UInput, ecodes as e
+
+        USE_EVDEV = True
+    except Exception:
+        USE_EVDEV = False
+
+Button = None
+MouseController = None
+KeyboardController = None
+Key = None
 try:
     from pynput.keyboard import Controller as KeyboardController, Key
     from pynput.mouse import Button, Controller as MouseController
@@ -283,7 +292,7 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
 
 
 # ---------------------------------------------------------------------------
-# Universal Input Injector (Direct Win32 API + pynput / evdev fallback)
+# Universal Input Injector (Direct Win32 API + evdev Wayland / pynput Fallback)
 # ---------------------------------------------------------------------------
 
 
@@ -360,21 +369,66 @@ class UniversalInputInjector:
         self.mon_top = mon_top
         self.screen_w = max(1, screen_w)
         self.screen_h = max(1, screen_h)
-        self.is_win32 = sys.platform == "win32"
+        self.mode = "none"
         self.mouse = None
         self.keyboard = None
+        self.ui = None
 
-        if not self.is_win32 and PYNPUT_AVAILABLE:
+        if sys.platform == "win32":
+            self.mode = "win32"
+            print(f"[DEBUG Receiver Injector] Using native Win32 hardware input injection on bounds ({mon_left},{mon_top},{screen_w}x{screen_h}).")
+        elif USE_EVDEV:
             try:
-                self.mouse = MouseController()
-                self.keyboard = KeyboardController()
-            except Exception as ex:
-                logger.warning(f"Failed to initialize pynput controller: {ex}")
+                min_x = min(0, mon_left)
+                max_x = max(self.screen_w, mon_left + self.screen_w)
+                min_y = min(0, mon_top)
+                max_y = max(self.screen_h, mon_top + self.screen_h)
 
-        print(
-            f"[DEBUG Receiver Injector] Initialized injector. Win32={self.is_win32}, "
-            f"Bounds=({self.mon_left},{self.mon_top},{self.screen_w}x{self.screen_h})"
-        )
+                cap = {
+                    e.EV_KEY: [
+                        e.BTN_LEFT,
+                        e.BTN_RIGHT,
+                        e.BTN_MIDDLE,
+                        e.BTN_TOUCH,
+                        e.BTN_TOOL_FINGER,
+                    ],
+                    e.EV_ABS: [
+                        (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=0)),
+                        (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=0)),
+                        (e.ABS_PRESSURE, AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)),
+                    ],
+                    e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL],
+                }
+
+                input_props = []
+                if hasattr(e, "INPUT_PROP_DIRECT"):
+                    input_props.append(e.INPUT_PROP_DIRECT)
+                if hasattr(e, "INPUT_PROP_POINTER"):
+                    input_props.append(e.INPUT_PROP_POINTER)
+
+                self.ui = UInput(
+                    events=cap,
+                    name="mrcoopers-receiver-input",
+                    input_props=input_props if input_props else None,
+                )
+                self.mode = "evdev"
+                print(f"[DEBUG Receiver Injector] Linux evdev virtual touch & pointer active ({max_x}x{max_y}).")
+            except Exception as ex:
+                print(f"[DEBUG Receiver Injector] Linux evdev init notice: {ex}")
+                self.mode = "none"
+
+        if self.mode == "none":
+            if PYNPUT_AVAILABLE:
+                try:
+                    self.mouse = MouseController()
+                    self.keyboard = KeyboardController()
+                    self.mode = "pynput"
+                    print("[DEBUG Receiver Injector] Using pynput fallback.")
+                except Exception as ex:
+                    print(f"[DEBUG Receiver Injector] pynput init failed: {ex}")
+                    self.mode = "unsupported"
+            else:
+                self.mode = "unsupported"
 
     def execute(self, event: dict):
         ev_type = event.get("type")
@@ -387,7 +441,7 @@ class UniversalInputInjector:
         else:
             px, py = None, None
 
-        if self.is_win32:
+        if self.mode == "win32":
             try:
                 if px is not None and py is not None:
                     ctypes.windll.user32.SetCursorPos(int(px), int(py))
@@ -441,6 +495,51 @@ class UniversalInputInjector:
             except Exception as ex:
                 logger.error(f"Win32 input injection exception: {ex}")
 
+        elif self.mode == "evdev" and self.ui:
+            try:
+                if px is not None and py is not None:
+                    self.ui.write(e.EV_ABS, e.ABS_X, int(px))
+                    self.ui.write(e.EV_ABS, e.ABS_Y, int(py))
+
+                if ev_type in ("touch_down", "mouse_down"):
+                    btn_type = event.get("button", "left")
+                    btn_code = (
+                        e.BTN_RIGHT
+                        if btn_type == "right"
+                        else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    )
+                    self.ui.write(e.EV_ABS, e.ABS_PRESSURE, 200)
+                    if btn_code == e.BTN_LEFT:
+                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
+                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 1)
+                    self.ui.write(e.EV_KEY, btn_code, 1)
+                    self.ui.syn()
+
+                elif ev_type in ("touch_up", "mouse_up"):
+                    btn_type = event.get("button", "left")
+                    btn_code = (
+                        e.BTN_RIGHT
+                        if btn_type == "right"
+                        else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    )
+                    self.ui.write(e.EV_ABS, e.ABS_PRESSURE, 0)
+                    if btn_code == e.BTN_LEFT:
+                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
+                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 0)
+                    self.ui.write(e.EV_KEY, btn_code, 0)
+                    self.ui.syn()
+
+                elif ev_type in ("touch_move", "mouse_move"):
+                    self.ui.syn()
+
+                elif ev_type == "scroll":
+                    dy = 1 if event.get("dy", 0) > 0 else -1
+                    self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
+                    self.ui.syn()
+                return
+            except Exception as ex:
+                logger.error(f"evdev input injection exception: {ex}")
+
         # Linux / pynput Fallback
         if self.mouse:
             if px is not None and py is not None:
@@ -476,7 +575,11 @@ class UniversalInputInjector:
                     pass
 
     def close(self):
-        pass
+        if self.mode == "evdev" and self.ui:
+            try:
+                self.ui.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1171,6 +1274,11 @@ class ControlServerThread(QThread):
 
 
 class TouchDisplayCanvas(QWidget):
+    """
+    High-DPI Canvas with full support for hardware touchscreens (QTouchEvent)
+    and traditional mouse injection.
+    """
+
     def __init__(self, control_server: ControlServerThread, parent=None):
         super().__init__(parent)
         self.control_server = control_server
@@ -1184,7 +1292,7 @@ class TouchDisplayCanvas(QWidget):
         self.update()
 
     def _get_video_rect(self) -> QRect:
-        if not self.current_frame:
+        if not self.current_frame or self.current_frame.isNull():
             return self.rect()
         pix_size = self.current_frame.size()
         pix_size.scale(self.size(), Qt.KeepAspectRatio)
@@ -1199,14 +1307,49 @@ class TouchDisplayCanvas(QWidget):
         r = self._get_video_rect()
         if r.width() == 0 or r.height() == 0:
             return None
-        nx, ny = (pos.x() - r.x()) / r.width(), (pos.y() - r.y()) / r.height()
+        nx = (pos.x() - r.x()) / r.width()
+        ny = (pos.y() - r.y()) / r.height()
         return (nx, ny) if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0 else None
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() in (
+            QEvent.TouchBegin,
+            QEvent.TouchUpdate,
+            QEvent.TouchEnd,
+            QEvent.TouchCancel,
+        ):
+            self._handle_touch_event(event)
+            return True
+        return super().event(event)
+
+    def _handle_touch_event(self, event):
+        points = event.points()
+        if not points:
+            return
+        pt = points[0]
+        norm = self._normalize_pos(pt.position())
+        if not norm:
+            return
+
+        ev_type = event.type()
+        if ev_type == QEvent.TouchBegin:
+            self.control_server.send_event(
+                {"type": "touch_down", "x": norm[0], "y": norm[1], "button": "left"}
+            )
+        elif ev_type == QEvent.TouchUpdate:
+            self.control_server.send_event(
+                {"type": "touch_move", "x": norm[0], "y": norm[1]}
+            )
+        elif ev_type in (QEvent.TouchEnd, QEvent.TouchCancel):
+            self.control_server.send_event(
+                {"type": "touch_up", "x": norm[0], "y": norm[1], "button": "left"}
+            )
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        if self.current_frame:
+        if self.current_frame and not self.current_frame.isNull():
             painter.drawPixmap(self._get_video_rect(), self.current_frame)
 
     def mousePressEvent(self, event):
@@ -1268,14 +1411,15 @@ class ReceiverMainWindow(QMainWindow):
             mon_l, mon_t = mon["left"], mon["top"]
         self.input_injector = UniversalInputInjector(mon_l, mon_t, scr_w, scr_h)
 
-        self._setup_ui()
-        self._apply_details_visibility()
-
+        # Initialize network servers BEFORE setting up UI
         self.control_thread = ControlServerThread()
         self.audio_thread = AudioServerThread()
         self.video_thread = VideoServerThread(self.get_pin, self.is_pin_required)
         self.beacon_thread = DiscoveryBeaconThread(self.get_pin, self.is_pin_required)
         self.reverse_video_thread = ReverseVideoServerThread()
+
+        self._setup_ui()
+        self._apply_details_visibility()
 
         self.video_thread.frame_received.connect(self.on_frame)
         self.video_thread.client_connected.connect(self.on_connected)
@@ -1295,7 +1439,7 @@ class ReceiverMainWindow(QMainWindow):
         return self.pin
 
     def is_pin_required(self) -> bool:
-        if self.pin_req_cb is not None:
+        if getattr(self, "pin_req_cb", None) is not None:
             return self.pin_req_cb.isChecked()
         return self._pin_required
 
@@ -1345,8 +1489,8 @@ class ReceiverMainWindow(QMainWindow):
 
         sb_layout.addWidget(self.details_container, alignment=Qt.AlignCenter)
 
-        self.control_thread_dummy = ControlServerThread()
-        self.canvas = TouchDisplayCanvas(self.control_thread_dummy)
+        # Wire canvas directly to active control thread
+        self.canvas = TouchDisplayCanvas(self.control_thread)
         self.stack.addWidget(self.standby)
         self.stack.addWidget(self.canvas)
 

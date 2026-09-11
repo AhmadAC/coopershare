@@ -1,3 +1,4 @@
+
 """
 MrCoopersScreenShare - Sender (PC Presenter & Remote Controller)
 Main executable launcher and bootstrap script.
@@ -51,10 +52,15 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP") != "
             print(f"[BOOTSTRAP ERROR] Failed to run external sender.py: {_ex}")
 
 from ui_main import FloatingSenderWindow
-from utils import create_application_icon, ensure_kde_desktop_entry
+from utils import (
+    create_application_icon,
+    ensure_kde_desktop_entry,
+    ensure_uinput_permissions,
+)
 
-# Ensure KDE permissions exist for KWin ScreenShot2
+# Ensure KDE screen capture & Linux kernel touch permissions exist
 ensure_kde_desktop_entry()
+ensure_uinput_permissions()
 
 if __name__ == "__main__":
     if sys.platform == "win32":

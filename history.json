@@ -4,10 +4,10 @@
         "172.31.60.175": "408 STEAM",
         "192.168.90.221": "317 CS"
     },
-    "quality_preset": "Balanced (75%)",
+    "quality_preset": "Ultra Crisp (92%)",
     "touch_input": true,
     "tv_volume": 34,
     "allow_audio_when_paused": false,
     "opacity": 93,
-    "fps_preset": "60 FPS"
+    "fps_preset": "30 FPS"
 }
