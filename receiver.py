@@ -8,7 +8,7 @@ Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSO
           Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput),
           UDP Discovery Beacon, 4-Digit PIN Authentication,
           Vector SVG Icons replacing emojis,
-          Native Multi-Touch Event Interception.
+          Hardware Multi-Touch QTouchEvent Processing.
 """
 
 import ctypes
@@ -393,26 +393,15 @@ class UniversalInputInjector:
                         e.BTN_TOOL_FINGER,
                     ],
                     e.EV_ABS: [
-                        (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=0)),
-                        (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=0)),
-                        (e.ABS_PRESSURE, AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)),
+                        (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=1)),
+                        (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=1)),
                     ],
-                    e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL],
+                    e.EV_REL: [e.REL_WHEEL],
                 }
 
-                input_props = []
-                if hasattr(e, "INPUT_PROP_DIRECT"):
-                    input_props.append(e.INPUT_PROP_DIRECT)
-                if hasattr(e, "INPUT_PROP_POINTER"):
-                    input_props.append(e.INPUT_PROP_POINTER)
-
-                self.ui = UInput(
-                    events=cap,
-                    name="mrcoopers-receiver-input",
-                    input_props=input_props if input_props else None,
-                )
+                self.ui = UInput(cap, name="mrcoopers-receiver-input")
                 self.mode = "evdev"
-                print(f"[DEBUG Receiver Injector] Linux evdev virtual touch & pointer active ({max_x}x{max_y}).")
+                print(f"[DEBUG Receiver Injector] Linux evdev virtual pointer active ({max_x}x{max_y}).")
             except Exception as ex:
                 print(f"[DEBUG Receiver Injector] Linux evdev init notice: {ex}")
                 self.mode = "none"
@@ -508,10 +497,8 @@ class UniversalInputInjector:
                         if btn_type == "right"
                         else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
                     )
-                    self.ui.write(e.EV_ABS, e.ABS_PRESSURE, 200)
                     if btn_code == e.BTN_LEFT:
                         self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
-                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 1)
                     self.ui.write(e.EV_KEY, btn_code, 1)
                     self.ui.syn()
 
@@ -522,10 +509,8 @@ class UniversalInputInjector:
                         if btn_type == "right"
                         else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
                     )
-                    self.ui.write(e.EV_ABS, e.ABS_PRESSURE, 0)
                     if btn_code == e.BTN_LEFT:
                         self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
-                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 0)
                     self.ui.write(e.EV_KEY, btn_code, 0)
                     self.ui.syn()
 
@@ -1175,6 +1160,7 @@ class ControlServerThread(QThread):
                 conn.settimeout(0.5)
                 with self._send_lock:
                     self.client_conn = conn
+                logger.info(f"Control channel client connected from {addr[0]}")
             except socket.timeout:
                 continue
             except Exception:
@@ -1248,8 +1234,12 @@ class ControlServerThread(QThread):
                 try:
                     msg = json.dumps(event_data).encode("utf-8")
                     self.client_conn.sendall(struct.pack(">L", len(msg)) + msg)
-                except Exception:
+                    logger.debug(f"[Touch Send] {event_data.get('type')} at {event_data.get('x')}, {event_data.get('y')}")
+                except Exception as ex:
+                    logger.error(f"Failed to transmit touch event: {ex}")
                     self.client_conn = None
+            else:
+                logger.warning("send_event called but no active client connection exists!")
 
     def stop(self):
         self.running = False
@@ -1275,8 +1265,8 @@ class ControlServerThread(QThread):
 
 class TouchDisplayCanvas(QWidget):
     """
-    High-DPI Canvas with full support for hardware touchscreens (QTouchEvent)
-    and traditional mouse injection.
+    High-DPI Canvas with full hardware support for Windows 11 multi-touch events
+    (QTouchEvent) and traditional mouse/trackpad events.
     """
 
     def __init__(self, control_server: ControlServerThread, parent=None):
