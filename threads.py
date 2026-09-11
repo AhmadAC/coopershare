@@ -2,7 +2,8 @@
 
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
-Supports native Windows WASAPI loopback, high-performance MSS capture, and Wayland native capture (grim/spectacle).
+Supports native Windows WASAPI loopback, KDE Plasma 6 KWin D-Bus ScreenShot2 kernel pipe capture,
+KDE Spectacle RAM-disk grabber, Wayland screencopy, and MSS hardware capture.
 """
 
 import json
@@ -11,6 +12,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 from typing import Optional
@@ -38,6 +40,187 @@ from video_backend import render_cursor_on_frame
 
 if AUDIO_AVAILABLE:
     import sounddevice as sd
+
+
+class KWinScreenShot2Grabber:
+    """Zero-overhead native KDE Plasma 6 (Wayland) KWin ScreenShot2 kernel pipe capture."""
+
+    def __init__(self):
+        self.available = False
+        self.iface = None
+        if not sys.platform.startswith("linux"):
+            return
+
+        try:
+            from PySide6.QtDBus import QDBusConnection, QDBusInterface
+
+            iface = QDBusInterface(
+                "org.kde.KWin.ScreenShot2",
+                "/org/kde/KWin/ScreenShot2",
+                "org.kde.KWin.ScreenShot2",
+                QDBusConnection.sessionBus(),
+            )
+            if iface.isValid():
+                self.iface = iface
+                test_frame = self.grab(include_cursor=False)
+                if test_frame is not None and test_frame.size > 0:
+                    self.available = True
+                    print(
+                        f"[DEBUG Screen Capturer] Native KDE Plasma 6 KWin screencopy active ({test_frame.shape[1]}x{test_frame.shape[0]})."
+                    )
+                else:
+                    err_msg = iface.lastError().message()
+                    print(f"[DEBUG Screen Capturer] KWin ScreenShot2 probe notice: {err_msg if err_msg else 'Empty frame'}")
+            else:
+                print(f"[DEBUG Screen Capturer] KWin ScreenShot2 interface unavailable: {iface.lastError().message()}")
+        except Exception as e:
+            print(f"[DEBUG Screen Capturer] KWin ScreenShot2 probe error: {e}")
+            self.available = False
+
+    def grab(self, include_cursor: bool = True) -> Optional[np.ndarray]:
+        if not self.iface:
+            return None
+        r_fd, w_fd = -1, -1
+        try:
+            from PySide6.QtDBus import QDBusUnixFileDescriptor
+
+            r_fd, w_fd = os.pipe()
+            q_fd = QDBusUnixFileDescriptor(w_fd)
+            options = {
+                "include-cursor": include_cursor,
+                "native-resolution": True,
+            }
+
+            reply = self.iface.call("CaptureWorkspace", options, q_fd)
+            os.close(w_fd)
+            w_fd = -1
+
+            if reply.isError() or not reply.arguments():
+                r_fd2, w_fd2 = os.pipe()
+                q_fd2 = QDBusUnixFileDescriptor(w_fd2)
+                reply2 = self.iface.call("CaptureActiveScreen", options, q_fd2)
+                os.close(w_fd2)
+                os.close(r_fd)
+                r_fd = r_fd2
+                if reply2.isError() or not reply2.arguments():
+                    os.close(r_fd)
+                    r_fd = -1
+                    return None
+                meta = reply2.arguments()[0]
+            else:
+                meta = reply.arguments()[0]
+
+            width = int(meta.get("width", 0))
+            height = int(meta.get("height", 0))
+            stride = int(meta.get("stride", width * 4))
+
+            if width <= 0 or height <= 0:
+                os.close(r_fd)
+                r_fd = -1
+                return None
+
+            total_bytes = stride * height
+            buf = bytearray()
+            while len(buf) < total_bytes:
+                chunk = os.read(r_fd, min(262144, total_bytes - len(buf)))
+                if not chunk:
+                    break
+                buf.extend(chunk)
+            os.close(r_fd)
+            r_fd = -1
+
+            if len(buf) < total_bytes:
+                return None
+
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape((height, stride // 4, 4))
+            if stride // 4 > width:
+                arr = arr[:, :width, :]
+
+            # Convert BGRA to BGR
+            bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+            return bgr
+        except Exception:
+            if w_fd != -1:
+                try:
+                    os.close(w_fd)
+                except Exception:
+                    pass
+            if r_fd != -1:
+                try:
+                    os.close(r_fd)
+                except Exception:
+                    pass
+            return None
+
+
+class SpectacleGrabber:
+    """KDE Spectacle fullscreen capture writing to shared memory (/dev/shm)."""
+
+    def __init__(self):
+        self.cmd = shutil.which("spectacle")
+        self.tmp_path = "/dev/shm/coopershare_frame.png"
+        self.available = False
+        if self.cmd and sys.platform.startswith("linux"):
+            try:
+                res = subprocess.run(
+                    [self.cmd, "-f", "-b", "-n", "-o", self.tmp_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2.0,
+                )
+                if res.returncode == 0 and os.path.exists(self.tmp_path) and os.path.getsize(self.tmp_path) > 100:
+                    self.available = True
+                    print(f"[DEBUG Screen Capturer] KDE Spectacle RAM-disk capture active ({self.tmp_path}).")
+            except Exception as e:
+                print(f"[DEBUG Screen Capturer] Spectacle probe notice: {e}")
+
+    def grab(self) -> Optional[np.ndarray]:
+        if not self.cmd:
+            return None
+        try:
+            res = subprocess.run(
+                [self.cmd, "-f", "-b", "-n", "-o", self.tmp_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+            if res.returncode == 0 and os.path.exists(self.tmp_path):
+                img = cv2.imread(self.tmp_path, cv2.IMREAD_COLOR)
+                return img
+        except Exception:
+            return None
+        return None
+
+
+def probe_grim(grim_bin: str) -> tuple[bool, list[str]]:
+    """Probes grim for supported formats."""
+    try:
+        r = subprocess.run(
+            [grim_bin, "-t", "ppm", "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=0.8,
+        )
+        if r.returncode == 0 and len(r.stdout) > 100:
+            print("[DEBUG Sender Video] Wayland screencopy active via grim (PPM).")
+            return True, ["-t", "ppm"]
+    except Exception:
+        pass
+
+    try:
+        r = subprocess.run(
+            [grim_bin, "-t", "jpeg", "-q", "75", "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=0.8,
+        )
+        if r.returncode == 0 and len(r.stdout) > 100:
+            print("[DEBUG Sender Video] Wayland screencopy active via grim (JPEG).")
+            return True, ["-t", "jpeg"]
+    except Exception:
+        pass
+
+    return False, []
 
 
 class DiscoveryListenerThread(QThread):
@@ -120,7 +303,6 @@ class ScreenSenderThread(QThread):
         )
 
     def trigger_cursorless_frame(self):
-        """Disables cursor on the next frame so pause displays a clean screen without frozen pointer."""
         self.send_cursorless_frame_once = True
 
     def run(self):
@@ -171,23 +353,26 @@ class ScreenSenderThread(QThread):
         is_wayland = sys.platform.startswith("linux") and (
             os.environ.get("XDG_SESSION_TYPE") == "wayland" or os.environ.get("WAYLAND_DISPLAY") is not None
         )
-        grim_bin = shutil.which("grim") if is_wayland else None
-        spectacle_bin = shutil.which("spectacle") if (is_wayland and not grim_bin) else None
 
-        if is_wayland:
-            if grim_bin:
-                print(f"[DEBUG Sender Video] Wayland compositor active. Capturing via: {grim_bin}")
-            elif spectacle_bin:
-                print(f"[DEBUG Sender Video] Wayland compositor active. Capturing via: {spectacle_bin}")
-            else:
-                print(
-                    "[DEBUG Sender Video] Wayland detected. For best capture performance, install grim: 'sudo dnf install grim'"
-                )
+        # 1. Native KWin ScreenShot2 D-Bus kernel pipe grabber (KDE Plasma 6 Wayland)
+        kwin_grabber = KWinScreenShot2Grabber() if is_wayland else None
+        use_kwin = bool(kwin_grabber and kwin_grabber.available)
+
+        # 2. KDE Spectacle RAM-disk grabber fallback
+        spectacle_grabber = SpectacleGrabber() if (is_wayland and not use_kwin) else None
+        use_spectacle = bool(spectacle_grabber and spectacle_grabber.available)
+
+        # 3. grim CLI fallback
+        grim_bin = shutil.which("grim") if (is_wayland and not use_kwin and not use_spectacle) else None
+        use_grim = False
+        grim_args = []
+        if grim_bin:
+            use_grim, grim_args = probe_grim(grim_bin)
 
         with create_mss_instance() as sct:
-            monitor = sct.monitors[1]
-            mon_left = monitor["left"]
-            mon_top = monitor["top"]
+            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            mon_left = monitor.get("left", 0)
+            mon_top = monitor.get("top", 0)
 
             while self.running:
                 if self.paused and not self.send_cursorless_frame_once:
@@ -197,39 +382,71 @@ class ScreenSenderThread(QThread):
                 t_start = time.perf_counter()
 
                 try:
-                    if grim_bin:
-                        cmd = [grim_bin, "-t", "jpeg", "-q", str(self.quality)]
+                    data = None
+
+                    if use_kwin:
+                        bgr = kwin_grabber.grab(
+                            include_cursor=(not self.paused and not self.send_cursorless_frame_once)
+                        )
+                        if bgr is not None:
+                            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                            if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
+                                encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
+
+                            if self.use_444_chroma:
+                                sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
+                                sampling_444_val = getattr(
+                                    cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001
+                                )
+                                encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+
+                            success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
+                            if success:
+                                data = enc_img.tobytes()
+
+                    elif use_spectacle:
+                        bgr = spectacle_grabber.grab()
+                        if bgr is not None:
+                            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                            success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
+                            if success:
+                                data = enc_img.tobytes()
+
+                    elif use_grim:
+                        cmd = [grim_bin] + grim_args
+                        if "-t" in grim_args and "jpeg" in grim_args:
+                            cmd.extend(["-q", str(self.quality)])
                         if not self.paused and not self.send_cursorless_frame_once:
                             cmd.append("-c")
                         cmd.append("-")
 
-                        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=1.0)
-                        if res.returncode == 0 and res.stdout:
-                            data = res.stdout
-                            sock.sendall(struct.pack(">L", len(data)) + data)
-                        if self.send_cursorless_frame_once:
-                            self.send_cursorless_frame_once = False
-
-                    elif spectacle_bin:
                         res = subprocess.run(
-                            [spectacle_bin, "-b", "-n", "-o", "/dev/stdout"],
+                            cmd,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL,
-                            timeout=1.5,
+                            timeout=0.6,
                         )
                         if res.returncode == 0 and res.stdout:
-                            np_arr = np.frombuffer(res.stdout, np.uint8)
-                            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                            if img is not None:
-                                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-                                success, enc_img = cv2.imencode(".jpg", img, encode_params)
-                                if success:
-                                    data = enc_img.tobytes()
-                                    sock.sendall(struct.pack(">L", len(data)) + data)
-                        if self.send_cursorless_frame_once:
-                            self.send_cursorless_frame_once = False
+                            if "-t" in grim_args and "jpeg" in grim_args:
+                                data = res.stdout
+                            else:
+                                np_arr = np.frombuffer(res.stdout, np.uint8)
+                                bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                                if bgr is not None:
+                                    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                                    if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
+                                        encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
+                                    if self.use_444_chroma:
+                                        sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
+                                        sampling_444_val = getattr(
+                                            cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001
+                                        )
+                                        encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+                                    success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
+                                    if success:
+                                        data = enc_img.tobytes()
 
-                    else:
+                    if data is None:
                         raw_frame = sct.grab(monitor)
                         img = np.array(raw_frame)
                         bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
@@ -251,14 +468,23 @@ class ScreenSenderThread(QThread):
                         success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
                         if success:
                             data = enc_img.tobytes()
-                            sock.sendall(struct.pack(">L", len(data)) + data)
 
-                        if self.send_cursorless_frame_once:
-                            self.send_cursorless_frame_once = False
+                    if data:
+                        sock.sendall(struct.pack(">L", len(data)) + data)
 
-                except Exception as e:
-                    print(f"[DEBUG Sender Video] Frame send failed: {e}")
+                    if self.send_cursorless_frame_once:
+                        self.send_cursorless_frame_once = False
+
+                except (socket.error, BrokenPipeError, ConnectionResetError) as e:
+                    print(f"[DEBUG Sender Video] Network socket disconnected: {e}")
                     break
+                except subprocess.TimeoutExpired:
+                    self.msleep(10)
+                    continue
+                except Exception as e:
+                    print(f"[DEBUG Sender Video] Frame capture notice: {e}")
+                    self.msleep(10)
+                    continue
 
                 elapsed = time.perf_counter() - t_start
                 target_frame_time = 1.0 / max(1, self.fps_limit)
@@ -406,7 +632,6 @@ class InputReceiverThread(QThread):
                 return False
 
     def send_command(self, cmd: dict):
-        """Transmits remote input / control packets to the receiver display with auto-reconnection."""
         if not self._ensure_socket_connected():
             return
         with self._send_lock:
@@ -427,7 +652,7 @@ class InputReceiverThread(QThread):
         self._ensure_socket_connected()
 
         with create_mss_instance() as sct:
-            mon = sct.monitors[1]
+            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             scr_w, scr_h = mon["width"], mon["height"]
             mon_l, mon_t = mon["left"], mon["top"]
 

@@ -3,7 +3,7 @@
 """
 MrCoopersScreenShare - Source Shortcut Creator
 Creates desktop and local shortcuts to launch `sender.py` directly from source
-using pythonw.exe (windowless execution on Windows) or python3 (on Linux).
+using pythonw.exe (windowless execution on Windows) or python3 (on Linux with KWin D-Bus permissions).
 """
 
 import os
@@ -18,17 +18,14 @@ def get_pythonw_executable() -> str:
     current_exe = sys.executable
     dir_name = os.path.dirname(current_exe)
 
-    # 1. Check same directory as current python interpreter
     c1 = os.path.join(dir_name, "pythonw.exe")
     if os.path.exists(c1):
         return c1
 
-    # 2. Check regex replacement in path
     c2 = re.sub(r"python\.exe$", "pythonw.exe", current_exe, flags=re.IGNORECASE)
     if os.path.exists(c2):
         return c2
 
-    # 3. Check sys.exec_prefix / base_exec_prefix (virtualenvs)
     for prefix in [sys.exec_prefix, sys.base_exec_prefix]:
         c3 = os.path.join(prefix, "pythonw.exe")
         if os.path.exists(c3):
@@ -37,12 +34,10 @@ def get_pythonw_executable() -> str:
         if os.path.exists(c3_scripts):
             return c3_scripts
 
-    # 4. Check system PATH
     which_path = shutil.which("pythonw.exe") or shutil.which("pythonw")
     if which_path and os.path.exists(which_path):
         return which_path
 
-    # 5. Check pyw launcher
     pyw_path = shutil.which("pyw.exe") or shutil.which("pyw")
     if pyw_path and os.path.exists(pyw_path):
         return pyw_path
@@ -70,20 +65,16 @@ def generate_icon_files(project_root: str) -> tuple[str, str]:
             painter = QPainter(pix)
             painter.setRenderHint(QPainter.Antialiasing, True)
 
-            # Draw icon background
             painter.setBrush(QColor("#0078d4"))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
 
-            # Draw screen frame
             painter.setBrush(QColor("#ffffff"))
             painter.drawRoundedRect(14, 15, 36, 24, 4, 4)
 
-            # Draw screen display
             painter.setBrush(QColor("#1a1e29"))
             painter.drawRect(18, 19, 28, 16)
 
-            # Draw stand
             painter.setBrush(QColor("#ffffff"))
             painter.drawRect(29, 41, 6, 4)
             painter.drawRoundedRect(22, 45, 20, 3, 1, 1)
@@ -194,6 +185,7 @@ Icon={icon_path if os.path.exists(icon_path) else 'video-display'}
 Terminal=false
 StartupNotify=true
 Categories=Utility;Network;
+X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
 """
 
     for shortcut_path in filter(None, targets):

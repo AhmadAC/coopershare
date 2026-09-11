@@ -9,3 +9,4 @@ Icon=/var/mnt/shared-drive/2027/coopershare/icon.png
 Terminal=false
 StartupNotify=true
 Categories=Utility;Network;
+X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
