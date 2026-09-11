@@ -66,6 +66,21 @@ def _is_dbus_error(msg: QDBusMessage) -> bool:
     return False
 
 
+def _extract_dict_from_dbus_meta(meta_raw) -> dict:
+    """Safely unpacks PySide6 QDBusArgument metadata into a Python dictionary."""
+    if isinstance(meta_raw, dict):
+        return meta_raw
+    for method_name in ("asVariant", "toVariant"):
+        if hasattr(meta_raw, method_name):
+            try:
+                val = getattr(meta_raw, method_name)()
+                if isinstance(val, dict):
+                    return val
+            except Exception:
+                pass
+    return {}
+
+
 class KWinScreenShot2Grabber:
     """Zero-overhead native KDE Plasma 6 (Wayland) KWin ScreenShot2 kernel pipe capture."""
 
@@ -192,31 +207,45 @@ class KWinScreenShot2Grabber:
             if not raw_bytes:
                 return None
 
-            meta = meta_raw
-            if hasattr(meta_raw, "asVariant"):
-                meta = meta_raw.asVariant()
+            total_pixels = len(raw_bytes) // 4
+            meta = _extract_dict_from_dbus_meta(meta_raw)
 
-            width = 0
-            height = 0
-            stride = 0
-            if isinstance(meta, dict):
-                width = int(meta.get("width", 0))
-                height = int(meta.get("height", 0))
-                stride = int(meta.get("stride", 0))
+            width = int(meta.get("width", 0))
+            height = int(meta.get("height", 0))
+            stride = int(meta.get("stride", 0))
+            fmt_code = int(meta.get("format", 0))
 
-            if width <= 0 or height <= 0:
+            # Resolve physical dimensions against fractional scaling (e.g. 1920x1080 at 125% scale)
+            if width <= 0 or height <= 0 or (width * height != total_pixels):
                 screen = QGuiApplication.primaryScreen()
                 if screen:
-                    geom = screen.size()
-                    width, height = geom.width(), geom.height()
+                    dpr = screen.devicePixelRatio()
+                    lw, lh = screen.size().width(), screen.size().height()
+                    nw, nh = int(round(lw * dpr)), int(round(lh * dpr))
+
+                    if nw * nh == total_pixels:
+                        width, height = nw, nh
+                    elif lw * lh == total_pixels:
+                        width, height = lw, lh
+                    else:
+                        # Aspect ratio deduction
+                        aspect = lw / lh if lh > 0 else (16.0 / 9.0)
+                        h_est = int(round((total_pixels / aspect) ** 0.5))
+                        w_est = int(round(h_est * aspect))
+                        if w_est * h_est == total_pixels:
+                            width, height = w_est, h_est
+                        else:
+                            width, height = nw, nh
 
             if width <= 0 or height <= 0:
                 return None
 
-            if stride <= 0:
-                stride = width * 4
+            expected_stride = width * 4
+            if stride < expected_stride:
+                stride = expected_stride
 
-            if len(raw_bytes) < stride * height:
+            expected_total_bytes = stride * height
+            if len(raw_bytes) < expected_total_bytes:
                 if len(raw_bytes) >= width * height * 4:
                     stride = width * 4
                 else:
@@ -226,7 +255,13 @@ class KWinScreenShot2Grabber:
             if stride // 4 > width:
                 arr = arr[:, :width, :]
 
-            bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+            # In Wayland, KWin writes ARGB32_Premultiplied (Format 5, BGRA byte order)
+            # Format 17 is RGBA8888
+            if fmt_code in (16, 17):  # Format_RGBA8888 / Format_RGBA8888_Premultiplied
+                bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+            else:
+                bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+
             return bgr
 
         except Exception as ex:
