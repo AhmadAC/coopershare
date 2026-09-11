@@ -1,3 +1,4 @@
+
 """
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
 Features persistent state loading and debounced saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
@@ -12,7 +13,7 @@ import time
 from typing import Optional
 
 from PySide6.QtCore import QByteArray, QEvent, QPoint, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QKeyEvent
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -708,10 +709,28 @@ class FloatingSenderWindow(QWidget):
             self._populate_device_list()
 
     def ensure_control_channel(self, target_ip: str) -> bool:
-        """Ensures a dedicated control channel is running to the target receiver."""
+        """Safely ensures a dedicated control channel is running using clean main-thread screen metrics."""
         if not self.control_thread or not self.control_thread.isRunning():
             print(f"[DEBUG Sender UI] Starting control thread for {target_ip}...")
-            self.control_thread = InputReceiverThread(target_ip, self.is_input_enabled)
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            if screen:
+                geom = screen.geometry()
+                dpr = float(screen.devicePixelRatio())
+                scr_w = max(1, int(round(geom.width() * dpr)))
+                scr_h = max(1, int(round(geom.height() * dpr)))
+                mon_l = int(round(geom.x() * dpr))
+                mon_t = int(round(geom.y() * dpr))
+            else:
+                scr_w, scr_h, mon_l, mon_t = 1920, 1080, 0, 0
+
+            self.control_thread = InputReceiverThread(
+                target_ip,
+                self.is_input_enabled,
+                scr_w=scr_w,
+                scr_h=scr_h,
+                mon_l=mon_l,
+                mon_t=mon_t,
+            )
             self.control_thread.start()
             for _ in range(20):
                 if self.control_thread.sock:

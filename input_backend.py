@@ -64,34 +64,19 @@ class UniversalInputInjector:
                         e.BTN_TOOL_FINGER,
                     ],
                     e.EV_ABS: [
-                        (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=0)),
-                        (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=0)),
-                        (e.ABS_PRESSURE, AbsInfo(value=0, min=0, max=255, fuzz=0, flat=0, resolution=0)),
+                        (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=1)),
+                        (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=1)),
                     ],
-                    e.EV_REL: [e.REL_WHEEL, e.REL_HWHEEL],
+                    e.EV_REL: [e.REL_WHEEL],
                 }
 
-                input_props = []
-                if hasattr(e, "INPUT_PROP_DIRECT"):
-                    input_props.append(e.INPUT_PROP_DIRECT)
-                if hasattr(e, "INPUT_PROP_POINTER"):
-                    input_props.append(e.INPUT_PROP_POINTER)
-
-                self.ui = UInput(
-                    events=cap,
-                    name="mrcoopers-virtual-touch",
-                    input_props=input_props if input_props else None,
-                )
+                self.ui = UInput(cap, name="mrcoopers-virtual-input")
                 self.mode = "evdev"
-                print(f"[DEBUG Injector] Linux evdev kernel virtual touch & pointer active ({max_x}x{max_y}).")
-            except PermissionError:
+                print(f"[DEBUG Injector] Linux evdev kernel virtual pointer active ({max_x}x{max_y}).")
+            except PermissionError as p_err:
                 print(
-                    "\n" + "=" * 70 + "\n"
-                    "[ERROR Injector] Permission denied on /dev/uinput!\n"
-                    "Wayland requires kernel uinput permissions for touch and mouse injection.\n"
-                    "Please run the following command in terminal on Fedora:\n\n"
-                    "  echo 'KERNEL==\"uinput\", MODE=\"0660\", TAG+=\"uaccess\"' | sudo tee /etc/udev/rules.d/99-uinput.rules && sudo udevadm trigger\n"
-                    + "=" * 70 + "\n"
+                    f"\n[ERROR Injector] Permission denied on /dev/uinput: {p_err}\n"
+                    "Run: sudo setfacl -m u:$USER:rw /dev/uinput\n"
                 )
                 self.mode = "none"
             except Exception as ex:
@@ -161,12 +146,11 @@ class UniversalInputInjector:
                         if btn_type == "right"
                         else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
                     )
-                    self.ui.write(e.EV_ABS, e.ABS_PRESSURE, 200)
                     if btn_code == e.BTN_LEFT:
                         self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
-                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 1)
                     self.ui.write(e.EV_KEY, btn_code, 1)
                     self.ui.syn()
+                    print(f"[DEBUG Injector evdev] Touch Down at ({px}, {py}) btn={btn_type}")
 
                 elif ev_type in ("touch_up", "mouse_up"):
                     btn_type = event.get("button", "left")
@@ -175,12 +159,11 @@ class UniversalInputInjector:
                         if btn_type == "right"
                         else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
                     )
-                    self.ui.write(e.EV_ABS, e.ABS_PRESSURE, 0)
                     if btn_code == e.BTN_LEFT:
                         self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
-                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 0)
                     self.ui.write(e.EV_KEY, btn_code, 0)
                     self.ui.syn()
+                    print(f"[DEBUG Injector evdev] Touch Up at ({px}, {py}) btn={btn_type}")
 
                 elif ev_type in ("touch_move", "mouse_move"):
                     self.ui.syn()

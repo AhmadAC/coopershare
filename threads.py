@@ -1,4 +1,3 @@
-
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 Supports native Windows WASAPI loopback, KDE Plasma 6 KWin D-Bus ScreenShot2 kernel pipe capture,
@@ -16,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from typing import Optional
 
 import cv2
@@ -841,10 +841,22 @@ class AudioSenderThread(QThread):
 
 
 class InputReceiverThread(QThread):
-    def __init__(self, target_ip: str, is_input_enabled_func):
+    def __init__(
+        self,
+        target_ip: str,
+        is_input_enabled_func,
+        scr_w: int = 1920,
+        scr_h: int = 1080,
+        mon_l: int = 0,
+        mon_t: int = 0,
+    ):
         super().__init__()
         self.target_ip = target_ip
         self.is_input_enabled_func = is_input_enabled_func
+        self.scr_w = max(1, scr_w)
+        self.scr_h = max(1, scr_h)
+        self.mon_l = mon_l
+        self.mon_t = mon_t
         self.running = True
         self.sock: Optional[socket.socket] = None
         self._send_lock = threading.Lock()
@@ -860,10 +872,10 @@ class InputReceiverThread(QThread):
                 sock.connect((self.target_ip, CONTROL_PORT))
                 sock.settimeout(0.5)
                 self.sock = sock
-                print(f"[DEBUG Sender Control] Reconnected control socket to {self.target_ip}:{CONTROL_PORT}")
+                print(f"[DEBUG Sender Control] Connected to Receiver Control on {self.target_ip}:{CONTROL_PORT}")
                 return True
             except Exception as e:
-                print(f"[DEBUG Sender Control] Control socket connect failed: {e}")
+                print(f"[DEBUG Sender Control] Control socket connect failed to {self.target_ip}:{CONTROL_PORT}: {e}")
                 return False
 
     def send_command(self, cmd: dict):
@@ -883,25 +895,19 @@ class InputReceiverThread(QThread):
                     self.sock = None
 
     def run(self):
-        print(f"[DEBUG Sender Control] Connecting to {self.target_ip}:{CONTROL_PORT}...")
+        print(f"[DEBUG Sender Control] Control worker started for {self.target_ip}:{CONTROL_PORT}...")
+        injector = None
+        try:
+            injector = UniversalInputInjector(
+                self.scr_w, self.scr_h, mon_left=self.mon_l, mon_top=self.mon_t
+            )
+            print(f"[DEBUG Sender Control] Input injector ready: mode={injector.mode} on {self.scr_w}x{self.scr_h}")
+        except Exception as ex:
+            print(f"[ERROR Sender Control] Failed to initialize injector: {ex}")
+            traceback.print_exc()
+
         self._ensure_socket_connected()
 
-        # Extract native screen geometry (handles Wayland fractional scaling)
-        screen = QGuiApplication.primaryScreen()
-        if screen:
-            geom = screen.geometry()
-            dpr = float(screen.devicePixelRatio())
-            scr_w = int(round(geom.width() * dpr))
-            scr_h = int(round(geom.height() * dpr))
-            mon_l = int(round(geom.x() * dpr))
-            mon_t = int(round(geom.y() * dpr))
-        else:
-            with create_mss_instance() as sct:
-                monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                scr_w, scr_h = monitor["width"], monitor["height"]
-                mon_l, mon_t = monitor["left"], monitor["top"]
-
-        injector = UniversalInputInjector(scr_w, scr_h, mon_left=mon_l, mon_top=mon_t)
         payload_size = struct.calcsize(">L")
         data = bytearray()
 
@@ -914,7 +920,7 @@ class InputReceiverThread(QThread):
             try:
                 packet = self.sock.recv(2048)
                 if not packet:
-                    print("[DEBUG Sender Control] Connection closed by receiver.")
+                    print("[DEBUG Sender Control] Control socket closed by receiver.")
                     with self._send_lock:
                         try:
                             self.sock.close()
@@ -951,12 +957,17 @@ class InputReceiverThread(QThread):
 
                 try:
                     event = json.loads(raw_msg.decode("utf-8"))
+                    print(f"[DEBUG Sender Control] Event received from TV: {event}")
                     if self.is_input_enabled_func():
-                        injector.execute(event)
+                        if injector:
+                            injector.execute(event)
+                    else:
+                        print("[DEBUG Sender Control] Touch input ignored because 'TV Touch Control' is unchecked.")
                 except Exception as ex:
                     print(f"[DEBUG Sender Control] Event execution error: {ex}")
 
-        injector.close()
+        if injector:
+            injector.close()
         with self._send_lock:
             try:
                 if self.sock:
