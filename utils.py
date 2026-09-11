@@ -1,10 +1,13 @@
 """
-Persistence, image generation, low-level socket utilities, and SVG vector icon renderers.
+Persistence, image generation, low-level socket utilities, SVG vector icon renderers,
+and KDE Plasma Wayland permission helper.
 """
 
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 from typing import Optional
 
@@ -15,7 +18,7 @@ from PySide6.QtSvg import QSvgRenderer
 
 
 def get_app_directory() -> str:
-    """Returns the base directory where sender is running."""
+    """Returns the base directory where the application is located."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
@@ -46,6 +49,116 @@ def save_history(history_data: dict):
         print("[DEBUG Sender] Saved history.json successfully.")
     except Exception as e:
         print(f"[DEBUG Sender] Failed to write history.json: {e}")
+
+
+def ensure_kde_desktop_entry(force: bool = False):
+    """
+    Ensures desktop entries exist with KWin ScreenShot2 D-Bus permissions
+    for both the application shortcut and the python executable so KApplicationTrader
+    authorizes the process under KDE Plasma 6 Wayland.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+
+    apps_dir = os.path.expanduser("~/.local/share/applications")
+    os.makedirs(apps_dir, exist_ok=True)
+
+    app_dir = get_app_directory()
+    sender_path = os.path.join(app_dir, "sender.py")
+    icon_png = os.path.join(app_dir, "icon.png")
+    icon_val = icon_png if os.path.exists(icon_png) else "video-display"
+
+    real_py = os.path.realpath(sys.executable)
+    sys_py = sys.executable
+
+    entries = [
+        # 1. Main Launcher Entry
+        (
+            os.path.join(apps_dir, "mrcoopers-screenshare-sender.desktop"),
+            f"""[Desktop Entry]
+Version=1.0
+Type=Application
+Name=MrCoopersScreenShare Sender
+Comment=Screen sharing and touch controller
+Exec="{sys_py}" "{sender_path}"
+Path={app_dir}
+Icon={icon_val}
+Terminal=false
+StartupNotify=true
+Categories=Utility;Network;
+X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
+""",
+        ),
+        # 2. Direct Canonical Python Binary Authorization Entry for KApplicationTrader
+        (
+            os.path.join(apps_dir, "python-kwin-screenshot.desktop"),
+            f"""[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Python KWin ScreenShot Helper
+Exec={real_py}
+NoDisplay=true
+Categories=Utility;
+X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
+""",
+        ),
+    ]
+
+    if sys_py != real_py:
+        entries.append(
+            (
+                os.path.join(apps_dir, "python-symlink-kwin-screenshot.desktop"),
+                f"""[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Python Symlink KWin ScreenShot Helper
+Exec={sys_py}
+NoDisplay=true
+Categories=Utility;
+X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
+""",
+            )
+        )
+
+    updated = False
+    for path, content in entries:
+        needs_write = force or not os.path.exists(path)
+        if not needs_write and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    curr = f.read()
+                if "X-KDE-DBUS-Restricted-Interfaces" not in curr:
+                    needs_write = True
+            except Exception:
+                needs_write = True
+
+        if needs_write:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                os.chmod(path, 0o755)
+                updated = True
+                print(f"[INFO] Registered KDE permission entry: {path}")
+            except Exception as e:
+                print(f"[DEBUG KDE Permissions] Failed writing {path}: {e}")
+
+    if updated or force:
+        for update_cmd in [
+            ["kbuildsycoca6", "--noincremental"],
+            ["kbuildsycoca5", "--noincremental"],
+            ["update-desktop-database", apps_dir],
+        ]:
+            if shutil.which(update_cmd[0]):
+                try:
+                    subprocess.run(
+                        update_cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                    print(f"[INFO] Rebuilt desktop cache with {update_cmd[0]}")
+                except Exception:
+                    pass
 
 
 def create_application_icon() -> QIcon:
