@@ -1,4 +1,4 @@
-# receiver.py
+
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
 Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSON History Memory,
@@ -289,7 +289,6 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
 
 
 class UniversalInputInjector:
-    # Win32 Mouse & Keyboard Event Flags
     MOUSEEVENTF_LEFTDOWN = 0x0002
     MOUSEEVENTF_LEFTUP = 0x0004
     MOUSEEVENTF_RIGHTDOWN = 0x0008
@@ -300,37 +299,35 @@ class UniversalInputInjector:
     KEYEVENTF_EXTENDEDKEY = 0x0001
     KEYEVENTF_KEYUP = 0x0002
 
-    # Virtual Key Mappings for Win32
     QT_KEY_TO_VK = {
-        0x01000000: 0x1B,  # Escape
-        0x01000001: 0x09,  # Tab
-        0x01000002: 0x09,  # Backtab
-        0x01000003: 0x08,  # Backspace
-        0x01000004: 0x0D,  # Return
-        0x01000005: 0x0D,  # Enter
-        0x01000006: 0x2D,  # Insert
-        0x01000007: 0x2E,  # Delete
-        0x01000008: 0x13,  # Pause
-        0x01000009: 0x2A,  # Print
-        0x01000010: 0x24,  # Home
-        0x01000011: 0x23,  # End
-        0x01000012: 0x25,  # Left
-        0x01000013: 0x26,  # Up
-        0x01000014: 0x27,  # Right
-        0x01000015: 0x28,  # Down
-        0x01000016: 0x21,  # PageUp
-        0x01000017: 0x22,  # PageDown
-        0x01000020: 0x10,  # Shift
-        0x01000021: 0x11,  # Control
-        0x01000022: 0x5B,  # Meta / Windows key
-        0x01000023: 0x12,  # Alt
-        0x01000024: 0x14,  # CapsLock
-        0x01000025: 0x90,  # NumLock
-        0x01000026: 0x91,  # ScrollLock
-        0x20: 0x20,        # Space
+        0x01000000: 0x1B,
+        0x01000001: 0x09,
+        0x01000002: 0x09,
+        0x01000003: 0x08,
+        0x01000004: 0x0D,
+        0x01000005: 0x0D,
+        0x01000006: 0x2D,
+        0x01000007: 0x2E,
+        0x01000008: 0x13,
+        0x01000009: 0x2A,
+        0x01000010: 0x24,
+        0x01000011: 0x23,
+        0x01000012: 0x25,
+        0x01000013: 0x26,
+        0x01000014: 0x27,
+        0x01000015: 0x28,
+        0x01000016: 0x21,
+        0x01000017: 0x22,
+        0x01000020: 0x10,
+        0x01000021: 0x11,
+        0x01000022: 0x5B,
+        0x01000023: 0x12,
+        0x01000024: 0x14,
+        0x01000025: 0x90,
+        0x01000026: 0x91,
+        0x20: 0x20,
     }
 
-    # Add F1-F24 function keys
     for _i in range(1, 25):
         QT_KEY_TO_VK[0x01000030 + _i - 1] = 0x70 + _i - 1
 
@@ -404,7 +401,6 @@ class UniversalInputInjector:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
                     else:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-                    print(f"[DEBUG Receiver Injector] Win32 Mouse Down: {btn} at ({px}, {py})")
 
                 elif ev_type in ("touch_up", "mouse_up"):
                     btn = event.get("button", "left")
@@ -414,13 +410,11 @@ class UniversalInputInjector:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
                     else:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-                    print(f"[DEBUG Receiver Injector] Win32 Mouse Up: {btn} at ({px}, {py})")
 
                 elif ev_type == "scroll":
                     dy = event.get("dy", 0)
                     delta = 120 if dy > 0 else -120
                     ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
-                    print(f"[DEBUG Receiver Injector] Win32 Scroll: dy={dy}")
 
                 elif ev_type in ("key_down", "key_up"):
                     key_code = event.get("key_code", 0)
@@ -444,9 +438,6 @@ class UniversalInputInjector:
                         if vk in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E):
                             flags |= self.KEYEVENTF_EXTENDEDKEY
                         ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
-                        print(f"[DEBUG Receiver Injector] Win32 Key {ev_type}: vk=0x{vk:02X}, name='{key_name}', text='{text}'")
-                    else:
-                        print(f"[DEBUG Receiver Injector] Win32 Unknown Key: code={key_code}, name='{key_name}', text='{text}'")
                 return
             except Exception as ex:
                 logger.error(f"Win32 input injection exception: {ex}")
@@ -868,7 +859,8 @@ class VideoServerThread(QThread):
 
             except ConnectionResetError:
                 break
-            except Exception:
+            except Exception as ex:
+                logger.error(f"Video client processing error from {client_ip}: {ex}")
                 break
 
         try:
@@ -931,7 +923,7 @@ class ReverseVideoServerThread(QThread):
         conn.settimeout(None)
 
         with create_mss_instance() as sct:
-            monitor = sct.monitors[1]
+            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             mon_left = monitor["left"]
             mon_top = monitor["top"]
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
@@ -1270,7 +1262,7 @@ class ReceiverMainWindow(QMainWindow):
         self.pin = f"{random.randint(1000, 9999)}"
 
         with create_mss_instance() as sct:
-            mon = sct.monitors[1]
+            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             scr_w, scr_h = mon["width"], mon["height"]
             mon_l, mon_t = mon["left"], mon["top"]
         self.input_injector = UniversalInputInjector(mon_l, mon_t, scr_w, scr_h)
@@ -1286,6 +1278,10 @@ class ReceiverMainWindow(QMainWindow):
         self.video_thread.client_disconnected.connect(self.on_disconnected)
         self.control_thread.command_received.connect(self.on_control_command)
 
+        # Set up UI before starting network threads so callbacks can safely access pin_req_cb
+        self._setup_ui()
+        self._apply_details_visibility()
+
         for th in (
             self.control_thread,
             self.audio_thread,
@@ -1295,14 +1291,13 @@ class ReceiverMainWindow(QMainWindow):
         ):
             th.start()
 
-        self._setup_ui()
-        self._apply_details_visibility()
-
     def get_pin(self) -> str:
         return self.pin
 
     def is_pin_required(self) -> bool:
-        return self.pin_req_cb.isChecked()
+        if hasattr(self, "pin_req_cb") and self.pin_req_cb is not None:
+            return self.pin_req_cb.isChecked()
+        return False
 
     def _setup_ui(self):
         self.stack = QStackedWidget()

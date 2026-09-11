@@ -1,5 +1,3 @@
-#################### START OF FILE: create_shortcut.py ####################
-
 """
 MrCoopersScreenShare - Source Shortcut Creator
 Creates desktop and local shortcuts to launch `sender.py` directly from source
@@ -179,13 +177,14 @@ Version=1.0
 Type=Application
 Name={app_name}
 Comment=MrCoopersScreenShare Sender (Python Source)
-Exec="{python_exe}" "{target_script}"
+Exec={python_exe} {target_script}
 Path={working_dir}
 Icon={icon_path if os.path.exists(icon_path) else 'video-display'}
 Terminal=false
-StartupNotify=true
+StartupNotify=false
 Categories=Utility;Network;
 X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
+X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,zkde_screencast_unstable_v1
 """
 
     for shortcut_path in filter(None, targets):

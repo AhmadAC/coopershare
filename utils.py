@@ -53,13 +53,29 @@ def save_history(history_data: dict):
 
 def ensure_kde_desktop_entry(force: bool = False):
     """
-    Ensures desktop entries exist with KWin ScreenShot2 D-Bus permissions
-    for both the application shortcut and the python executable so KApplicationTrader
-    authorizes the process under KDE Plasma 6 Wayland.
+    Ensures environment overrides and desktop entries exist for KWin ScreenShot2
+    D-Bus authorization under KDE Plasma 6 Wayland.
     """
     if not sys.platform.startswith("linux"):
         return
 
+    # 1. Register systemd environment configuration for kwin_wayland
+    env_dir = os.path.expanduser("~/.config/environment.d")
+    os.makedirs(env_dir, exist_ok=True)
+    kwin_conf = os.path.join(env_dir, "10-kwin-screencopy.conf")
+    env_content = (
+        "KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1\n"
+        "KWIN_WAYLAND_NO_PERMISSION_CHECKS=1\n"
+    )
+    if not os.path.exists(kwin_conf) or force:
+        try:
+            with open(kwin_conf, "w", encoding="utf-8") as f:
+                f.write(env_content)
+            print(f"[INFO] Registered KWin session environment override: {kwin_conf}")
+        except Exception as e:
+            print(f"[DEBUG KDE Permissions] Failed writing environment config: {e}")
+
+    # 2. Register application desktop entries
     apps_dir = os.path.expanduser("~/.local/share/applications")
     os.makedirs(apps_dir, exist_ok=True)
 
@@ -68,11 +84,23 @@ def ensure_kde_desktop_entry(force: bool = False):
     icon_png = os.path.join(app_dir, "icon.png")
     icon_val = icon_png if os.path.exists(icon_png) else "video-display"
 
+    proc_self_exe = ""
+    try:
+        proc_self_exe = os.path.realpath(f"/proc/{os.getpid()}/exe")
+    except Exception:
+        pass
+
     real_py = os.path.realpath(sys.executable)
     sys_py = sys.executable
+    which_py3 = shutil.which("python3") or ""
+    which_py = shutil.which("python") or ""
+
+    candidates = []
+    for p in [proc_self_exe, real_py, sys_py, which_py3, which_py]:
+        if p and os.path.exists(p) and p not in candidates:
+            candidates.append(p)
 
     entries = [
-        # 1. Main Launcher Entry
         (
             os.path.join(apps_dir, "mrcoopers-screenshare-sender.desktop"),
             f"""[Desktop Entry]
@@ -80,42 +108,33 @@ Version=1.0
 Type=Application
 Name=MrCoopersScreenShare Sender
 Comment=Screen sharing and touch controller
-Exec="{sys_py}" "{sender_path}"
+Exec={sys_py} {sender_path}
 Path={app_dir}
 Icon={icon_val}
 Terminal=false
-StartupNotify=true
+StartupNotify=false
 Categories=Utility;Network;
 X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
+X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,zkde_screencast_unstable_v1
 """,
-        ),
-        # 2. Direct Canonical Python Binary Authorization Entry for KApplicationTrader
-        (
-            os.path.join(apps_dir, "python-kwin-screenshot.desktop"),
-            f"""[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Python KWin ScreenShot Helper
-Exec={real_py}
-NoDisplay=true
-Categories=Utility;
-X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
-""",
-        ),
+        )
     ]
 
-    if sys_py != real_py:
+    for idx, exe_path in enumerate(candidates):
+        filename = f"mrcoopers-py-engine-{idx}.desktop"
         entries.append(
             (
-                os.path.join(apps_dir, "python-symlink-kwin-screenshot.desktop"),
+                os.path.join(apps_dir, filename),
                 f"""[Desktop Entry]
 Version=1.0
 Type=Application
-Name=Python Symlink KWin ScreenShot Helper
-Exec={sys_py}
-NoDisplay=true
+Name=MrCoopersScreenShare Python Engine {idx}
+Exec={exe_path}
+Terminal=false
+StartupNotify=false
 Categories=Utility;
 X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2
+X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,zkde_screencast_unstable_v1
 """,
             )
         )
