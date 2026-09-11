@@ -3,5 +3,7 @@
     "devices": {
         "172.31.60.175": "408 STEAM",
         "192.168.90.221": "317 CS"
-    }
+    },
+    "quality_preset": "Balanced (75%)",
+    "touch_input": true
 }

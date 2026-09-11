@@ -1,6 +1,7 @@
 """
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
-Features persistent state loading and saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.).
+Features persistent state loading and saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
+with vector SVG icons replacing all emojis.
 """
 
 import ctypes
@@ -9,7 +10,7 @@ import sys
 import time
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QKeyEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -36,14 +37,37 @@ from threads import (
     ScreenSenderThread,
 )
 from ui_viewer import RemoteReceiverViewerWindow
-from utils import create_application_icon, load_history, save_history
+from utils import (
+    SVG_CHEVRON_DOWN,
+    SVG_CLOSE,
+    SVG_DISCONNECT,
+    SVG_DISPLAY,
+    SVG_LOGOUT,
+    SVG_MAXIMIZE,
+    SVG_MINIMIZE,
+    SVG_PAUSE,
+    SVG_PLAY,
+    SVG_RESTORE,
+    SVG_SCREEN,
+    SVG_STATUS_DOT,
+    SVG_TAG,
+    SVG_TIMER,
+    SVG_TRASH,
+    SVG_VOLUME_MUTE,
+    SVG_VOLUME_ON,
+    create_application_icon,
+    load_history,
+    save_history,
+    svg_to_icon,
+    svg_to_pixmap,
+)
 
 
 class TimerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Receiver Timer")
-        self.setFixedWidth(340)
+        self.setFixedWidth(360)
         self.setStyleSheet(
             """
             QDialog {
@@ -82,9 +106,16 @@ class TimerDialog(QDialog):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(12)
 
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(8)
+        timer_icon_lbl = QLabel()
+        timer_icon_lbl.setPixmap(svg_to_pixmap(SVG_TIMER, 18, 18, "#00d084"))
         title_lbl = QLabel("Set Receiver Timer")
         title_lbl.setStyleSheet("font-weight: bold; font-size: 13px; color: #00d084;")
-        layout.addWidget(title_lbl)
+        header_layout.addWidget(timer_icon_lbl)
+        header_layout.addWidget(title_lbl)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
 
         desc_lbl = QLabel("Enter duration (e.g. 30, 5m, 10:00, or raw number):")
         layout.addWidget(desc_lbl)
@@ -95,6 +126,7 @@ class TimerDialog(QDialog):
         self.timer_edit.returnPressed.connect(self.accept)
 
         self.timer_btn = QPushButton("Start Timer")
+        self.timer_btn.setIcon(svg_to_icon(SVG_TIMER, 14, "#ffffff"))
         self.timer_btn.clicked.connect(self.accept)
 
         input_layout.addWidget(self.timer_edit)
@@ -298,12 +330,16 @@ class FloatingSenderWindow(QWidget):
         h_layout.setContentsMargins(0, 0, 0, 0)
         h_layout.setSpacing(6)
 
-        self.status_dot = QLabel("●")
-        self.status_dot.setStyleSheet(f"color: {self.status_color}; font-size: 14px;")
+        self.status_dot = QLabel()
+        self.status_dot.setFixedSize(14, 14)
+        self._update_status_dot(self.status_color)
+
         self.title_lbl = QLabel("MrCoopersScreenShare")
         self.title_lbl.setStyleSheet("font-weight: bold; color: #00a2ed;")
 
-        self.collapse_btn = QPushButton("▼")
+        self.collapse_btn = QPushButton()
+        self.collapse_btn.setIcon(svg_to_icon(SVG_CHEVRON_DOWN, 12, "#8f9bb3"))
+        self.collapse_btn.setIconSize(QSize(12, 12))
         self.collapse_btn.setToolTip("Collapse to mini floating indicator")
         self.collapse_btn.setFixedSize(24, 24)
         self.collapse_btn.setStyleSheet(
@@ -311,10 +347,12 @@ class FloatingSenderWindow(QWidget):
         )
         self.collapse_btn.clicked.connect(self.collapse_to_mini)
 
-        self.close_btn = QPushButton("✕")
+        self.close_btn = QPushButton()
+        self.close_btn.setIcon(svg_to_icon(SVG_CLOSE, 12, "#ff6b6b"))
+        self.close_btn.setIconSize(QSize(12, 12))
         self.close_btn.setFixedSize(24, 24)
         self.close_btn.setStyleSheet(
-            "background: #332228; color: #ff6b6b; border-radius: 12px; padding: 0px;"
+            "background: #332228; border-radius: 12px; padding: 0px;"
         )
         self.close_btn.clicked.connect(self.close)
 
@@ -419,15 +457,18 @@ class FloatingSenderWindow(QWidget):
 
         # Row 4: Action Buttons (Pause/Resume, TV Audio Mute, Host Speaker Mute)
         btn_row = QHBoxLayout()
-        self.pause_btn = QPushButton("⏸ Pause")
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setIcon(svg_to_icon(SVG_PAUSE, 14, "#ffffff"))
         self.pause_btn.clicked.connect(self.toggle_pause)
         self.pause_btn.setEnabled(False)
 
-        self.stream_mute_btn = QPushButton("🔊 TV Audio")
+        self.stream_mute_btn = QPushButton("TV Audio")
+        self.stream_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_ON, 14, "#ffffff"))
         self.stream_mute_btn.clicked.connect(self.toggle_stream_mute)
         self.stream_mute_btn.setEnabled(False)
 
-        self.host_mute_btn = QPushButton("🔇 Mute Host")
+        self.host_mute_btn = QPushButton("Mute Host")
+        self.host_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_MUTE, 14, "#ffffff"))
         self.host_mute_btn.setToolTip(
             "Mutes local PC speakers so audio only plays through the TV"
         )
@@ -508,6 +549,9 @@ class FloatingSenderWindow(QWidget):
         if sys.platform == "win32":
             self.is_host_muted = HostAudioController.get_host_mute()
             self._update_host_mute_ui()
+
+    def _update_status_dot(self, color_hex: str):
+        self.status_dot.setPixmap(svg_to_pixmap(SVG_STATUS_DOT, 14, 14, color_hex))
 
     def _populate_device_list(self):
         self.device_combo.blockSignals(True)
@@ -797,51 +841,52 @@ class FloatingSenderWindow(QWidget):
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         has_target = bool(target_ip)
 
-        view_rec_act = QAction("🖥️ View & Control TV Screen", self)
+        view_rec_act = QAction("View & Control TV Screen", self)
+        view_rec_act.setIcon(svg_to_icon(SVG_SCREEN, 16, "#00a2ed"))
         view_rec_act.triggered.connect(self.open_receiver_viewer)
         view_rec_act.setEnabled(has_target)
         menu.addAction(view_rec_act)
 
         menu.addSeparator()
 
-        timer_act = QAction("⏱️ TV Timer...", self)
+        timer_act = QAction("TV Timer...", self)
+        timer_act.setIcon(svg_to_icon(SVG_TIMER, 16, "#00d084"))
         timer_act.triggered.connect(self.open_timer_dialog)
         timer_act.setEnabled(has_target)
         menu.addAction(timer_act)
 
         menu.addSeparator()
 
-        win_menu = menu.addMenu("📺 TV Window Control")
-        max_act = QAction("🗖 Maximize / Fullscreen TV", self)
+        win_menu = menu.addMenu("TV Window Control")
+        win_menu.setIcon(svg_to_icon(SVG_DISPLAY, 16, "#ffffff"))
+
+        max_act = QAction("Maximize / Fullscreen TV", self)
+        max_act.setIcon(svg_to_icon(SVG_MAXIMIZE, 16, "#ffffff"))
         max_act.triggered.connect(lambda: self.send_receiver_window_command("maximize"))
         win_menu.addAction(max_act)
 
-        norm_act = QAction("🗗 Restore TV Window (Normal)", self)
+        norm_act = QAction("Restore TV Window (Normal)", self)
+        norm_act.setIcon(svg_to_icon(SVG_RESTORE, 16, "#ffffff"))
         norm_act.triggered.connect(lambda: self.send_receiver_window_command("normal"))
         win_menu.addAction(norm_act)
 
-        min_act = QAction("🗕 Minimize TV Window", self)
+        min_act = QAction("Minimize TV Window", self)
+        min_act.setIcon(svg_to_icon(SVG_MINIMIZE, 16, "#ffffff"))
         min_act.triggered.connect(lambda: self.send_receiver_window_command("minimize"))
         win_menu.addAction(min_act)
         win_menu.setEnabled(has_target)
 
         menu.addSeparator()
 
-        rename_act = QAction("🏷️ Set Friendly Name for TV...", self)
+        rename_act = QAction("Set Friendly Name for TV...", self)
+        rename_act.setIcon(svg_to_icon(SVG_TAG, 16, "#ffffff"))
         rename_act.triggered.connect(self.prompt_set_friendly_name)
         menu.addAction(rename_act)
 
-        remove_act = QAction("🗑️ Remove Selected TV", self)
+        remove_act = QAction("Remove Selected TV", self)
+        remove_act.setIcon(svg_to_icon(SVG_TRASH, 16, "#ff6b6b"))
         remove_act.triggered.connect(self.remove_selected_device)
         menu.addAction(remove_act)
-
-        menu.addSeparator()
-
-        touch_act = QAction("Allow TV Touch Input", self)
-        touch_act.setCheckable(True)
-        touch_act.setChecked(self.input_enabled)
-        touch_act.triggered.connect(lambda c: self.touch_input_cb.setChecked(c))
-        menu.addAction(touch_act)
 
         menu.addSeparator()
 
@@ -849,21 +894,25 @@ class FloatingSenderWindow(QWidget):
             pause_act = QAction(
                 "Resume Stream" if self.is_paused else "Pause Stream", self
             )
+            pause_act.setIcon(svg_to_icon(SVG_PLAY if self.is_paused else SVG_PAUSE, 16, "#ffffff"))
             pause_act.triggered.connect(self.toggle_pause)
             menu.addAction(pause_act)
             menu.addSeparator()
 
         if self.is_mini_mode:
             expand_act = QAction("Expand Controls", self)
+            expand_act.setIcon(svg_to_icon(SVG_RESTORE, 16, "#ffffff"))
             expand_act.triggered.connect(self.expand_window)
             menu.addAction(expand_act)
         else:
             collapse_act = QAction("Collapse to Mini", self)
+            collapse_act.setIcon(svg_to_icon(SVG_MINIMIZE, 16, "#ffffff"))
             collapse_act.triggered.connect(self.collapse_to_mini)
             menu.addAction(collapse_act)
 
         menu.addSeparator()
         quit_action = QAction("Exit MrCoopersScreenShare", self)
+        quit_action.setIcon(svg_to_icon(SVG_LOGOUT, 16, "#ff6b6b"))
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
         menu.exec(event.globalPos())
@@ -911,10 +960,12 @@ class FloatingSenderWindow(QWidget):
 
     def _update_host_mute_ui(self):
         if self.is_host_muted:
-            self.host_mute_btn.setText("🔊 Unmute Host")
+            self.host_mute_btn.setText("Unmute Host")
+            self.host_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_ON, 14, "#ffffff"))
             self.host_mute_btn.setStyleSheet("background-color: #d83b01; color: white;")
         else:
-            self.host_mute_btn.setText("🔇 Mute Host")
+            self.host_mute_btn.setText("Mute Host")
+            self.host_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_MUTE, 14, "#ffffff"))
             self.host_mute_btn.setStyleSheet("background-color: #262c3b; color: #ffffff;")
 
     def on_device_discovered(self, ip: str, pin_required: bool):
@@ -1008,7 +1059,8 @@ class FloatingSenderWindow(QWidget):
 
         self.connect_btn.setText("Share")
         self.connect_btn.setStyleSheet("background-color: #0078d4;")
-        self.pause_btn.setText("⏸ Pause")
+        self.pause_btn.setText("Pause")
+        self.pause_btn.setIcon(svg_to_icon(SVG_PAUSE, 14, "#ffffff"))
         self.pause_btn.setStyleSheet("background-color: #0078d4; color: white;")
         self.pause_btn.setEnabled(False)
         self.stream_mute_btn.setEnabled(False)
@@ -1021,7 +1073,8 @@ class FloatingSenderWindow(QWidget):
                 self.stream_thread.trigger_cursorless_frame()
                 self.is_paused = True
                 self.stream_thread.paused = True
-                self.pause_btn.setText("▶ Resume")
+                self.pause_btn.setText("Resume")
+                self.pause_btn.setIcon(svg_to_icon(SVG_PLAY, 14, "#ffffff"))
                 self.pause_btn.setStyleSheet(
                     "background-color: #f37021; color: white; font-weight: bold;"
                 )
@@ -1029,7 +1082,8 @@ class FloatingSenderWindow(QWidget):
             else:
                 self.is_paused = False
                 self.stream_thread.paused = False
-                self.pause_btn.setText("⏸ Pause")
+                self.pause_btn.setText("Pause")
+                self.pause_btn.setIcon(svg_to_icon(SVG_PAUSE, 14, "#ffffff"))
                 self.pause_btn.setStyleSheet(
                     "background-color: #0078d4; color: white; font-weight: bold;"
                 )
@@ -1041,12 +1095,14 @@ class FloatingSenderWindow(QWidget):
             self.audio_thread.muted = self.is_stream_muted
 
             if self.is_stream_muted:
-                self.stream_mute_btn.setText("🔇 TV Muted")
+                self.stream_mute_btn.setText("TV Muted")
+                self.stream_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_MUTE, 14, "#ffffff"))
                 self.stream_mute_btn.setStyleSheet(
                     "background-color: #d83b01; color: white; font-weight: bold;"
                 )
             else:
-                self.stream_mute_btn.setText("🔊 TV Audio")
+                self.stream_mute_btn.setText("TV Audio")
+                self.stream_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_ON, 14, "#ffffff"))
                 self.stream_mute_btn.setStyleSheet(
                     "background-color: #0078d4; color: white; font-weight: bold;"
                 )
@@ -1071,7 +1127,7 @@ class FloatingSenderWindow(QWidget):
 
     def _update_status_color(self, color_hex: str):
         self.status_color = color_hex
-        self.status_dot.setStyleSheet(f"color: {color_hex}; font-size: 14px;")
+        self._update_status_dot(color_hex)
         if not self.is_pulsing:
             self._update_mini_bar_style()
 

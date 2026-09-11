@@ -7,8 +7,7 @@ Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSO
           Remote Window Management (Maximize, Normal, Minimize),
           Right-Click Context Menu (Run Script, Show Timer, Fullscreen, Standby Details Visibility),
           Dynamic Audio Playback, Native Win32 / Universal Input Injection (pynput/evdev),
-          UDP Discovery Beacon, 4-Digit PIN Authentication,
-          Vector SVG Icons replacing emojis.
+          UDP Discovery Beacon, 4-Digit PIN Authentication.
 """
 
 import ctypes
@@ -56,12 +55,11 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP_REC") 
 import cv2
 import mss
 import numpy as np
-from PySide6.QtCore import QByteArray, QEvent, QPointF, QRect, Qt, QThread, Signal
+from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QThread, Signal
 from PySide6.QtGui import (
     QAction,
     QCursor,
     QFont,
-    QIcon,
     QImage,
     QKeyEvent,
     QPainter,
@@ -105,46 +103,6 @@ if not logger.handlers:
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-
-
-def svg_to_pixmap(svg_str: str, width: int = 16, height: int = 16, color: Optional[str] = "#ffffff") -> QPixmap:
-    if color:
-        svg_str = svg_str.replace("currentColor", color)
-    try:
-        from PySide6.QtSvg import QSvgRenderer
-        renderer = QSvgRenderer(QByteArray(svg_str.encode("utf-8")))
-        pix = QPixmap(width, height)
-        pix.fill(Qt.transparent)
-        painter = QPainter(pix)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        renderer.render(painter)
-        painter.end()
-        return pix
-    except Exception:
-        pix = QPixmap(width, height)
-        pix.fill(Qt.transparent)
-        return pix
-
-
-def svg_to_icon(svg_str: str, size: int = 16, color: Optional[str] = "#ffffff") -> QIcon:
-    pix = svg_to_pixmap(svg_str, size, size, color)
-    return QIcon(pix)
-
-
-# Clean Vector SVGs for Receiver
-REC_SVG_ROCKET = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/></svg>"""
-
-REC_SVG_TIMER = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>"""
-
-REC_SVG_INFO = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>"""
-
-REC_SVG_FULLSCREEN = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><polyline points="21 15 21 21 15 21"/><polyline points="3 9 3 3 9 3"/></svg>"""
-
-REC_SVG_EXIT_FULLSCREEN = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><polyline points="14 14 20 14 20 20"/><polyline points="10 10 4 10 4 4"/></svg>"""
-
-REC_SVG_DISCONNECT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="2" x2="22" y2="22"/></svg>"""
-
-REC_SVG_LOGOUT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>"""
 
 
 def load_receiver_config() -> dict:
@@ -545,16 +503,9 @@ class LocalRunScriptDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(14)
 
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(8)
-        icon_lbl = QLabel()
-        icon_lbl.setPixmap(svg_to_pixmap(REC_SVG_ROCKET, 20, 20, "#00a2ed"))
-        title_lbl = QLabel("Run Application / Script on Display")
+        title_lbl = QLabel("🚀 Run Application / Script on Display")
         title_lbl.setStyleSheet("font-weight: bold; font-size: 15px; color: #00a2ed;")
-        header_layout.addWidget(icon_lbl)
-        header_layout.addWidget(title_lbl)
-        header_layout.addStretch()
-        layout.addLayout(header_layout)
+        layout.addWidget(title_lbl)
 
         layout.addWidget(QLabel("Executable / Shortcut / Script Path:"))
         path_layout = QHBoxLayout()
@@ -591,11 +542,8 @@ class LocalRunScriptDialog(QDialog):
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setObjectName("cancel_btn")
         self.cancel_btn.clicked.connect(self.reject)
-
         self.run_btn = QPushButton("Execute Now")
-        self.run_btn.setIcon(svg_to_icon(REC_SVG_ROCKET, 14, "#ffffff"))
         self.run_btn.clicked.connect(self.accept)
-
         btn_layout.addWidget(self.cancel_btn)
         btn_layout.addWidget(self.run_btn)
         layout.addLayout(btn_layout)
@@ -662,16 +610,9 @@ class LocalTimerDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(14)
 
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(8)
-        icon_lbl = QLabel()
-        icon_lbl.setPixmap(svg_to_pixmap(REC_SVG_TIMER, 20, 20, "#00d084"))
-        title_lbl = QLabel("Start Timer on Receiver Display")
+        title_lbl = QLabel("⏱️ Start Timer on Receiver Display")
         title_lbl.setStyleSheet("font-weight: bold; font-size: 15px; color: #00d084;")
-        header_layout.addWidget(icon_lbl)
-        header_layout.addWidget(title_lbl)
-        header_layout.addStretch()
-        layout.addLayout(header_layout)
+        layout.addWidget(title_lbl)
 
         layout.addWidget(QLabel("Enter duration (e.g. 30, 5m, 10:00, or raw number):"))
         self.timer_edit = QLineEdit()
@@ -686,11 +627,8 @@ class LocalTimerDialog(QDialog):
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setObjectName("cancel_btn")
         self.cancel_btn.clicked.connect(self.reject)
-
         self.start_btn = QPushButton("Start Timer")
-        self.start_btn.setIcon(svg_to_icon(REC_SVG_TIMER, 14, "#ffffff"))
         self.start_btn.clicked.connect(self.accept)
-
         btn_layout.addWidget(self.cancel_btn)
         btn_layout.addWidget(self.start_btn)
         layout.addLayout(btn_layout)
@@ -1071,8 +1009,10 @@ class ControlServerThread(QThread):
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_sock.bind(("0.0.0.0", self.port))
-        self.server_sock.listen(1)
+        self.server_sock.listen(5)
         self.server_sock.settimeout(0.5)
+
+        print(f"[DEBUG Receiver Control] Listening for control channel on port {self.port}...")
 
         while self.running:
             try:
@@ -1081,6 +1021,7 @@ class ControlServerThread(QThread):
                 conn.settimeout(0.5)
                 with self._send_lock:
                     self.client_conn = conn
+                print(f"[DEBUG Receiver Control] Control client connected from {addr[0]}")
             except socket.timeout:
                 continue
             except Exception:
@@ -1091,48 +1032,36 @@ class ControlServerThread(QThread):
 
             while self.running and self.client_conn:
                 try:
-                    while len(data) < payload_size:
-                        if not self.running:
+                    try:
+                        packet = conn.recv(4096)
+                        if not packet:
+                            print("[DEBUG Receiver Control] Client closed control connection.")
                             break
-                        try:
-                            packet = conn.recv(2048)
-                            if not packet:
-                                raise ConnectionResetError
-                            data.extend(packet)
-                        except socket.timeout:
-                            continue
+                        data.extend(packet)
+                    except socket.timeout:
+                        pass
+                    except (BlockingIOError, InterruptedError):
+                        continue
 
-                    if not self.running:
-                        break
-
-                    packed_size = data[:payload_size]
-                    data = data[payload_size:]
-                    msg_size = struct.unpack(">L", packed_size)[0]
-
-                    while len(data) < msg_size:
-                        if not self.running:
+                    while len(data) >= payload_size:
+                        msg_size = struct.unpack(">L", data[:payload_size])[0]
+                        if len(data) < payload_size + msg_size:
                             break
+
+                        raw_msg = data[payload_size : payload_size + msg_size]
+                        data = data[payload_size + msg_size :]
+
                         try:
-                            packet = conn.recv(min(msg_size - len(data), 4096))
-                            if not packet:
-                                raise ConnectionResetError
-                            data.extend(packet)
-                        except socket.timeout:
-                            continue
+                            msg_obj = json.loads(raw_msg.decode("utf-8"))
+                            self.command_received.emit(msg_obj)
+                        except Exception as decode_err:
+                            print(f"[DEBUG Receiver Control] JSON decode error: {decode_err}")
 
-                    if not self.running:
-                        break
-
-                    raw_msg = data[:msg_size]
-                    data = data[msg_size:]
-                    msg_obj = json.loads(raw_msg.decode("utf-8"))
-                    self.command_received.emit(msg_obj)
-
-                except (socket.timeout, BlockingIOError):
-                    continue
                 except ConnectionResetError:
+                    print("[DEBUG Receiver Control] Client connection reset.")
                     break
-                except Exception:
+                except Exception as ex:
+                    print(f"[DEBUG Receiver Control] Exception in control loop: {ex}")
                     break
 
             with self._send_lock:
@@ -1335,7 +1264,7 @@ class ReceiverMainWindow(QMainWindow):
         self.pin_req_cb.setChecked(False)
         self.pin_req_cb.setStyleSheet("color: #8f9bb3; font-size: 15px; margin-top: 10px;")
 
-        self.hint_lbl = QLabel("Right-click anywhere for menu  |  Press ESC / F11 to toggle fullscreen")
+        self.hint_lbl = QLabel("Right-click anywhere for menu • Press ESC / F11 to toggle fullscreen")
         self.hint_lbl.setStyleSheet("color: #4b5568; font-size: 13px; margin-top: 20px;")
 
         self.details_layout.addWidget(self.title_lbl, alignment=Qt.AlignCenter)
@@ -1552,13 +1481,11 @@ class ReceiverMainWindow(QMainWindow):
         """
         )
 
-        run_act = QAction("Run Script / Executable on Display...", self)
-        run_act.setIcon(svg_to_icon(REC_SVG_ROCKET, 16, "#00a2ed"))
+        run_act = QAction("🚀 Run Script / Executable on Display...", self)
         run_act.triggered.connect(self.open_local_script_dialog)
         menu.addAction(run_act)
 
-        timer_act = QAction("Show Timer...", self)
-        timer_act.setIcon(svg_to_icon(REC_SVG_TIMER, 16, "#00d084"))
+        timer_act = QAction("⏱️ Show Timer...", self)
         timer_act.triggered.connect(self.open_local_timer_dialog)
         menu.addAction(timer_act)
 
@@ -1566,7 +1493,6 @@ class ReceiverMainWindow(QMainWindow):
 
         info_toggle_text = "Show Standby Details (IP/PIN)" if self.hide_details else "Hide Standby Details (IP/PIN)"
         toggle_info_act = QAction(info_toggle_text, self)
-        toggle_info_act.setIcon(svg_to_icon(REC_SVG_INFO, 16, "#ffffff"))
         toggle_info_act.triggered.connect(self.toggle_details_visibility)
         menu.addAction(toggle_info_act)
 
@@ -1574,24 +1500,20 @@ class ReceiverMainWindow(QMainWindow):
 
         if self.isFullScreen():
             fs_act = QAction("Exit Fullscreen (F11)", self)
-            fs_act.setIcon(svg_to_icon(REC_SVG_EXIT_FULLSCREEN, 16, "#ffffff"))
             fs_act.triggered.connect(self.showNormal)
         else:
             fs_act = QAction("Enter Fullscreen (F11)", self)
-            fs_act.setIcon(svg_to_icon(REC_SVG_FULLSCREEN, 16, "#ffffff"))
             fs_act.triggered.connect(self.showFullScreen)
         menu.addAction(fs_act)
 
         if self.stack.currentWidget() == self.canvas:
             disc_act = QAction("Disconnect Stream", self)
-            disc_act.setIcon(svg_to_icon(REC_SVG_DISCONNECT, 16, "#f37021"))
             disc_act.triggered.connect(self.on_disconnected)
             menu.addAction(disc_act)
 
         menu.addSeparator()
 
         exit_act = QAction("Exit Application (Esc)", self)
-        exit_act.setIcon(svg_to_icon(REC_SVG_LOGOUT, 16, "#ff6b6b"))
         exit_act.triggered.connect(self.close)
         menu.addAction(exit_act)
 
