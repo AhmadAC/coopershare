@@ -82,11 +82,12 @@ def _extract_dict_from_dbus_meta(meta_raw) -> dict:
 
 
 class PersistentPipeReader:
-    """High-speed persistent worker that consumes the KWin pipe into pre-allocated memory without thread overhead."""
+    """High-speed persistent worker that reads exact frame payloads without waiting for EOF."""
 
     def __init__(self, initial_capacity: int = 1920 * 1080 * 4 + 131072):
         self.buf = bytearray(initial_capacity)
         self.bytes_read = 0
+        self.expected_size = 0
         self.fd = -1
         self.start_evt = threading.Event()
         self.done_evt = threading.Event()
@@ -94,8 +95,9 @@ class PersistentPipeReader:
         self.worker = threading.Thread(target=self._run, name="KWinPipeWorker", daemon=True)
         self.worker.start()
 
-    def start_read(self, fd: int):
+    def start_read(self, fd: int, expected_size: int = 0):
         self.fd = fd
+        self.expected_size = expected_size
         self.bytes_read = 0
         self.done_evt.clear()
         self.start_evt.set()
@@ -112,10 +114,13 @@ class PersistentPipeReader:
                 break
 
             fd = self.fd
+            expected = self.expected_size
             offset = 0
+
             while True:
                 try:
-                    chunk = os.read(fd, 262144)
+                    to_read = min(262144, expected - offset) if expected > 0 else 262144
+                    chunk = os.read(fd, to_read)
                     if not chunk:
                         break
                     chunk_len = len(chunk)
@@ -123,6 +128,8 @@ class PersistentPipeReader:
                         self.buf.extend(b"\x00" * (offset + chunk_len - len(self.buf) + 1048576))
                     self.buf[offset : offset + chunk_len] = chunk
                     offset += chunk_len
+                    if expected > 0 and offset >= expected:
+                        break
                 except Exception:
                     break
 
@@ -140,7 +147,16 @@ class KWinScreenShot2Grabber:
     def __init__(self):
         self.available = False
         self.iface = None
+        self.expected_w = 1920
+        self.expected_h = 1080
         self.pipe_reader = PersistentPipeReader()
+
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            dpr = screen.devicePixelRatio()
+            self.expected_w = int(round(screen.size().width() * dpr))
+            self.expected_h = int(round(screen.size().height() * dpr))
+
         if not sys.platform.startswith("linux"):
             return
 
@@ -158,7 +174,7 @@ class KWinScreenShot2Grabber:
             self.iface = _get_interface()
             if self.iface.isValid():
                 for attempt in range(2):
-                    test_frame = self.grab(include_cursor=False)
+                    test_frame = self.grab(include_cursor=False, init_timeout=1.5)
                     if test_frame is not None and test_frame.size > 0:
                         self.available = True
                         print(
@@ -166,6 +182,9 @@ class KWinScreenShot2Grabber:
                         )
                         break
                     else:
+                        print(
+                            f"[DEBUG Screen Capturer] KWin ScreenShot2 probe attempt {attempt + 1} did not return frame."
+                        )
                         if attempt == 0:
                             ensure_kde_desktop_entry(force=True)
                             time.sleep(0.3)
@@ -178,7 +197,7 @@ class KWinScreenShot2Grabber:
             print(f"[DEBUG Screen Capturer] KWin ScreenShot2 probe error: {e}")
             self.available = False
 
-    def grab(self, include_cursor: bool = True) -> Optional[np.ndarray]:
+    def grab(self, include_cursor: bool = True, init_timeout: float = 0.2) -> Optional[np.ndarray]:
         if not self.iface:
             return None
         r_fd, w_fd = -1, -1
@@ -188,7 +207,7 @@ class KWinScreenShot2Grabber:
             r_fd, w_fd = os.pipe()
 
             try:
-                fcntl.fcntl(r_fd, 1031, 8 * 1024 * 1024)  # F_SETPIPE_SZ = 1031
+                fcntl.fcntl(r_fd, 1031, 1048576)
             except Exception:
                 pass
 
@@ -199,36 +218,37 @@ class KWinScreenShot2Grabber:
                 "native-resolution": True,
             }
 
-            self.pipe_reader.start_read(r_fd)
+            expected_bytes = self.expected_w * self.expected_h * 4
+            self.pipe_reader.start_read(r_fd, expected_bytes)
 
-            reply = self.iface.call("CaptureWorkspace", options, q_fd)
+            reply = self.iface.call("CaptureActiveScreen", options, q_fd)
             os.close(w_fd)
             w_fd = -1
+            q_fd = None  # Crucial: Drop internal dup(2) handle so writer pipe closes cleanly
 
             if _is_dbus_error(reply) or not reply.arguments():
                 err_msg = reply.errorMessage() if reply.errorMessage() else "No arguments"
 
                 r_fd2, w_fd2 = os.pipe()
                 try:
-                    fcntl.fcntl(r_fd2, 1031, 8 * 1024 * 1024)
+                    fcntl.fcntl(r_fd2, 1031, 1048576)
                 except Exception:
                     pass
                 q_fd2 = QDBusUnixFileDescriptor(w_fd2)
 
-                self.pipe_reader.start_read(r_fd2)
-                reply2 = self.iface.call("CaptureActiveScreen", options, q_fd2)
+                self.pipe_reader.start_read(r_fd2, expected_bytes)
+                reply2 = self.iface.call("CaptureWorkspace", options, q_fd2)
                 os.close(w_fd2)
                 w_fd2 = -1
+                q_fd2 = None
                 os.close(r_fd)
                 r_fd = r_fd2
 
                 if _is_dbus_error(reply2) or not reply2.arguments():
                     err_msg2 = reply2.errorMessage() if reply2.errorMessage() else "No arguments"
-                    if "not authorized" in err_msg.lower() or "not authorized" in err_msg2.lower():
-                        print(
-                            "[NOTICE] KWin ScreenShot2 requires session environment reload.\n"
-                            "         Log out and log back in once to enable 60 FPS zero-latency KWin capture."
-                        )
+                    print(
+                        f"[DEBUG Screen Capturer] KWin D-Bus error: {err_msg} | Fallback error: {err_msg2}"
+                    )
                     os.close(r_fd)
                     r_fd = -1
                     return None
@@ -236,7 +256,7 @@ class KWinScreenShot2Grabber:
             else:
                 meta_raw = reply.arguments()[0]
 
-            raw_bytes = self.pipe_reader.wait_read(timeout=0.5)
+            raw_bytes = self.pipe_reader.wait_read(timeout=init_timeout)
             os.close(r_fd)
             r_fd = -1
 
@@ -244,50 +264,38 @@ class KWinScreenShot2Grabber:
                 return None
 
             total_pixels = len(raw_bytes) // 4
+            if total_pixels <= 0:
+                return None
+
             meta = _extract_dict_from_dbus_meta(meta_raw)
+            mw = int(meta.get("width", 0))
+            mh = int(meta.get("height", 0))
 
-            width = int(meta.get("width", 0))
-            height = int(meta.get("height", 0))
-            stride = int(meta.get("stride", 0))
-
-            if width <= 0 or height <= 0 or (width * height != total_pixels):
+            if mw > 0 and mh > 0 and (mw * mh == total_pixels):
+                width, height = mw, mh
+            elif self.expected_w * self.expected_h == total_pixels:
+                width, height = self.expected_w, self.expected_h
+            else:
                 screen = QGuiApplication.primaryScreen()
                 if screen:
-                    dpr = screen.devicePixelRatio()
                     lw, lh = screen.size().width(), screen.size().height()
-                    nw, nh = int(round(lw * dpr)), int(round(lh * dpr))
-
-                    if nw * nh == total_pixels:
-                        width, height = nw, nh
-                    elif lw * lh == total_pixels:
+                    if lw * lh == total_pixels:
                         width, height = lw, lh
                     else:
                         aspect = lw / lh if lh > 0 else (16.0 / 9.0)
-                        h_est = int(round((total_pixels / aspect) ** 0.5))
-                        w_est = int(round(h_est * aspect))
-                        if w_est * h_est == total_pixels:
-                            width, height = w_est, h_est
-                        else:
-                            width, height = nw, nh
+                        height = int(round((total_pixels / aspect) ** 0.5))
+                        width = int(round(height * aspect))
+                else:
+                    width, height = 1920, 1080
 
-            if width <= 0 or height <= 0:
-                return None
-
-            expected_stride = width * 4
-            if stride < expected_stride:
-                stride = expected_stride
+            self.expected_w = width
+            self.expected_h = height
+            stride = width * 4
 
             if len(raw_bytes) < stride * height:
-                if len(raw_bytes) >= width * height * 4:
-                    stride = width * 4
-                else:
-                    return None
+                return None
 
-            arr = np.frombuffer(raw_bytes[: stride * height], dtype=np.uint8).reshape((height, stride // 4, 4))
-            if stride // 4 > width:
-                arr = arr[:, :width, :]
-
-            # Return the 4-channel array directly (OpenCV imencode handles BGRA natively with zero copies)
+            arr = np.frombuffer(raw_bytes[: stride * height], dtype=np.uint8).reshape((height, width, 4))
             return arr
 
         except Exception as ex:
@@ -530,7 +538,6 @@ class ScreenSenderThread(QThread):
             spectacle_grabber = SpectacleGrabber()
             use_spectacle = spectacle_grabber.available
 
-        # Diagnostics & FPS accounting metrics
         fps_frame_counter = 0
         fps_last_report_time = time.perf_counter()
         total_capture_dur = 0.0
@@ -553,7 +560,6 @@ class ScreenSenderThread(QThread):
                     data = None
                     t_cap_start = time.perf_counter()
 
-                    # 1. Capture Step
                     if use_kwin:
                         frame_raw = kwin_grabber.grab(
                             include_cursor=(not self.paused and not self.send_cursorless_frame_once)
@@ -575,10 +581,10 @@ class ScreenSenderThread(QThread):
 
                     if frame_raw is None:
                         if is_wayland:
-                            time.sleep(0.01)
+                            time.sleep(0.005)
                         continue
 
-                    # 2. Fast JPEG Encoding Step (Zero-pass Huffman for sustained 60 FPS)
+                    # Fast JPEG encoding
                     t_enc_start = time.perf_counter()
                     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
@@ -590,7 +596,6 @@ class ScreenSenderThread(QThread):
                     try:
                         success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
                     except Exception:
-                        # Fallback to BGR conversion if raw buffer channels require alignment
                         if frame_raw.shape[2] == 4:
                             frame_raw = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
                         success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
@@ -599,7 +604,7 @@ class ScreenSenderThread(QThread):
                         data = enc_img.tobytes()
                     t_enc_end = time.perf_counter()
 
-                    # 3. Network Transmission Step
+                    # Network transmission
                     t_send_start = time.perf_counter()
                     if data:
                         sock.sendall(struct.pack(">L", len(data)) + data)
@@ -608,7 +613,6 @@ class ScreenSenderThread(QThread):
                     if self.send_cursorless_frame_once:
                         self.send_cursorless_frame_once = False
 
-                    # Diagnostics Accumulation
                     fps_frame_counter += 1
                     total_capture_dur += (t_cap_end - t_cap_start)
                     total_encode_dur += (t_enc_end - t_enc_start)
@@ -646,7 +650,7 @@ class ScreenSenderThread(QThread):
                     time.sleep(0.005)
                     continue
 
-                # 4. Precision Frame Pacing
+                # Frame pacing
                 frame_elapsed = time.perf_counter() - t_frame_start
                 target_frame_time = 1.0 / max(1, self.fps_limit)
                 sleep_sec = target_frame_time - frame_elapsed
