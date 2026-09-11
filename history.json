@@ -5,5 +5,7 @@
         "192.168.90.221": "317 CS"
     },
     "quality_preset": "Balanced (75%)",
-    "touch_input": true
+    "touch_input": true,
+    "tv_volume": 9,
+    "allow_audio_when_paused": false
 }

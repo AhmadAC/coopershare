@@ -1,7 +1,7 @@
 """
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
 Features persistent state loading and saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
-with vector SVG icons replacing all emojis.
+with vector SVG icons replacing all emojis and dynamic audio-pause toggle state feedback.
 """
 
 import ctypes
@@ -160,6 +160,7 @@ class FloatingSenderWindow(QWidget):
         self.is_stream_muted = False
         self.is_host_muted = False
         self.input_enabled = bool(self.history_data.get("touch_input", True))
+        self.allow_audio_when_paused = bool(self.history_data.get("allow_audio_when_paused", False))
 
         saved_vol = self.history_data.get("tv_volume", 100)
         self.tv_volume = (max(0, min(150, int(saved_vol))) if isinstance(saved_vol, (int, float)) else 100) / 100.0
@@ -750,6 +751,24 @@ class FloatingSenderWindow(QWidget):
         self.history_data["auto_connect"] = checked
         save_history(self.history_data)
 
+    def toggle_allow_audio_when_paused(self):
+        self.allow_audio_when_paused = not self.allow_audio_when_paused
+        self.history_data["allow_audio_when_paused"] = self.allow_audio_when_paused
+        save_history(self.history_data)
+        self._update_audio_pause_state()
+        print(f"[DEBUG Sender UI] Audio when paused toggled: {self.allow_audio_when_paused}")
+
+    def on_allow_audio_when_paused_toggled(self, checked: bool):
+        self.allow_audio_when_paused = checked
+        self.history_data["allow_audio_when_paused"] = checked
+        save_history(self.history_data)
+        self._update_audio_pause_state()
+
+    def _update_audio_pause_state(self):
+        if self.audio_thread:
+            should_pause_audio = self.is_paused and not self.allow_audio_when_paused
+            self.audio_thread.paused = should_pause_audio
+
     def on_opacity_changed(self, val: int):
         self.op_val_lbl.setText(f"{val}%")
         if not self.is_mini_mode:
@@ -887,6 +906,23 @@ class FloatingSenderWindow(QWidget):
         remove_act.setIcon(svg_to_icon(SVG_TRASH, 16, "#ff6b6b"))
         remove_act.triggered.connect(self.remove_selected_device)
         menu.addAction(remove_act)
+
+        menu.addSeparator()
+
+        if self.allow_audio_when_paused:
+            audio_pause_text = "Disable Audio When Paused"
+            audio_pause_icon = svg_to_icon(SVG_VOLUME_ON, 16, "#00d084")
+            audio_pause_tip = "Currently allowed: TV audio plays even while stream is paused"
+        else:
+            audio_pause_text = "Allow Audio When Paused"
+            audio_pause_icon = svg_to_icon(SVG_VOLUME_MUTE, 16, "#8f9bb3")
+            audio_pause_tip = "Currently muted: TV audio is silenced while stream is paused"
+
+        allow_audio_pause_act = QAction(audio_pause_text, self)
+        allow_audio_pause_act.setIcon(audio_pause_icon)
+        allow_audio_pause_act.setToolTip(audio_pause_tip)
+        allow_audio_pause_act.triggered.connect(self.toggle_allow_audio_when_paused)
+        menu.addAction(allow_audio_pause_act)
 
         menu.addSeparator()
 
@@ -1032,6 +1068,7 @@ class FloatingSenderWindow(QWidget):
         self.stream_thread.start()
 
         self.audio_thread = AudioSenderThread(target_ip, volume=self.tv_volume)
+        self._update_audio_pause_state()
         self.audio_thread.start()
 
         self.ensure_control_channel(target_ip)
@@ -1045,6 +1082,7 @@ class FloatingSenderWindow(QWidget):
             self.audio_thread = None
 
         self.is_paused = False
+        self._update_audio_pause_state()
 
         if self.viewer_window:
             try:
@@ -1088,6 +1126,7 @@ class FloatingSenderWindow(QWidget):
                     "background-color: #0078d4; color: white; font-weight: bold;"
                 )
                 self._update_status_color("#00d084")
+            self._update_audio_pause_state()
 
     def toggle_stream_mute(self):
         if self.audio_thread:

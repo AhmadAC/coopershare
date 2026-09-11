@@ -1,4 +1,3 @@
-
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 """
@@ -233,6 +232,7 @@ class AudioSenderThread(QThread):
         self.volume = volume
         self.running = True
         self.muted = False
+        self.paused = False
         self.sock: Optional[socket.socket] = None
 
     def set_volume(self, vol: float):
@@ -263,7 +263,7 @@ class AudioSenderThread(QThread):
 
         if use_native_wasapi:
             while self.running:
-                eff_vol = 0.0 if self.muted else self.volume
+                eff_vol = 0.0 if (self.muted or self.paused) else self.volume
                 chunk = wasapi.read_pcm16_chunk(volume=eff_vol)
                 if chunk and self.sock:
                     try:
@@ -280,7 +280,7 @@ class AudioSenderThread(QThread):
                 def callback(indata, frames, time_info, status):
                     if self.running and self.sock:
                         try:
-                            if self.muted:
+                            if self.muted or self.paused:
                                 silence = b"\x00" * (frames * CHANNELS * 2)
                                 self.sock.sendall(silence)
                             else:
