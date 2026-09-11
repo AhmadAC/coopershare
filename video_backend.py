@@ -38,7 +38,6 @@ def render_cursor_on_frame(
     """Draws a high-contrast anti-aliased mouse pointer onto the frame with DPR scaling."""
     gx, gy = get_system_cursor_position()
 
-    # Apply Device Pixel Ratio scaling for Wayland / High-DPI screens
     if scale_factor <= 0.0 or scale_factor == 1.0:
         screen = QGuiApplication.primaryScreen()
         if screen:
@@ -51,7 +50,6 @@ def render_cursor_on_frame(
 
     h, w = bgr_image.shape[:2]
     if 0 <= cx < w and 0 <= cy < h:
-        # Scale the cursor polygon proportionally with resolution / DPI
         size_mult = max(1.0, scale_factor)
         base_pts = np.array(
             [
@@ -68,28 +66,28 @@ def render_cursor_on_frame(
         scaled_pts = (base_pts * size_mult).astype(np.int32)
         pts = scaled_pts + np.array([cx, cy], dtype=np.int32)
 
-        # Draw outer black outline for high contrast
+        # Outer high-contrast black border
         cv2.polylines(
             bgr_image,
             [pts],
             isClosed=True,
-            color=(0, 0, 0, 255) if bgr_image.shape[2] == 4 else (0, 0, 0),
+            color=(0, 0, 0),
             thickness=max(2, int(round(2 * size_mult))),
             lineType=cv2.LINE_AA,
         )
-        # Draw solid white interior
+        # Inner white fill
         cv2.fillPoly(
             bgr_image,
             [pts],
-            color=(255, 255, 255, 255) if bgr_image.shape[2] == 4 else (255, 255, 255),
+            color=(255, 255, 255),
             lineType=cv2.LINE_AA,
         )
-        # Draw inner dark edge
+        # Inner accent line
         cv2.polylines(
             bgr_image,
             [pts],
             isClosed=True,
-            color=(20, 20, 20, 255) if bgr_image.shape[2] == 4 else (20, 20, 20),
+            color=(20, 20, 20),
             thickness=1,
             lineType=cv2.LINE_AA,
         )

@@ -83,7 +83,7 @@ def _extract_dict_from_dbus_meta(meta_raw) -> dict:
 
 
 class PersistentPipeReader:
-    """High-speed persistent worker that reads exact frame payloads without waiting for EOF."""
+    """High-speed persistent worker that reads exact frame payloads into a decoupled buffer."""
 
     def __init__(self, initial_capacity: int = 1920 * 1080 * 4 + 131072):
         self.buf = bytearray(initial_capacity)
@@ -103,9 +103,12 @@ class PersistentPipeReader:
         self.done_evt.clear()
         self.start_evt.set()
 
-    def wait_read(self, timeout: float = 0.5) -> memoryview:
-        self.done_evt.wait(timeout)
-        return memoryview(self.buf)[: self.bytes_read]
+    def wait_read(self, timeout: float = 0.5) -> Optional[bytes]:
+        signaled = self.done_evt.wait(timeout)
+        if not signaled or self.bytes_read <= 0:
+            return None
+        # Return an isolated copy so the capture thread can immediately read the next frame
+        return bytes(self.buf[: self.bytes_read])
 
     def _run(self):
         while self.running:
@@ -148,16 +151,20 @@ class KWinScreenShot2Grabber:
     def __init__(self):
         self.available = False
         self.iface = None
-        self.expected_w = 1920
-        self.expected_h = 1080
+        self.native_w = 1920
+        self.native_h = 1080
+        self.logical_w = 1536
+        self.logical_h = 864
         self.dpr = 1.0
         self.pipe_reader = PersistentPipeReader()
 
         screen = QGuiApplication.primaryScreen()
         if screen:
             self.dpr = float(screen.devicePixelRatio())
-            self.expected_w = int(round(screen.size().width() * self.dpr))
-            self.expected_h = int(round(screen.size().height() * self.dpr))
+            self.logical_w = screen.size().width()
+            self.logical_h = screen.size().height()
+            self.native_w = int(round(self.logical_w * self.dpr))
+            self.native_h = int(round(self.logical_h * self.dpr))
 
         if not sys.platform.startswith("linux"):
             return
@@ -176,7 +183,7 @@ class KWinScreenShot2Grabber:
             self.iface = _get_interface()
             if self.iface.isValid():
                 for attempt in range(2):
-                    test_frame = self.grab(include_cursor=False, init_timeout=1.5)
+                    test_frame = self.grab(include_cursor=True, native_resolution=True, init_timeout=1.5)
                     if test_frame is not None and test_frame.size > 0:
                         self.available = True
                         print(
@@ -196,7 +203,12 @@ class KWinScreenShot2Grabber:
             print(f"[DEBUG Screen Capturer] KWin ScreenShot2 probe error: {e}")
             self.available = False
 
-    def grab(self, include_cursor: bool = False, init_timeout: float = 0.2) -> Optional[np.ndarray]:
+    def grab(
+        self,
+        include_cursor: bool = True,
+        native_resolution: bool = True,
+        init_timeout: float = 0.25,
+    ) -> Optional[np.ndarray]:
         if not self.iface:
             return None
         r_fd, w_fd = -1, -1
@@ -214,10 +226,13 @@ class KWinScreenShot2Grabber:
 
             options = {
                 "include-cursor": include_cursor,
-                "native-resolution": True,
+                "native-resolution": native_resolution,
             }
 
-            expected_bytes = self.expected_w * self.expected_h * 4
+            target_w = self.native_w if native_resolution else self.logical_w
+            target_h = self.native_h if native_resolution else self.logical_h
+            expected_bytes = target_w * target_h * 4
+
             self.pipe_reader.start_read(r_fd, expected_bytes)
 
             reply = self.iface.call("CaptureActiveScreen", options, q_fd)
@@ -272,30 +287,25 @@ class KWinScreenShot2Grabber:
 
             if mw > 0 and mh > 0 and (mw * mh == total_pixels):
                 width, height = mw, mh
-            elif self.expected_w * self.expected_h == total_pixels:
-                width, height = self.expected_w, self.expected_h
+            elif target_w * target_h == total_pixels:
+                width, height = target_w, target_h
+            elif self.native_w * self.native_h == total_pixels:
+                width, height = self.native_w, self.native_h
+            elif self.logical_w * self.logical_h == total_pixels:
+                width, height = self.logical_w, self.logical_h
             else:
-                screen = QGuiApplication.primaryScreen()
-                if screen:
-                    lw, lh = screen.size().width(), screen.size().height()
-                    if lw * lh == total_pixels:
-                        width, height = lw, lh
-                    else:
-                        aspect = lw / lh if lh > 0 else (16.0 / 9.0)
-                        height = int(round((total_pixels / aspect) ** 0.5))
-                        width = int(round(height * aspect))
-                else:
-                    width, height = 1920, 1080
+                aspect = self.logical_w / self.logical_h if self.logical_h > 0 else (16.0 / 9.0)
+                height = int(round((total_pixels / aspect) ** 0.5))
+                width = int(round(height * aspect))
 
-            self.expected_w = width
-            self.expected_h = height
             stride = width * 4
-
             if len(raw_bytes) < stride * height:
                 return None
 
+            # Raw memory parsing and instant conversion to standard 3-channel BGR
             arr = np.frombuffer(raw_bytes[: stride * height], dtype=np.uint8).reshape((height, width, 4))
-            return arr
+            bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+            return bgr
 
         except Exception as ex:
             print(f"[DEBUG Screen Capturer] KWin ScreenShot2 grab exception: {ex}")
@@ -465,7 +475,7 @@ class ScreenSenderThread(QThread):
         self.paused = False
         self.send_cursorless_frame_once = False
 
-        # Async producer-consumer frame pipeline
+        # Asynchronous frame queue
         self.frame_queue = queue.Queue(maxsize=1)
         self.pipeline_running = False
 
@@ -497,9 +507,9 @@ class ScreenSenderThread(QThread):
             except queue.Empty:
                 continue
 
-            frame_raw, t_cap_ms = item
+            frame_bgr, t_cap_ms = item
 
-            # Fast Concurrent Encoding
+            # Instant 3-channel encoding with zero exception overhead
             t_enc_start = time.perf_counter()
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
@@ -508,13 +518,7 @@ class ScreenSenderThread(QThread):
                 sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
                 encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
 
-            try:
-                success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
-            except Exception:
-                if frame_raw.shape[2] == 4:
-                    frame_raw = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
-                success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
-
+            success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
             data = enc_img.tobytes() if success else None
             t_enc_end = time.perf_counter()
 
@@ -613,7 +617,7 @@ class ScreenSenderThread(QThread):
             spectacle_grabber = SpectacleGrabber()
             use_spectacle = spectacle_grabber.available
 
-        # Spin up parallel encoder/transmitter worker
+        # Start concurrent encoder/transmitter worker
         self.pipeline_running = True
         encoder_worker_thread = threading.Thread(
             target=self._encoder_network_worker, args=(sock,), daemon=True
@@ -639,20 +643,19 @@ class ScreenSenderThread(QThread):
                     t_cap_start = time.perf_counter()
 
                     if use_kwin:
-                        frame_raw = kwin_grabber.grab(include_cursor=False)
-                        if frame_raw is not None and not self.paused and not self.send_cursorless_frame_once:
-                            # Stamped with DPR scaling factor so cursor appears accurately on the TV
-                            render_cursor_on_frame(
-                                frame_raw,
-                                monitor_left=mon_left,
-                                monitor_top=mon_top,
-                                scale_factor=screen_dpr,
-                            )
+                        # Full physical resolution when >= 95%, high-speed logical resolution when Balanced for 60 FPS
+                        use_native_res = bool(self.quality >= 95)
+                        want_cursor = not (self.paused or self.send_cursorless_frame_once)
+                        # KWin draws the real system cursor directly into the framebuffer
+                        frame_bgr = kwin_grabber.grab(
+                            include_cursor=want_cursor,
+                            native_resolution=use_native_res,
+                        )
                     elif use_spectacle and spectacle_grabber:
-                        frame_raw = spectacle_grabber.grab()
-                        if frame_raw is not None and not self.paused and not self.send_cursorless_frame_once:
+                        frame_bgr = spectacle_grabber.grab()
+                        if frame_bgr is not None and not (self.paused or self.send_cursorless_frame_once):
                             render_cursor_on_frame(
-                                frame_raw,
+                                frame_bgr,
                                 monitor_left=mon_left,
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
@@ -660,21 +663,21 @@ class ScreenSenderThread(QThread):
                     elif not is_wayland:
                         raw_frame = sct.grab(monitor)
                         img = np.array(raw_frame)
-                        frame_raw = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                        if not self.paused and not self.send_cursorless_frame_once:
+                        frame_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                        if not (self.paused or self.send_cursorless_frame_once):
                             render_cursor_on_frame(
-                                frame_raw,
+                                frame_bgr,
                                 monitor_left=mon_left,
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
                             )
                     else:
-                        frame_raw = None
+                        frame_bgr = None
 
                     t_cap_end = time.perf_counter()
                     cap_ms = (t_cap_end - t_cap_start) * 1000.0
 
-                    if frame_raw is None:
+                    if frame_bgr is None:
                         if is_wayland:
                             time.sleep(0.002)
                         continue
@@ -682,14 +685,14 @@ class ScreenSenderThread(QThread):
                     if self.send_cursorless_frame_once:
                         self.send_cursorless_frame_once = False
 
-                    # Push frame directly into the parallel encode queue; drop stale frame if backlog occurs
+                    # Push frame directly into the parallel encode queue without blocking
                     if self.frame_queue.full():
                         try:
                             self.frame_queue.get_nowait()
                         except queue.Empty:
                             pass
 
-                    self.frame_queue.put_nowait((frame_raw, cap_ms))
+                    self.frame_queue.put_nowait((frame_bgr, cap_ms))
 
                 except (socket.error, BrokenPipeError, ConnectionResetError) as e:
                     print(f"[DEBUG Sender Video] Network socket disconnected: {e}")
@@ -702,7 +705,7 @@ class ScreenSenderThread(QThread):
                     time.sleep(0.002)
                     continue
 
-                # Precise clock pacing
+                # Clock pacing
                 frame_elapsed = time.perf_counter() - t_frame_start
                 target_frame_time = 1.0 / max(1, self.fps_limit)
                 sleep_sec = target_frame_time - frame_elapsed
