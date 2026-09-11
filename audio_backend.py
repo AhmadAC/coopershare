@@ -1,10 +1,12 @@
+#################### START OF FILE: audio_backend.py ####################
+
 """
 Native 64-bit Windows WASAPI Desktop Audio Loopback & Physical Speaker Mute Controller (ctypes COM).
+Provides safe cross-platform fallbacks for non-Windows environments (Linux / macOS).
 """
 
 import ctypes
 from ctypes import (
-    HRESULT,
     POINTER,
     Structure,
     byref,
@@ -25,6 +27,10 @@ from typing import Optional
 import numpy as np
 
 from config import CHANNELS, DEFAULT_SAMPLE_RATE
+
+# Cross-platform fallbacks for Windows-specific ctypes types
+HRESULT = getattr(ctypes, "HRESULT", ctypes.c_long)
+WINFUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 
 
 class GUID(Structure):
@@ -77,7 +83,7 @@ def _release_com_ptr(ptr: c_void_p):
     if ptr and ptr.value:
         try:
             vtbl = ctypes.cast(ptr, POINTER(POINTER(c_void_p))).contents
-            release_func = ctypes.WINFUNCTYPE(c_ulong, c_void_p)(vtbl[2])
+            release_func = WINFUNCTYPE(c_ulong, c_void_p)(vtbl[2])
             release_func(ptr)
         except Exception:
             pass
@@ -109,7 +115,7 @@ class HostAudioController:
                 return False
 
             enum_vtbl = ctypes.cast(p_enum, POINTER(POINTER(c_void_p))).contents
-            get_endpoint = ctypes.WINFUNCTYPE(
+            get_endpoint = WINFUNCTYPE(
                 HRESULT, c_void_p, c_int, c_int, POINTER(c_void_p)
             )(enum_vtbl[4])
             hr = get_endpoint(p_enum, 0, 0, byref(p_dev))
@@ -117,7 +123,7 @@ class HostAudioController:
                 return False
 
             dev_vtbl = ctypes.cast(p_dev, POINTER(POINTER(c_void_p))).contents
-            activate = ctypes.WINFUNCTYPE(
+            activate = WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(GUID), c_ulong, c_void_p, POINTER(c_void_p)
             )(dev_vtbl[3])
 
@@ -128,9 +134,7 @@ class HostAudioController:
                 return False
 
             ep_vtbl = ctypes.cast(p_ep_vol, POINTER(POINTER(c_void_p))).contents
-            set_mute = ctypes.WINFUNCTYPE(HRESULT, c_void_p, c_int, c_void_p)(
-                ep_vtbl[14]
-            )
+            set_mute = WINFUNCTYPE(HRESULT, c_void_p, c_int, c_void_p)(ep_vtbl[14])
             hr = set_mute(p_ep_vol, 1 if mute else 0, None)
             return hr == 0
         except Exception as ex:
@@ -164,7 +168,7 @@ class HostAudioController:
                 return False
 
             enum_vtbl = ctypes.cast(p_enum, POINTER(POINTER(c_void_p))).contents
-            get_endpoint = ctypes.WINFUNCTYPE(
+            get_endpoint = WINFUNCTYPE(
                 HRESULT, c_void_p, c_int, c_int, POINTER(c_void_p)
             )(enum_vtbl[4])
             hr = get_endpoint(p_enum, 0, 0, byref(p_dev))
@@ -172,7 +176,7 @@ class HostAudioController:
                 return False
 
             dev_vtbl = ctypes.cast(p_dev, POINTER(POINTER(c_void_p))).contents
-            activate = ctypes.WINFUNCTYPE(
+            activate = WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(GUID), c_ulong, c_void_p, POINTER(c_void_p)
             )(dev_vtbl[3])
 
@@ -183,9 +187,7 @@ class HostAudioController:
                 return False
 
             ep_vtbl = ctypes.cast(p_ep_vol, POINTER(POINTER(c_void_p))).contents
-            get_mute = ctypes.WINFUNCTYPE(HRESULT, c_void_p, POINTER(c_int))(
-                ep_vtbl[15]
-            )
+            get_mute = WINFUNCTYPE(HRESULT, c_void_p, POINTER(c_int))(ep_vtbl[15])
             is_muted = c_int(0)
             hr = get_mute(p_ep_vol, byref(is_muted))
             return bool(is_muted.value) if hr == 0 else False
@@ -233,7 +235,7 @@ class NativeWindowsWasapiLoopback:
             enum_vtbl = ctypes.cast(
                 self.p_enumerator, POINTER(POINTER(c_void_p))
             ).contents
-            get_endpoint_func = ctypes.WINFUNCTYPE(
+            get_endpoint_func = WINFUNCTYPE(
                 HRESULT, c_void_p, c_int, c_int, POINTER(c_void_p)
             )(enum_vtbl[4])
 
@@ -243,7 +245,7 @@ class NativeWindowsWasapiLoopback:
                 return False
 
             dev_vtbl = ctypes.cast(self.p_device, POINTER(POINTER(c_void_p))).contents
-            activate_func = ctypes.WINFUNCTYPE(
+            activate_func = WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(GUID), c_ulong, c_void_p, POINTER(c_void_p)
             )(dev_vtbl[3])
 
@@ -261,7 +263,7 @@ class NativeWindowsWasapiLoopback:
             client_vtbl = ctypes.cast(
                 self.audio_client, POINTER(POINTER(c_void_p))
             ).contents
-            get_format_func = ctypes.WINFUNCTYPE(
+            get_format_func = WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(POINTER(WAVEFORMATEX))
             )(client_vtbl[8])
 
@@ -278,7 +280,7 @@ class NativeWindowsWasapiLoopback:
                 fmt.wFormatTag == 0xFFFE and self.bits_per_sample == 32
             )
 
-            init_func = ctypes.WINFUNCTYPE(
+            init_func = WINFUNCTYPE(
                 HRESULT, c_void_p, c_int, c_ulong, c_int64, c_int64, c_void_p, c_void_p
             )(client_vtbl[3])
             hr = init_func(
@@ -293,7 +295,7 @@ class NativeWindowsWasapiLoopback:
             if hr != 0:
                 return False
 
-            get_service_func = ctypes.WINFUNCTYPE(
+            get_service_func = WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(GUID), POINTER(c_void_p)
             )(client_vtbl[14])
             self.capture_client = c_void_p()
@@ -305,7 +307,7 @@ class NativeWindowsWasapiLoopback:
             if hr != 0 or not self.capture_client.value:
                 return False
 
-            start_func = ctypes.WINFUNCTYPE(HRESULT, c_void_p)(client_vtbl[10])
+            start_func = WINFUNCTYPE(HRESULT, c_void_p)(client_vtbl[10])
             start_func(self.audio_client)
 
             self.initialized = True
@@ -327,7 +329,7 @@ class NativeWindowsWasapiLoopback:
             cap_vtbl = ctypes.cast(
                 self.capture_client, POINTER(POINTER(c_void_p))
             ).contents
-            get_buffer_func = ctypes.WINFUNCTYPE(
+            get_buffer_func = WINFUNCTYPE(
                 HRESULT,
                 c_void_p,
                 POINTER(c_void_p),
@@ -336,10 +338,10 @@ class NativeWindowsWasapiLoopback:
                 POINTER(c_uint64),
                 POINTER(c_uint64),
             )(cap_vtbl[3])
-            release_buffer_func = ctypes.WINFUNCTYPE(HRESULT, c_void_p, c_uint)(
+            release_buffer_func = WINFUNCTYPE(HRESULT, c_void_p, c_uint)(
                 cap_vtbl[4]
             )
-            get_next_packet_func = ctypes.WINFUNCTYPE(
+            get_next_packet_func = WINFUNCTYPE(
                 HRESULT, c_void_p, POINTER(c_uint)
             )(cap_vtbl[5])
 
@@ -409,7 +411,7 @@ class NativeWindowsWasapiLoopback:
                 client_vtbl = ctypes.cast(
                     self.audio_client, POINTER(POINTER(c_void_p))
                 ).contents
-                stop_func = ctypes.WINFUNCTYPE(HRESULT, c_void_p)(client_vtbl[11])
+                stop_func = WINFUNCTYPE(HRESULT, c_void_p)(client_vtbl[11])
                 stop_func(self.audio_client)
             except Exception:
                 pass

@@ -1,3 +1,5 @@
+#################### START OF FILE: input_backend.py ####################
+
 """
 Cross-Platform Universal Input Injector supporting native Win32 API (Windows),
 evdev (Linux), and pynput fallback.
@@ -17,10 +19,13 @@ if sys.platform.startswith("linux"):
     except Exception:
         USE_EVDEV = False
 
+Button = None
+MouseController = None
 try:
     from pynput.mouse import Button, Controller as MouseController
 except Exception:
-    pass
+    Button = None
+    MouseController = None
 
 
 class UniversalInputInjector:
@@ -38,6 +43,8 @@ class UniversalInputInjector:
         self.mon_left = mon_left
         self.mon_top = mon_top
         self.mode = "none"
+        self.mouse = None
+        self.ui = None
 
         if sys.platform == "win32":
             self.mode = "win32"
@@ -80,12 +87,15 @@ class UniversalInputInjector:
                 self.mode = "none"
 
         if self.mode == "none":
-            try:
-                self.mouse = MouseController()
-                self.mode = "pynput"
-                print("[DEBUG Injector] Using pynput mouse controller fallback.")
-            except Exception as ex:
-                print(f"[DEBUG Injector] pynput init failed: {ex}")
+            if MouseController is not None:
+                try:
+                    self.mouse = MouseController()
+                    self.mode = "pynput"
+                    print("[DEBUG Injector] Using pynput mouse controller fallback.")
+                except Exception as ex:
+                    print(f"[DEBUG Injector] pynput init failed: {ex}")
+                    self.mode = "unsupported"
+            else:
                 self.mode = "unsupported"
 
     def execute(self, event: dict):
@@ -126,7 +136,7 @@ class UniversalInputInjector:
             except Exception as ex:
                 print(f"[DEBUG Injector Win32] Execution failed: {ex}")
 
-        elif self.mode == "evdev":
+        elif self.mode == "evdev" and self.ui:
             if px is not None and py is not None:
                 self.ui.write(e.EV_ABS, e.ABS_X, int(px))
                 self.ui.write(e.EV_ABS, e.ABS_Y, int(py))
@@ -149,7 +159,7 @@ class UniversalInputInjector:
                 self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
             self.ui.syn()
 
-        elif self.mode == "pynput":
+        elif self.mode == "pynput" and self.mouse:
             if px is not None and py is not None:
                 self.mouse.position = (px, py)
             if ev_type in ("touch_down", "mouse_down"):
@@ -170,9 +180,8 @@ class UniversalInputInjector:
                 self.mouse.scroll(0, 1 if event.get("dy", 0) > 0 else -1)
 
     def close(self):
-        if self.mode == "evdev":
+        if self.mode == "evdev" and self.ui:
             try:
                 self.ui.close()
             except Exception:
                 pass
-

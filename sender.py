@@ -1,4 +1,4 @@
-
+#################### START OF FILE: sender.py ####################
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Remote Controller)
@@ -9,6 +9,14 @@ import ctypes
 import os
 import runpy
 import sys
+
+# Linux-Specific Platform & Input Method Fixes for Wayland / KDE Plasma
+if sys.platform.startswith("linux"):
+    os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
+    os.environ["QT_IM_MODULE"] = "ibus"
+    os.environ["XMODIFIERS"] = "@im=ibus"
+    if "QT_QPA_PLATFORM" not in os.environ:
+        os.environ["QT_QPA_PLATFORM"] = "xcb;wayland"
 
 # Enable Per-Monitor High DPI Awareness on Windows early
 if sys.platform == "win32":

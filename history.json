@@ -7,5 +7,6 @@
     "quality_preset": "Balanced (75%)",
     "touch_input": true,
     "tv_volume": 9,
-    "allow_audio_when_paused": false
+    "allow_audio_when_paused": false,
+    "opacity": 93
 }

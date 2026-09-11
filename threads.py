@@ -1,10 +1,16 @@
+#################### START OF FILE: threads.py ####################
+
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
+Supports native Windows WASAPI loopback, high-performance MSS capture, and Wayland native capture (grim/spectacle).
 """
 
 import json
+import os
+import shutil
 import socket
 import struct
+import subprocess
 import threading
 import time
 from typing import Optional
@@ -162,6 +168,22 @@ class ScreenSenderThread(QThread):
             self.status_changed.emit(f"Connect Error: {e}", False)
             return
 
+        is_wayland = sys.platform.startswith("linux") and (
+            os.environ.get("XDG_SESSION_TYPE") == "wayland" or os.environ.get("WAYLAND_DISPLAY") is not None
+        )
+        grim_bin = shutil.which("grim") if is_wayland else None
+        spectacle_bin = shutil.which("spectacle") if (is_wayland and not grim_bin) else None
+
+        if is_wayland:
+            if grim_bin:
+                print(f"[DEBUG Sender Video] Wayland compositor active. Capturing via: {grim_bin}")
+            elif spectacle_bin:
+                print(f"[DEBUG Sender Video] Wayland compositor active. Capturing via: {spectacle_bin}")
+            else:
+                print(
+                    "[DEBUG Sender Video] Wayland detected. For best capture performance, install grim: 'sudo dnf install grim'"
+                )
+
         with create_mss_instance() as sct:
             monitor = sct.monitors[1]
             mon_left = monitor["left"]
@@ -175,32 +197,64 @@ class ScreenSenderThread(QThread):
                 t_start = time.perf_counter()
 
                 try:
-                    raw_frame = sct.grab(monitor)
-                    img = np.array(raw_frame)
-                    bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                    if grim_bin:
+                        cmd = [grim_bin, "-t", "jpeg", "-q", str(self.quality)]
+                        if not self.paused and not self.send_cursorless_frame_once:
+                            cmd.append("-c")
+                        cmd.append("-")
 
-                    if not self.paused and not self.send_cursorless_frame_once:
-                        render_cursor_on_frame(bgr, mon_left, mon_top)
+                        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=1.0)
+                        if res.returncode == 0 and res.stdout:
+                            data = res.stdout
+                            sock.sendall(struct.pack(">L", len(data)) + data)
+                        if self.send_cursorless_frame_once:
+                            self.send_cursorless_frame_once = False
 
-                    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-                    if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
-                        encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
-
-                    if self.use_444_chroma:
-                        sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
-                        sampling_444_val = getattr(
-                            cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001
+                    elif spectacle_bin:
+                        res = subprocess.run(
+                            [spectacle_bin, "-b", "-n", "-o", "/dev/stdout"],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            timeout=1.5,
                         )
-                        encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+                        if res.returncode == 0 and res.stdout:
+                            np_arr = np.frombuffer(res.stdout, np.uint8)
+                            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                            if img is not None:
+                                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                                success, enc_img = cv2.imencode(".jpg", img, encode_params)
+                                if success:
+                                    data = enc_img.tobytes()
+                                    sock.sendall(struct.pack(">L", len(data)) + data)
+                        if self.send_cursorless_frame_once:
+                            self.send_cursorless_frame_once = False
 
-                    success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
+                    else:
+                        raw_frame = sct.grab(monitor)
+                        img = np.array(raw_frame)
+                        bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-                    if success:
-                        data = enc_img.tobytes()
-                        sock.sendall(struct.pack(">L", len(data)) + data)
+                        if not self.paused and not self.send_cursorless_frame_once:
+                            render_cursor_on_frame(bgr, mon_left, mon_top)
 
-                    if self.send_cursorless_frame_once:
-                        self.send_cursorless_frame_once = False
+                        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                        if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
+                            encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
+
+                        if self.use_444_chroma:
+                            sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
+                            sampling_444_val = getattr(
+                                cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001
+                            )
+                            encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+
+                        success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
+                        if success:
+                            data = enc_img.tobytes()
+                            sock.sendall(struct.pack(">L", len(data)) + data)
+
+                        if self.send_cursorless_frame_once:
+                            self.send_cursorless_frame_once = False
 
                 except Exception as e:
                     print(f"[DEBUG Sender Video] Frame send failed: {e}")

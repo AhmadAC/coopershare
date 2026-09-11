@@ -1,7 +1,10 @@
+#################### START OF FILE: ui_main.py ####################
+
 """
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
 Features persistent state loading and saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
-with vector SVG icons replacing all emojis and dynamic audio-pause toggle state feedback.
+with vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
+and a toggleable Remote TV Viewer session controller.
 """
 
 import ctypes
@@ -11,8 +14,9 @@ import time
 from typing import Optional
 
 from PySide6.QtCore import QByteArray, QEvent, QPoint, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QKeyEvent
+from PySide6.QtGui import QAction, QColor, QKeyEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -168,6 +172,7 @@ class FloatingSenderWindow(QWidget):
         self.discovered_ip = ""
         self.pin_required = False
         self.status_color = "#8f9bb3"
+        self.current_opacity = 0.94
         self.was_streaming_before_viewing = False
 
         # Pulsing Animation attributes for Collapsed Taskbar Click
@@ -205,7 +210,8 @@ class FloatingSenderWindow(QWidget):
 
         saved_op = self.history_data.get("opacity", 94)
         op_val = max(20, min(100, int(saved_op))) if isinstance(saved_op, (int, float)) else 94
-        self.setWindowOpacity(op_val / 100.0)
+        self.current_opacity = op_val / 100.0
+        self.apply_opacity(self.current_opacity)
 
         if sys.platform == "win32":
             try:
@@ -221,6 +227,22 @@ class FloatingSenderWindow(QWidget):
                 print(f"[DEBUG Sender Win32] Style init notice: {e}")
 
         self.enforce_always_on_top()
+
+    def apply_opacity(self, opacity: float):
+        """Cross-platform opacity applicator supporting Wayland, X11, and Windows."""
+        self.current_opacity = max(0.1, min(1.0, float(opacity)))
+
+        # Native window opacity is only supported on Windows, macOS, and X11 (not Wayland)
+        is_wayland = QApplication.platformName() == "wayland"
+        if not is_wayland:
+            try:
+                super().setWindowOpacity(self.current_opacity)
+            except Exception:
+                pass
+
+        self._update_card_style()
+        if hasattr(self, "mini_bar"):
+            self._update_mini_bar_style()
 
     def enforce_always_on_top(self):
         if sys.platform == "win32":
@@ -267,13 +289,13 @@ class FloatingSenderWindow(QWidget):
         if elapsed >= 3.0 or not self.is_mini_mode:
             self.pulse_timer.stop()
             self.is_pulsing = False
-            self.setWindowOpacity(0.35)
+            self.apply_opacity(0.35)
             self._update_mini_bar_style()
             return
 
         osc = (math.sin(elapsed * math.pi * 3.5) + 1.0) / 2.0
         current_op = 0.30 + (0.60 * osc)
-        self.setWindowOpacity(current_op)
+        self.apply_opacity(current_op)
         self.enforce_always_on_top()
 
     def changeEvent(self, event: QEvent):
@@ -286,8 +308,36 @@ class FloatingSenderWindow(QWidget):
             else:
                 if not self.isMinimized():
                     self.enforce_always_on_top()
-                    self.setWindowOpacity(self.opacity_slider.value() / 100.0)
+                    if hasattr(self, "opacity_slider"):
+                        self.apply_opacity(self.opacity_slider.value() / 100.0)
         super().changeEvent(event)
+
+    def _update_card_style(self):
+        if not hasattr(self, "card"):
+            return
+        alpha = self.current_opacity if not self.is_mini_mode else 1.0
+        self.card.setStyleSheet(
+            f"""
+            QFrame#card {{
+                background-color: rgba(26, 30, 41, {alpha:.3f});
+                border: 1px solid rgba(51, 60, 77, {min(1.0, alpha + 0.1):.3f});
+                border-radius: 14px;
+            }}
+            QLabel {{ color: #ffffff; font-family: 'Segoe UI', sans-serif; font-size: 12px; }}
+            QLineEdit, QComboBox {{
+                background: #262c3b; border: 1px solid #3d475f;
+                color: #ffffff; border-radius: 6px; padding: 5px 8px; font-size: 12px;
+            }}
+            QPushButton {{
+                background-color: #0078d4; color: white; border: none;
+                border-radius: 6px; font-weight: bold; font-size: 11px; padding: 6px 10px;
+            }}
+            QPushButton:hover {{ background-color: #106ebe; }}
+            QCheckBox {{ color: #8f9bb3; font-size: 11px; }}
+            QSlider::groove:horizontal {{ height: 4px; background: #333c4e; border-radius: 2px; }}
+            QSlider::handle:horizontal {{ background: #00a2ed; width: 12px; margin: -4px 0; border-radius: 6px; }}
+            """
+        )
 
     def _setup_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -299,28 +349,8 @@ class FloatingSenderWindow(QWidget):
         # View 1: Expanded Controller Card
         self.card = QFrame()
         self.card.setObjectName("card")
-        self.card.setStyleSheet(
-            """
-            QFrame#card {
-                background-color: #1a1e29;
-                border: 1px solid #333c4d;
-                border-radius: 14px;
-            }
-            QLabel { color: #ffffff; font-family: 'Segoe UI', sans-serif; font-size: 12px; }
-            QLineEdit, QComboBox {
-                background: #262c3b; border: 1px solid #3d475f;
-                color: #ffffff; border-radius: 6px; padding: 5px 8px; font-size: 12px;
-            }
-            QPushButton {
-                background-color: #0078d4; color: white; border: none;
-                border-radius: 6px; font-weight: bold; font-size: 11px; padding: 6px 10px;
-            }
-            QPushButton:hover { background-color: #106ebe; }
-            QCheckBox { color: #8f9bb3; font-size: 11px; }
-            QSlider::groove:horizontal { height: 4px; background: #333c4e; border-radius: 2px; }
-            QSlider::handle:horizontal { background: #00a2ed; width: 12px; margin: -4px 0; border-radius: 6px; }
-        """
-        )
+        self._update_card_style()
+
         self.card_layout = QVBoxLayout(self.card)
         self.card_layout.setContentsMargins(12, 10, 12, 10)
         self.card_layout.setSpacing(8)
@@ -589,6 +619,7 @@ class FloatingSenderWindow(QWidget):
 
     def _update_mini_bar_style(self, override_color: Optional[str] = None):
         color = override_color or self.status_color
+        alpha = self.current_opacity if self.is_mini_mode else 1.0
         self.mini_container.setStyleSheet(
             "QFrame#mini_container { background: transparent; }"
         )
@@ -596,20 +627,20 @@ class FloatingSenderWindow(QWidget):
             f"""
             QFrame#mini_bar {{
                 background-color: {color};
-                border: 1px solid rgba(255, 255, 255, 0.45);
+                border: 1px solid rgba(255, 255, 255, {min(1.0, alpha * 0.7):.2f});
                 border-radius: 2px;
             }}
             QFrame#mini_bar:hover {{
                 background-color: #00a2ed;
                 border: 1px solid #ffffff;
             }}
-        """
+            """
         )
 
     def collapse_to_mini(self):
         self.is_mini_mode = True
         self.stack.setCurrentWidget(self.mini_container)
-        self.setWindowOpacity(0.35)
+        self.apply_opacity(0.35)
         self.setFixedSize(48, 16)
         self.enforce_always_on_top()
 
@@ -620,8 +651,8 @@ class FloatingSenderWindow(QWidget):
         self.setMinimumSize(0, 0)
         self.setMaximumSize(16777215, 16777215)
         self.stack.setCurrentWidget(self.card)
-        if hasattr(self, "opacity_slider"):
-            self.setWindowOpacity(self.opacity_slider.value() / 100.0)
+        op_val = self.opacity_slider.value() if hasattr(self, "opacity_slider") else 94
+        self.apply_opacity(op_val / 100.0)
         self.card.adjustSize()
         self.adjustSize()
         self.enforce_always_on_top()
@@ -693,6 +724,13 @@ class FloatingSenderWindow(QWidget):
             print(f"[DEBUG Sender UI] Sending timer command '{clean_args}' to {target_ip}")
             self.control_thread.send_command({"type": "timer", "args": clean_args})
 
+    def toggle_receiver_viewer(self):
+        """Toggles the remote TV viewing and interactive control session on/off."""
+        if self.viewer_window and self.viewer_window.isVisible():
+            self.close_receiver_viewer()
+        else:
+            self.open_receiver_viewer()
+
     def open_receiver_viewer(self):
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         if not target_ip:
@@ -730,6 +768,15 @@ class FloatingSenderWindow(QWidget):
         self.viewer_window.viewer_closed.connect(self._on_viewer_closed)
         self.viewer_window.show()
 
+    def close_receiver_viewer(self):
+        """Explicitly shuts down the remote viewer window and reverts GUI state."""
+        if self.viewer_window:
+            try:
+                self.viewer_window.close()
+            except Exception:
+                pass
+            self.viewer_window = None
+
     def _on_viewer_closed(self):
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         if target_ip and self.ensure_control_channel(target_ip):
@@ -739,6 +786,14 @@ class FloatingSenderWindow(QWidget):
 
         if self.was_streaming_before_viewing and self.stream_thread:
             self.stream_thread.paused = False
+            self.is_paused = False
+            self.pause_btn.setText("Pause")
+            self.pause_btn.setIcon(svg_to_icon(SVG_PAUSE, 14, "#ffffff"))
+            self.pause_btn.setStyleSheet(
+                "background-color: #0078d4; color: white; font-weight: bold;"
+            )
+            self._update_status_color("#00d084")
+            self._update_audio_pause_state()
 
         self.viewer_window = None
 
@@ -772,7 +827,7 @@ class FloatingSenderWindow(QWidget):
     def on_opacity_changed(self, val: int):
         self.op_val_lbl.setText(f"{val}%")
         if not self.is_mini_mode:
-            self.setWindowOpacity(val / 100.0)
+            self.apply_opacity(val / 100.0)
         self.history_data["opacity"] = val
         save_history(self.history_data)
 
@@ -789,14 +844,14 @@ class FloatingSenderWindow(QWidget):
 
     def enterEvent(self, event):
         if self.is_mini_mode and not self.is_pulsing:
-            self.setWindowOpacity(1.0)
+            self.apply_opacity(1.0)
         self.enforce_always_on_top()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         if self.is_mini_mode and not self.is_pulsing:
-            self.setWindowOpacity(0.35)
-            self.enforce_always_on_top()
+            self.apply_opacity(0.35)
+        self.enforce_always_on_top()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
@@ -807,10 +862,14 @@ class FloatingSenderWindow(QWidget):
             self._is_dragging = False
 
     def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton:
+        if event.buttons() & Qt.LeftButton:
             diff = event.globalPosition().toPoint() - self._drag_start_pos
             if diff.manhattanLength() > 2:
                 self._is_dragging = True
+                wh = self.windowHandle()
+                if wh and hasattr(wh, "startSystemMove"):
+                    if wh.startSystemMove():
+                        return
                 self.move(self._window_start_pos + diff)
                 if self.is_mini_mode:
                     self.enforce_always_on_top()
@@ -854,16 +913,23 @@ class FloatingSenderWindow(QWidget):
                 background: #333c4d;
                 margin: 4px 6px;
             }
-        """
+            """
         )
 
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         has_target = bool(target_ip)
+        is_viewing = bool(self.viewer_window and self.viewer_window.isVisible())
 
-        view_rec_act = QAction("View & Control TV Screen", self)
-        view_rec_act.setIcon(svg_to_icon(SVG_SCREEN, 16, "#00a2ed"))
-        view_rec_act.triggered.connect(self.open_receiver_viewer)
-        view_rec_act.setEnabled(has_target)
+        # Toggleable View & Control TV Screen action
+        if is_viewing:
+            view_rec_act = QAction("Cancel View & Control TV Screen", self)
+            view_rec_act.setIcon(svg_to_icon(SVG_CLOSE, 16, "#ff6b6b"))
+        else:
+            view_rec_act = QAction("View & Control TV Screen", self)
+            view_rec_act.setIcon(svg_to_icon(SVG_SCREEN, 16, "#00a2ed"))
+
+        view_rec_act.triggered.connect(self.toggle_receiver_viewer)
+        view_rec_act.setEnabled(has_target or is_viewing)
         menu.addAction(view_rec_act)
 
         menu.addSeparator()
