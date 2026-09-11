@@ -6,7 +6,7 @@ Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSO
           Reverse Desktop Screen Streaming & Interactive Remote Input (Mouse + Keyboard / Hotkeys),
           Remote Window Management (Maximize, Normal, Minimize),
           Right-Click Context Menu (Run Script, Show Timer, Fullscreen, Standby Details Visibility),
-          Dynamic Audio Playback, Universal Input Injection (pynput/evdev),
+          Dynamic Audio Playback, Native Win32 / Universal Input Injection (pynput/evdev),
           UDP Discovery Beacon, 4-Digit PIN Authentication.
 """
 
@@ -131,7 +131,7 @@ except Exception as e:
     AUDIO_AVAILABLE = False
     logger.warning(f"sounddevice audio unavailable: {e}")
 
-# Universal Input Injection (pynput)
+# Universal Input Injection (pynput fallback)
 try:
     from pynput.keyboard import Controller as KeyboardController, Key
     from pynput.mouse import Button, Controller as MouseController
@@ -232,12 +232,56 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
 
 
 # ---------------------------------------------------------------------------
-# Universal Input Injector
+# Universal Input Injector (Direct Win32 API + pynput / evdev fallback)
 # ---------------------------------------------------------------------------
 
 
 class UniversalInputInjector:
-    SPECIAL_KEYS = {
+    # Win32 Mouse Event Flags
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_RIGHTDOWN = 0x0008
+    MOUSEEVENTF_RIGHTUP = 0x0010
+    MOUSEEVENTF_MIDDLEDOWN = 0x0020
+    MOUSEEVENTF_MIDDLEUP = 0x0040
+    MOUSEEVENTF_WHEEL = 0x0800
+    KEYEVENTF_KEYUP = 0x0002
+
+    WIN32_VK_MAP = {
+        "Return": 0x0D,
+        "Enter": 0x0D,
+        "Backspace": 0x08,
+        "Tab": 0x09,
+        "Escape": 0x1B,
+        "Space": 0x20,
+        "Delete": 0x2E,
+        "Shift": 0x10,
+        "Control": 0x11,
+        "Alt": 0x12,
+        "Meta": 0x5B,
+        "Up": 0x26,
+        "Down": 0x28,
+        "Left": 0x25,
+        "Right": 0x27,
+        "Home": 0x24,
+        "End": 0x23,
+        "Page_Up": 0x21,
+        "Page_Down": 0x22,
+        "F1": 0x70,
+        "F2": 0x71,
+        "F3": 0x72,
+        "F4": 0x73,
+        "F5": 0x74,
+        "F6": 0x75,
+        "F7": 0x76,
+        "F8": 0x77,
+        "F9": 0x78,
+        "F10": 0x79,
+        "F11": 0x7A,
+        "F12": 0x7B,
+    }
+
+    SPECIAL_KEYS_PYNPUT = {
         "Return": Key.enter if PYNPUT_AVAILABLE else None,
         "Enter": Key.enter if PYNPUT_AVAILABLE else None,
         "Backspace": Key.backspace if PYNPUT_AVAILABLE else None,
@@ -271,28 +315,87 @@ class UniversalInputInjector:
         "F12": Key.f12 if PYNPUT_AVAILABLE else None,
     }
 
-    def __init__(self, screen_w: int, screen_h: int):
+    def __init__(self, mon_left: int, mon_top: int, screen_w: int, screen_h: int):
+        self.mon_left = mon_left
+        self.mon_top = mon_top
         self.screen_w = screen_w
         self.screen_h = screen_h
+        self.is_win32 = sys.platform == "win32"
         self.mouse = None
         self.keyboard = None
 
-        if PYNPUT_AVAILABLE:
+        if not self.is_win32 and PYNPUT_AVAILABLE:
             try:
                 self.mouse = MouseController()
                 self.keyboard = KeyboardController()
             except Exception as ex:
                 logger.warning(f"Failed to initialize pynput controller: {ex}")
 
+    def update_geometry(self, mon_left: int, mon_top: int, screen_w: int, screen_h: int):
+        self.mon_left = mon_left
+        self.mon_top = mon_top
+        self.screen_w = screen_w
+        self.screen_h = screen_h
+
     def execute(self, event: dict):
         ev_type = event.get("type")
         nx = event.get("x")
         ny = event.get("y")
 
+        if nx is not None and ny is not None:
+            px = self.mon_left + max(0, min(self.screen_w - 1, int(nx * self.screen_w)))
+            py = self.mon_top + max(0, min(self.screen_h - 1, int(ny * self.screen_h)))
+        else:
+            px, py = None, None
+
+        if self.is_win32:
+            try:
+                if px is not None and py is not None:
+                    ctypes.windll.user32.SetCursorPos(px, py)
+
+                if ev_type in ("touch_down", "mouse_down"):
+                    btn = event.get("button", "left")
+                    if btn == "right":
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+                    elif btn == "middle":
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
+                    else:
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+
+                elif ev_type in ("touch_up", "mouse_up"):
+                    btn = event.get("button", "left")
+                    if btn == "right":
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+                    elif btn == "middle":
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
+                    else:
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+                elif ev_type == "scroll":
+                    dy = event.get("dy", 0)
+                    delta = 120 if dy > 0 else -120
+                    ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+
+                elif ev_type in ("key_down", "key_up"):
+                    key_name = event.get("key", "")
+                    text = event.get("text", "")
+                    vk = self.WIN32_VK_MAP.get(key_name)
+
+                    if not vk and text:
+                        vk_scan = ctypes.windll.user32.VkKeyScanW(ord(text[0]))
+                        if vk_scan != -1:
+                            vk = vk_scan & 0xFF
+
+                    if vk:
+                        flags = 0 if ev_type == "key_down" else self.KEYEVENTF_KEYUP
+                        ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
+                return
+            except Exception as ex:
+                logger.error(f"Win32 input injection exception: {ex}")
+
+        # Linux / Fallback execution
         if self.mouse:
-            if nx is not None and ny is not None:
-                px = max(0, min(self.screen_w - 1, int(nx * self.screen_w)))
-                py = max(0, min(self.screen_h - 1, int(ny * self.screen_h)))
+            if px is not None and py is not None:
                 self.mouse.position = (px, py)
 
             if ev_type in ("touch_down", "mouse_down"):
@@ -311,22 +414,21 @@ class UniversalInputInjector:
                 dy = event.get("dy", 0)
                 self.mouse.scroll(0, 1 if dy > 0 else -1)
 
-        if self.keyboard:
-            if ev_type in ("key_down", "key_up"):
-                key_name = event.get("key", "")
-                text = event.get("text", "")
-                target_key = self.SPECIAL_KEYS.get(key_name)
-                if not target_key and text:
-                    target_key = text
+        if self.keyboard and ev_type in ("key_down", "key_up"):
+            key_name = event.get("key", "")
+            text = event.get("text", "")
+            target_key = self.SPECIAL_KEYS_PYNPUT.get(key_name)
+            if not target_key and text:
+                target_key = text
 
-                if target_key:
-                    try:
-                        if ev_type == "key_down":
-                            self.keyboard.press(target_key)
-                        else:
-                            self.keyboard.release(target_key)
-                    except Exception:
-                        pass
+            if target_key:
+                try:
+                    if ev_type == "key_down":
+                        self.keyboard.press(target_key)
+                    else:
+                        self.keyboard.release(target_key)
+                except Exception:
+                    pass
 
     def close(self):
         pass
@@ -1094,7 +1196,8 @@ class ReceiverMainWindow(QMainWindow):
         with create_mss_instance() as sct:
             mon = sct.monitors[1]
             scr_w, scr_h = mon["width"], mon["height"]
-        self.input_injector = UniversalInputInjector(scr_w, scr_h)
+            mon_l, mon_t = mon["left"], mon["top"]
+        self.input_injector = UniversalInputInjector(mon_l, mon_t, scr_w, scr_h)
 
         self.control_thread = ControlServerThread()
         self.audio_thread = AudioServerThread()
@@ -1186,7 +1289,6 @@ class ReceiverMainWindow(QMainWindow):
         if not target_path:
             return
 
-        # Save selection in JSON config
         self.config["last_script_path"] = target_path
         self.config["last_script_args"] = args_str
         recent = self.config.get("recent_scripts", [])
@@ -1198,7 +1300,6 @@ class ReceiverMainWindow(QMainWindow):
 
         try:
             parsed_args = shlex.split(args_str) if args_str else []
-            # Strip extraneous quotes from each argument
             parsed_args = [arg.strip().strip('"').strip("'") for arg in parsed_args if arg.strip()]
 
             if target_path.lower().endswith(".py"):
@@ -1220,7 +1321,6 @@ class ReceiverMainWindow(QMainWindow):
             logger.error(f"Failed to execute local process '{target_path}': {ex}")
 
     def execute_local_timer(self, args_str: str = ""):
-        # Strip all surrounding quotes so only the raw number/unit string remains
         clean_arg = args_str.strip().strip('"').strip("'").strip()
         self.config["last_timer_args"] = clean_arg
         save_receiver_config(self.config)
@@ -1250,9 +1350,7 @@ class ReceiverMainWindow(QMainWindow):
             else:
                 cmd = [target_bin]
 
-            # Append the single clean argument if provided
             if clean_arg:
-                # Handle space-separated tokens without wrapping in quotes
                 for tok in clean_arg.split():
                     tok_clean = tok.strip().strip('"').strip("'")
                     if tok_clean:
