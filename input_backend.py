@@ -5,6 +5,7 @@ evdev (Linux), and pynput fallback.
 
 import ctypes
 import sys
+import numpy as np
 
 USE_EVDEV = False
 if sys.platform.startswith("linux"):
@@ -32,15 +33,15 @@ class UniversalInputInjector:
     MOUSEEVENTF_WHEEL = 0x0800
 
     def __init__(self, screen_w: int, screen_h: int, mon_left: int = 0, mon_top: int = 0):
-        self.screen_w = screen_w
-        self.screen_h = screen_h
+        self.screen_w = max(1, screen_w)
+        self.screen_h = max(1, screen_h)
         self.mon_left = mon_left
         self.mon_top = mon_top
         self.mode = "none"
 
         if sys.platform == "win32":
             self.mode = "win32"
-            print("[DEBUG Injector] Using native Win32 hardware input injection.")
+            print(f"[DEBUG Injector] Using native Win32 hardware input injection on bounds ({mon_left},{mon_top},{screen_w}x{screen_h}).")
         elif USE_EVDEV:
             try:
                 cap = {
@@ -93,15 +94,15 @@ class UniversalInputInjector:
         ny = event.get("y")
 
         if nx is not None and ny is not None:
-            px = self.mon_left + max(0, min(self.screen_w - 1, int(nx * self.screen_w)))
-            py = self.mon_top + max(0, min(self.screen_h - 1, int(ny * self.screen_h)))
+            px = self.mon_left + int(np.clip(nx, 0.0, 1.0) * (self.screen_w - 1))
+            py = self.mon_top + int(np.clip(ny, 0.0, 1.0) * (self.screen_h - 1))
         else:
             px, py = None, None
 
         if self.mode == "win32":
             try:
                 if px is not None and py is not None:
-                    ctypes.windll.user32.SetCursorPos(px, py)
+                    ctypes.windll.user32.SetCursorPos(int(px), int(py))
                 if ev_type in ("touch_down", "mouse_down"):
                     btn = event.get("button", "left")
                     if btn == "right":
@@ -127,8 +128,8 @@ class UniversalInputInjector:
 
         elif self.mode == "evdev":
             if px is not None and py is not None:
-                self.ui.write(e.EV_ABS, e.ABS_X, px)
-                self.ui.write(e.EV_ABS, e.ABS_Y, py)
+                self.ui.write(e.EV_ABS, e.ABS_X, int(px))
+                self.ui.write(e.EV_ABS, e.ABS_Y, int(py))
             if ev_type in ("touch_down", "mouse_down"):
                 btn = (
                     e.BTN_RIGHT
@@ -174,3 +175,4 @@ class UniversalInputInjector:
                 self.ui.close()
             except Exception:
                 pass
+

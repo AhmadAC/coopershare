@@ -61,8 +61,12 @@ class RemoteReceiverCanvas(QWidget):
             painter.setFont(QFont("Segoe UI", 14))
             painter.drawText(self.rect(), Qt.AlignCenter, "Connecting to TV Screen Stream...")
 
+    def enterEvent(self, event):
+        self.setFocus(Qt.MouseFocusReason)
+        super().enterEvent(event)
+
     def mousePressEvent(self, event: QMouseEvent):
-        self.setFocus()
+        self.setFocus(Qt.MouseFocusReason)
         norm = self._normalize_pos(event.position())
         if norm:
             btn = (
@@ -70,6 +74,7 @@ class RemoteReceiverCanvas(QWidget):
                 if event.button() == Qt.RightButton
                 else ("middle" if event.button() == Qt.MiddleButton else "left")
             )
+            print(f"[DEBUG Viewer Canvas] Mouse Press: {btn} at norm=({norm[0]:.4f}, {norm[1]:.4f})")
             self.send_command_func(
                 {
                     "type": "remote_input",
@@ -103,6 +108,7 @@ class RemoteReceiverCanvas(QWidget):
                 if event.button() == Qt.RightButton
                 else ("middle" if event.button() == Qt.MiddleButton else "left")
             )
+            print(f"[DEBUG Viewer Canvas] Mouse Release: {btn} at norm=({norm[0]:.4f}, {norm[1]:.4f})")
             self.send_command_func(
                 {
                     "type": "remote_input",
@@ -116,63 +122,51 @@ class RemoteReceiverCanvas(QWidget):
             )
 
     def wheelEvent(self, event):
+        dy = event.angleDelta().y()
+        print(f"[DEBUG Viewer Canvas] Mouse Wheel: dy={dy}")
         self.send_command_func(
-            {"type": "remote_input", "event": {"type": "scroll", "dy": event.angleDelta().y()}}
+            {"type": "remote_input", "event": {"type": "scroll", "dy": dy}}
         )
 
     def keyPressEvent(self, event: QKeyEvent):
-        key_name = (
-            event.text()
-            if event.text()
-            and event.key()
-            not in (
-                Qt.Key_Return,
-                Qt.Key_Enter,
-                Qt.Key_Backspace,
-                Qt.Key_Tab,
-                Qt.Key_Escape,
-            )
-            else event.keyCombination().key().name
-        )
+        key_code = event.key()
+        key_name = event.keyCombination().key().name.replace("Key_", "")
+        text = event.text()
+
+        print(f"[DEBUG Viewer Canvas] Key Press: code=0x{key_code:X}, name='{key_name}', text='{text}'")
 
         self.send_command_func(
             {
                 "type": "remote_input",
                 "event": {
                     "type": "key_down",
+                    "key_code": key_code,
                     "key": key_name,
-                    "text": event.text(),
+                    "text": text,
                 },
             }
         )
-        super().keyPressEvent(event)
+        event.accept()
 
     def keyReleaseEvent(self, event: QKeyEvent):
-        key_name = (
-            event.text()
-            if event.text()
-            and event.key()
-            not in (
-                Qt.Key_Return,
-                Qt.Key_Enter,
-                Qt.Key_Backspace,
-                Qt.Key_Tab,
-                Qt.Key_Escape,
-            )
-            else event.keyCombination().key().name
-        )
+        key_code = event.key()
+        key_name = event.keyCombination().key().name.replace("Key_", "")
+        text = event.text()
+
+        print(f"[DEBUG Viewer Canvas] Key Release: code=0x{key_code:X}, name='{key_name}', text='{text}'")
 
         self.send_command_func(
             {
                 "type": "remote_input",
                 "event": {
                     "type": "key_up",
+                    "key_code": key_code,
                     "key": key_name,
-                    "text": event.text(),
+                    "text": text,
                 },
             }
         )
-        super().keyReleaseEvent(event)
+        event.accept()
 
 
 class RemoteReceiverViewerWindow(QMainWindow):

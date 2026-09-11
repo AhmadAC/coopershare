@@ -26,6 +26,16 @@ import threading
 import time
 from typing import Optional
 
+# Enable Per-Monitor High DPI Awareness on Windows early
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 # ---------------------------------------------------------------------------
 # Onedir Dynamic Script Loader
 # ---------------------------------------------------------------------------
@@ -237,7 +247,7 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
 
 
 class UniversalInputInjector:
-    # Win32 Mouse Event Flags
+    # Win32 Mouse & Keyboard Event Flags
     MOUSEEVENTF_LEFTDOWN = 0x0002
     MOUSEEVENTF_LEFTUP = 0x0004
     MOUSEEVENTF_RIGHTDOWN = 0x0008
@@ -245,81 +255,73 @@ class UniversalInputInjector:
     MOUSEEVENTF_MIDDLEDOWN = 0x0020
     MOUSEEVENTF_MIDDLEUP = 0x0040
     MOUSEEVENTF_WHEEL = 0x0800
+    KEYEVENTF_EXTENDEDKEY = 0x0001
     KEYEVENTF_KEYUP = 0x0002
 
-    WIN32_VK_MAP = {
-        "Return": 0x0D,
-        "Enter": 0x0D,
-        "Backspace": 0x08,
-        "Tab": 0x09,
-        "Escape": 0x1B,
-        "Space": 0x20,
-        "Delete": 0x2E,
-        "Shift": 0x10,
-        "Control": 0x11,
-        "Alt": 0x12,
-        "Meta": 0x5B,
-        "Up": 0x26,
-        "Down": 0x28,
-        "Left": 0x25,
-        "Right": 0x27,
-        "Home": 0x24,
-        "End": 0x23,
-        "Page_Up": 0x21,
-        "Page_Down": 0x22,
-        "F1": 0x70,
-        "F2": 0x71,
-        "F3": 0x72,
-        "F4": 0x73,
-        "F5": 0x74,
-        "F6": 0x75,
-        "F7": 0x76,
-        "F8": 0x77,
-        "F9": 0x78,
-        "F10": 0x79,
-        "F11": 0x7A,
-        "F12": 0x7B,
+    # Virtual Key Mappings for Win32
+    QT_KEY_TO_VK = {
+        0x01000000: 0x1B,  # Escape
+        0x01000001: 0x09,  # Tab
+        0x01000002: 0x09,  # Backtab
+        0x01000003: 0x08,  # Backspace
+        0x01000004: 0x0D,  # Return
+        0x01000005: 0x0D,  # Enter
+        0x01000006: 0x2D,  # Insert
+        0x01000007: 0x2E,  # Delete
+        0x01000008: 0x13,  # Pause
+        0x01000009: 0x2A,  # Print
+        0x01000010: 0x24,  # Home
+        0x01000011: 0x23,  # End
+        0x01000012: 0x25,  # Left
+        0x01000013: 0x26,  # Up
+        0x01000014: 0x27,  # Right
+        0x01000015: 0x28,  # Down
+        0x01000016: 0x21,  # PageUp
+        0x01000017: 0x22,  # PageDown
+        0x01000020: 0x10,  # Shift
+        0x01000021: 0x11,  # Control
+        0x01000022: 0x5B,  # Meta / Windows key
+        0x01000023: 0x12,  # Alt
+        0x01000024: 0x14,  # CapsLock
+        0x01000025: 0x90,  # NumLock
+        0x01000026: 0x91,  # ScrollLock
+        0x20: 0x20,        # Space
     }
 
-    SPECIAL_KEYS_PYNPUT = {
-        "Return": Key.enter if PYNPUT_AVAILABLE else None,
-        "Enter": Key.enter if PYNPUT_AVAILABLE else None,
-        "Backspace": Key.backspace if PYNPUT_AVAILABLE else None,
-        "Tab": Key.tab if PYNPUT_AVAILABLE else None,
-        "Escape": Key.esc if PYNPUT_AVAILABLE else None,
-        "Space": Key.space if PYNPUT_AVAILABLE else None,
-        "Delete": Key.delete if PYNPUT_AVAILABLE else None,
-        "Shift": Key.shift if PYNPUT_AVAILABLE else None,
-        "Control": Key.ctrl if PYNPUT_AVAILABLE else None,
-        "Alt": Key.alt if PYNPUT_AVAILABLE else None,
-        "Meta": Key.cmd if PYNPUT_AVAILABLE else None,
-        "Up": Key.up if PYNPUT_AVAILABLE else None,
-        "Down": Key.down if PYNPUT_AVAILABLE else None,
-        "Left": Key.left if PYNPUT_AVAILABLE else None,
-        "Right": Key.right if PYNPUT_AVAILABLE else None,
-        "Home": Key.home if PYNPUT_AVAILABLE else None,
-        "End": Key.end if PYNPUT_AVAILABLE else None,
-        "Page_Up": Key.page_up if PYNPUT_AVAILABLE else None,
-        "Page_Down": Key.page_down if PYNPUT_AVAILABLE else None,
-        "F1": Key.f1 if PYNPUT_AVAILABLE else None,
-        "F2": Key.f2 if PYNPUT_AVAILABLE else None,
-        "F3": Key.f3 if PYNPUT_AVAILABLE else None,
-        "F4": Key.f4 if PYNPUT_AVAILABLE else None,
-        "F5": Key.f5 if PYNPUT_AVAILABLE else None,
-        "F6": Key.f6 if PYNPUT_AVAILABLE else None,
-        "F7": Key.f7 if PYNPUT_AVAILABLE else None,
-        "F8": Key.f8 if PYNPUT_AVAILABLE else None,
-        "F9": Key.f9 if PYNPUT_AVAILABLE else None,
-        "F10": Key.f10 if PYNPUT_AVAILABLE else None,
-        "F11": Key.f11 if PYNPUT_AVAILABLE else None,
-        "F12": Key.f12 if PYNPUT_AVAILABLE else None,
+    # Add F1-F24 function keys
+    for _i in range(1, 25):
+        QT_KEY_TO_VK[0x01000030 + _i - 1] = 0x70 + _i - 1
+
+    NAME_TO_VK = {
+        "return": 0x0D,
+        "enter": 0x0D,
+        "backspace": 0x08,
+        "tab": 0x09,
+        "escape": 0x1B,
+        "space": 0x20,
+        "delete": 0x2E,
+        "shift": 0x10,
+        "control": 0x11,
+        "ctrl": 0x11,
+        "alt": 0x12,
+        "meta": 0x5B,
+        "up": 0x26,
+        "down": 0x28,
+        "left": 0x25,
+        "right": 0x27,
+        "home": 0x24,
+        "end": 0x23,
+        "pageup": 0x21,
+        "page_up": 0x21,
+        "pagedown": 0x22,
+        "page_down": 0x22,
     }
 
     def __init__(self, mon_left: int, mon_top: int, screen_w: int, screen_h: int):
         self.mon_left = mon_left
         self.mon_top = mon_top
-        self.screen_w = screen_w
-        self.screen_h = screen_h
+        self.screen_w = max(1, screen_w)
+        self.screen_h = max(1, screen_h)
         self.is_win32 = sys.platform == "win32"
         self.mouse = None
         self.keyboard = None
@@ -331,11 +333,10 @@ class UniversalInputInjector:
             except Exception as ex:
                 logger.warning(f"Failed to initialize pynput controller: {ex}")
 
-    def update_geometry(self, mon_left: int, mon_top: int, screen_w: int, screen_h: int):
-        self.mon_left = mon_left
-        self.mon_top = mon_top
-        self.screen_w = screen_w
-        self.screen_h = screen_h
+        print(
+            f"[DEBUG Receiver Injector] Initialized injector. Win32={self.is_win32}, "
+            f"Bounds=({self.mon_left},{self.mon_top},{self.screen_w}x{self.screen_h})"
+        )
 
     def execute(self, event: dict):
         ev_type = event.get("type")
@@ -343,15 +344,15 @@ class UniversalInputInjector:
         ny = event.get("y")
 
         if nx is not None and ny is not None:
-            px = self.mon_left + max(0, min(self.screen_w - 1, int(nx * self.screen_w)))
-            py = self.mon_top + max(0, min(self.screen_h - 1, int(ny * self.screen_h)))
+            px = self.mon_left + int(np.clip(nx, 0.0, 1.0) * (self.screen_w - 1))
+            py = self.mon_top + int(np.clip(ny, 0.0, 1.0) * (self.screen_h - 1))
         else:
             px, py = None, None
 
         if self.is_win32:
             try:
                 if px is not None and py is not None:
-                    ctypes.windll.user32.SetCursorPos(px, py)
+                    ctypes.windll.user32.SetCursorPos(int(px), int(py))
 
                 if ev_type in ("touch_down", "mouse_down"):
                     btn = event.get("button", "left")
@@ -361,6 +362,7 @@ class UniversalInputInjector:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
                     else:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                    print(f"[DEBUG Receiver Injector] Win32 Mouse Down: {btn} at ({px}, {py})")
 
                 elif ev_type in ("touch_up", "mouse_up"):
                     btn = event.get("button", "left")
@@ -370,16 +372,25 @@ class UniversalInputInjector:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
                     else:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                    print(f"[DEBUG Receiver Injector] Win32 Mouse Up: {btn} at ({px}, {py})")
 
                 elif ev_type == "scroll":
                     dy = event.get("dy", 0)
                     delta = 120 if dy > 0 else -120
                     ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+                    print(f"[DEBUG Receiver Injector] Win32 Scroll: dy={dy}")
 
                 elif ev_type in ("key_down", "key_up"):
-                    key_name = event.get("key", "")
+                    key_code = event.get("key_code", 0)
+                    key_name = str(event.get("key", "")).lower().replace("key_", "")
                     text = event.get("text", "")
-                    vk = self.WIN32_VK_MAP.get(key_name)
+
+                    vk = self.QT_KEY_TO_VK.get(key_code)
+                    if not vk:
+                        vk = self.NAME_TO_VK.get(key_name)
+
+                    if not vk and 0x20 <= key_code <= 0x7E:
+                        vk = key_code
 
                     if not vk and text:
                         vk_scan = ctypes.windll.user32.VkKeyScanW(ord(text[0]))
@@ -388,12 +399,17 @@ class UniversalInputInjector:
 
                     if vk:
                         flags = 0 if ev_type == "key_down" else self.KEYEVENTF_KEYUP
+                        if vk in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E):
+                            flags |= self.KEYEVENTF_EXTENDEDKEY
                         ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
+                        print(f"[DEBUG Receiver Injector] Win32 Key {ev_type}: vk=0x{vk:02X}, name='{key_name}', text='{text}'")
+                    else:
+                        print(f"[DEBUG Receiver Injector] Win32 Unknown Key: code={key_code}, name='{key_name}', text='{text}'")
                 return
             except Exception as ex:
                 logger.error(f"Win32 input injection exception: {ex}")
 
-        # Linux / Fallback execution
+        # Linux / pynput Fallback
         if self.mouse:
             if px is not None and py is not None:
                 self.mouse.position = (px, py)
@@ -415,12 +431,9 @@ class UniversalInputInjector:
                 self.mouse.scroll(0, 1 if dy > 0 else -1)
 
         if self.keyboard and ev_type in ("key_down", "key_up"):
-            key_name = event.get("key", "")
             text = event.get("text", "")
-            target_key = self.SPECIAL_KEYS_PYNPUT.get(key_name)
-            if not target_key and text:
-                target_key = text
-
+            key_name = str(event.get("key", "")).lower().replace("key_", "")
+            target_key = text if text else key_name
             if target_key:
                 try:
                     if ev_type == "key_down":
@@ -842,6 +855,7 @@ class ReverseVideoServerThread(QThread):
             except Exception:
                 break
 
+            print(f"[DEBUG Receiver Reverse Video] Stream client connected from {addr[0]}")
             self._stream_to_viewer(conn)
 
         if self.server_sock:
@@ -995,8 +1009,10 @@ class ControlServerThread(QThread):
         self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_sock.bind(("0.0.0.0", self.port))
-        self.server_sock.listen(1)
+        self.server_sock.listen(5)
         self.server_sock.settimeout(0.5)
+
+        print(f"[DEBUG Receiver Control] Listening for control channel on port {self.port}...")
 
         while self.running:
             try:
@@ -1005,6 +1021,7 @@ class ControlServerThread(QThread):
                 conn.settimeout(0.5)
                 with self._send_lock:
                     self.client_conn = conn
+                print(f"[DEBUG Receiver Control] Control client connected from {addr[0]}")
             except socket.timeout:
                 continue
             except Exception:
@@ -1015,48 +1032,36 @@ class ControlServerThread(QThread):
 
             while self.running and self.client_conn:
                 try:
-                    while len(data) < payload_size:
-                        if not self.running:
+                    try:
+                        packet = conn.recv(4096)
+                        if not packet:
+                            print("[DEBUG Receiver Control] Client closed control connection.")
                             break
-                        try:
-                            packet = conn.recv(2048)
-                            if not packet:
-                                raise ConnectionResetError
-                            data.extend(packet)
-                        except socket.timeout:
-                            continue
+                        data.extend(packet)
+                    except socket.timeout:
+                        pass
+                    except (BlockingIOError, InterruptedError):
+                        continue
 
-                    if not self.running:
-                        break
-
-                    packed_size = data[:payload_size]
-                    data = data[payload_size:]
-                    msg_size = struct.unpack(">L", packed_size)[0]
-
-                    while len(data) < msg_size:
-                        if not self.running:
+                    while len(data) >= payload_size:
+                        msg_size = struct.unpack(">L", data[:payload_size])[0]
+                        if len(data) < payload_size + msg_size:
                             break
+
+                        raw_msg = data[payload_size : payload_size + msg_size]
+                        data = data[payload_size + msg_size :]
+
                         try:
-                            packet = conn.recv(min(msg_size - len(data), 4096))
-                            if not packet:
-                                raise ConnectionResetError
-                            data.extend(packet)
-                        except socket.timeout:
-                            continue
+                            msg_obj = json.loads(raw_msg.decode("utf-8"))
+                            self.command_received.emit(msg_obj)
+                        except Exception as decode_err:
+                            print(f"[DEBUG Receiver Control] JSON decode error: {decode_err}")
 
-                    if not self.running:
-                        break
-
-                    raw_msg = data[:msg_size]
-                    data = data[msg_size:]
-                    msg_obj = json.loads(raw_msg.decode("utf-8"))
-                    self.command_received.emit(msg_obj)
-
-                except (socket.timeout, BlockingIOError):
-                    continue
                 except ConnectionResetError:
+                    print("[DEBUG Receiver Control] Client connection reset.")
                     break
-                except Exception:
+                except Exception as ex:
+                    print(f"[DEBUG Receiver Control] Exception in control loop: {ex}")
                     break
 
             with self._send_lock:

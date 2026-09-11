@@ -1,3 +1,4 @@
+
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 """
@@ -333,8 +334,27 @@ class InputReceiverThread(QThread):
         self.sock: Optional[socket.socket] = None
         self._send_lock = threading.Lock()
 
+    def _ensure_socket_connected(self) -> bool:
+        with self._send_lock:
+            if self.sock:
+                return True
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(3.0)
+                sock.connect((self.target_ip, CONTROL_PORT))
+                sock.settimeout(0.5)
+                self.sock = sock
+                print(f"[DEBUG Sender Control] Reconnected control socket to {self.target_ip}:{CONTROL_PORT}")
+                return True
+            except Exception as e:
+                print(f"[DEBUG Sender Control] Control socket connect failed: {e}")
+                return False
+
     def send_command(self, cmd: dict):
-        """Transmits remote input / control packets to the receiver display."""
+        """Transmits remote input / control packets to the receiver display with auto-reconnection."""
+        if not self._ensure_socket_connected():
+            return
         with self._send_lock:
             if self.sock:
                 try:
@@ -342,21 +362,15 @@ class InputReceiverThread(QThread):
                     self.sock.sendall(struct.pack(">L", len(data)) + data)
                 except Exception as e:
                     print(f"[DEBUG Sender Control] Failed to transmit command: {e}")
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
 
     def run(self):
         print(f"[DEBUG Sender Control] Connecting to {self.target_ip}:{CONTROL_PORT}...")
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(3.0)
-            sock.connect((self.target_ip, CONTROL_PORT))
-            sock.settimeout(0.5)
-            with self._send_lock:
-                self.sock = sock
-            print("[DEBUG Sender Control] Control channel connected.")
-        except Exception as e:
-            print(f"[DEBUG Sender Control] Control channel connection failed: {e}")
-            return
+        self._ensure_socket_connected()
 
         with create_mss_instance() as sct:
             mon = sct.monitors[1]
@@ -368,59 +382,64 @@ class InputReceiverThread(QThread):
         data = bytearray()
 
         while self.running:
+            if not self.sock:
+                if not self._ensure_socket_connected():
+                    self.msleep(500)
+                    continue
+
             try:
-                while len(data) < payload_size:
-                    if not self.running:
-                        break
-                    try:
-                        packet = sock.recv(2048)
-                        if not packet:
-                            raise ConnectionResetError
-                        data.extend(packet)
-                    except socket.timeout:
-                        continue
-
-                if not self.running:
-                    break
-
-                packed_size = data[:payload_size]
-                data = data[payload_size:]
-                msg_size = struct.unpack(">L", packed_size)[0]
-
-                while len(data) < msg_size:
-                    if not self.running:
-                        break
-                    try:
-                        packet = sock.recv(min(msg_size - len(data), 4096))
-                        if not packet:
-                            raise ConnectionResetError
-                        data.extend(packet)
-                    except socket.timeout:
-                        continue
-
-                if not self.running:
-                    break
-
-                raw_msg = data[:msg_size]
-                data = data[msg_size:]
-                event = json.loads(raw_msg.decode("utf-8"))
-
-                if self.is_input_enabled_func():
-                    injector.execute(event)
-            except ConnectionResetError:
-                break
-            except Exception as e:
+                packet = self.sock.recv(2048)
+                if not packet:
+                    print("[DEBUG Sender Control] Connection closed by receiver.")
+                    with self._send_lock:
+                        try:
+                            self.sock.close()
+                        except Exception:
+                            pass
+                        self.sock = None
+                    self.msleep(300)
+                    continue
+                data.extend(packet)
+            except socket.timeout:
+                continue
+            except (BlockingIOError, InterruptedError):
+                continue
+            except Exception as ex:
                 if self.running:
-                    print(f"[DEBUG Sender Control] Input processing error: {e}")
-                break
+                    print(f"[DEBUG Sender Control] Socket read notice: {ex}")
+                with self._send_lock:
+                    try:
+                        if self.sock:
+                            self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+                self.msleep(300)
+                continue
+
+            while len(data) >= payload_size:
+                msg_size = struct.unpack(">L", data[:payload_size])[0]
+                if len(data) < payload_size + msg_size:
+                    break
+
+                raw_msg = data[payload_size : payload_size + msg_size]
+                data = data[payload_size + msg_size :]
+
+                try:
+                    event = json.loads(raw_msg.decode("utf-8"))
+                    if self.is_input_enabled_func():
+                        injector.execute(event)
+                except Exception as ex:
+                    print(f"[DEBUG Sender Control] Event execution error: {ex}")
 
         injector.close()
         with self._send_lock:
             try:
-                sock.close()
+                if self.sock:
+                    self.sock.close()
             except Exception:
                 pass
-                self.sock = None
+            self.sock = None
         print("[DEBUG Sender Control] Input receiver thread stopped.")
 
     def stop(self):

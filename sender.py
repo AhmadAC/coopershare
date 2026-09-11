@@ -1,3 +1,5 @@
+
+
 """
 MrCoopersScreenShare - Sender (PC Presenter & Remote Controller)
 Main executable launcher and bootstrap script.
@@ -7,6 +9,16 @@ import ctypes
 import os
 import runpy
 import sys
+
+# Enable Per-Monitor High DPI Awareness on Windows early
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 from PySide6.QtWidgets import QApplication
 
