@@ -1,12 +1,13 @@
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 Supports native Windows WASAPI loopback, KDE Plasma 6 KWin D-Bus ScreenShot2 kernel pipe capture,
-KDE Spectacle fallback, and MSS hardware capture.
+pipelined asynchronous streaming, KDE Spectacle fallback, and MSS hardware capture.
 """
 
 import fcntl
 import json
 import os
+import queue
 import shutil
 import socket
 import struct
@@ -149,13 +150,14 @@ class KWinScreenShot2Grabber:
         self.iface = None
         self.expected_w = 1920
         self.expected_h = 1080
+        self.dpr = 1.0
         self.pipe_reader = PersistentPipeReader()
 
         screen = QGuiApplication.primaryScreen()
         if screen:
-            dpr = screen.devicePixelRatio()
-            self.expected_w = int(round(screen.size().width() * dpr))
-            self.expected_h = int(round(screen.size().height() * dpr))
+            self.dpr = float(screen.devicePixelRatio())
+            self.expected_w = int(round(screen.size().width() * self.dpr))
+            self.expected_h = int(round(screen.size().height() * self.dpr))
 
         if not sys.platform.startswith("linux"):
             return
@@ -182,9 +184,6 @@ class KWinScreenShot2Grabber:
                         )
                         break
                     else:
-                        print(
-                            f"[DEBUG Screen Capturer] KWin ScreenShot2 probe attempt {attempt + 1} did not return frame."
-                        )
                         if attempt == 0:
                             ensure_kde_desktop_entry(force=True)
                             time.sleep(0.3)
@@ -197,7 +196,7 @@ class KWinScreenShot2Grabber:
             print(f"[DEBUG Screen Capturer] KWin ScreenShot2 probe error: {e}")
             self.available = False
 
-    def grab(self, include_cursor: bool = True, init_timeout: float = 0.2) -> Optional[np.ndarray]:
+    def grab(self, include_cursor: bool = False, init_timeout: float = 0.2) -> Optional[np.ndarray]:
         if not self.iface:
             return None
         r_fd, w_fd = -1, -1
@@ -224,7 +223,7 @@ class KWinScreenShot2Grabber:
             reply = self.iface.call("CaptureActiveScreen", options, q_fd)
             os.close(w_fd)
             w_fd = -1
-            q_fd = None  # Crucial: Drop internal dup(2) handle so writer pipe closes cleanly
+            q_fd = None
 
             if _is_dbus_error(reply) or not reply.arguments():
                 err_msg = reply.errorMessage() if reply.errorMessage() else "No arguments"
@@ -466,6 +465,10 @@ class ScreenSenderThread(QThread):
         self.paused = False
         self.send_cursorless_frame_once = False
 
+        # Async producer-consumer frame pipeline
+        self.frame_queue = queue.Queue(maxsize=1)
+        self.pipeline_running = False
+
     def set_fps_limit(self, fps: int):
         self.fps_limit = max(1, fps)
         print(f"[DEBUG Sender Video] Dynamic framerate adjusted to: {self.fps_limit} FPS")
@@ -479,6 +482,78 @@ class ScreenSenderThread(QThread):
 
     def trigger_cursorless_frame(self):
         self.send_cursorless_frame_once = True
+
+    def _encoder_network_worker(self, sock: socket.socket):
+        """Dedicated concurrent worker for parallel JPEG encoding and socket transmission."""
+        fps_frame_counter = 0
+        fps_last_report_time = time.perf_counter()
+        total_capture_dur = 0.0
+        total_encode_dur = 0.0
+        total_send_dur = 0.0
+
+        while self.pipeline_running:
+            try:
+                item = self.frame_queue.get(timeout=0.04)
+            except queue.Empty:
+                continue
+
+            frame_raw, t_cap_ms = item
+
+            # Fast Concurrent Encoding
+            t_enc_start = time.perf_counter()
+            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+
+            if self.use_444_chroma:
+                sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
+                sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
+                encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+
+            try:
+                success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
+            except Exception:
+                if frame_raw.shape[2] == 4:
+                    frame_raw = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
+                success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
+
+            data = enc_img.tobytes() if success else None
+            t_enc_end = time.perf_counter()
+
+            # Concurrent Network Transmission
+            t_send_start = time.perf_counter()
+            if data and self.pipeline_running:
+                try:
+                    sock.sendall(struct.pack(">L", len(data)) + data)
+                except Exception:
+                    self.pipeline_running = False
+                    break
+            t_send_end = time.perf_counter()
+
+            # Telemetry Tracking
+            fps_frame_counter += 1
+            total_capture_dur += t_cap_ms
+            total_encode_dur += (t_enc_end - t_enc_start) * 1000.0
+            total_send_dur += (t_send_end - t_send_start) * 1000.0
+
+            now = time.perf_counter()
+            if now - fps_last_report_time >= 1.0:
+                elapsed_report = now - fps_last_report_time
+                measured_fps = fps_frame_counter / elapsed_report
+                avg_cap_ms = total_capture_dur / fps_frame_counter
+                avg_enc_ms = total_encode_dur / fps_frame_counter
+                avg_send_ms = total_send_dur / fps_frame_counter
+                avg_cycle_ms = 1000.0 / measured_fps if measured_fps > 0 else 0.0
+
+                print(
+                    f"[DEBUG Sender Video] Live: {measured_fps:5.1f} FPS "
+                    f"(Target: {self.fps_limit} FPS | Cycle: {avg_cycle_ms:4.1f}ms "
+                    f"[Cap: {avg_cap_ms:4.1f}ms, Enc: {avg_enc_ms:4.1f}ms, Net: {avg_send_ms:4.1f}ms])"
+                )
+
+                fps_frame_counter = 0
+                total_capture_dur = 0.0
+                total_encode_dur = 0.0
+                total_send_dur = 0.0
+                fps_last_report_time = now
 
     def run(self):
         print(
@@ -538,18 +613,22 @@ class ScreenSenderThread(QThread):
             spectacle_grabber = SpectacleGrabber()
             use_spectacle = spectacle_grabber.available
 
-        fps_frame_counter = 0
-        fps_last_report_time = time.perf_counter()
-        total_capture_dur = 0.0
-        total_encode_dur = 0.0
-        total_send_dur = 0.0
+        # Spin up parallel encoder/transmitter worker
+        self.pipeline_running = True
+        encoder_worker_thread = threading.Thread(
+            target=self._encoder_network_worker, args=(sock,), daemon=True
+        )
+        encoder_worker_thread.start()
+
+        screen = QGuiApplication.primaryScreen()
+        screen_dpr = float(screen.devicePixelRatio()) if screen else 1.0
 
         with create_mss_instance() as sct:
             monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             mon_left = monitor.get("left", 0)
             mon_top = monitor.get("top", 0)
 
-            while self.running:
+            while self.running and self.pipeline_running:
                 if self.paused and not self.send_cursorless_frame_once:
                     time.sleep(0.04)
                     continue
@@ -557,105 +636,81 @@ class ScreenSenderThread(QThread):
                 t_frame_start = time.perf_counter()
 
                 try:
-                    data = None
                     t_cap_start = time.perf_counter()
 
                     if use_kwin:
-                        frame_raw = kwin_grabber.grab(
-                            include_cursor=(not self.paused and not self.send_cursorless_frame_once)
-                        )
+                        frame_raw = kwin_grabber.grab(include_cursor=False)
+                        if frame_raw is not None and not self.paused and not self.send_cursorless_frame_once:
+                            # Stamped with DPR scaling factor so cursor appears accurately on the TV
+                            render_cursor_on_frame(
+                                frame_raw,
+                                monitor_left=mon_left,
+                                monitor_top=mon_top,
+                                scale_factor=screen_dpr,
+                            )
                     elif use_spectacle and spectacle_grabber:
                         frame_raw = spectacle_grabber.grab()
                         if frame_raw is not None and not self.paused and not self.send_cursorless_frame_once:
-                            render_cursor_on_frame(frame_raw, mon_left, mon_top)
+                            render_cursor_on_frame(
+                                frame_raw,
+                                monitor_left=mon_left,
+                                monitor_top=mon_top,
+                                scale_factor=screen_dpr,
+                            )
                     elif not is_wayland:
                         raw_frame = sct.grab(monitor)
                         img = np.array(raw_frame)
                         frame_raw = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                         if not self.paused and not self.send_cursorless_frame_once:
-                            render_cursor_on_frame(frame_raw, mon_left, mon_top)
+                            render_cursor_on_frame(
+                                frame_raw,
+                                monitor_left=mon_left,
+                                monitor_top=mon_top,
+                                scale_factor=screen_dpr,
+                            )
                     else:
                         frame_raw = None
 
                     t_cap_end = time.perf_counter()
+                    cap_ms = (t_cap_end - t_cap_start) * 1000.0
 
                     if frame_raw is None:
                         if is_wayland:
-                            time.sleep(0.005)
+                            time.sleep(0.002)
                         continue
-
-                    # Fast JPEG encoding
-                    t_enc_start = time.perf_counter()
-                    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-
-                    if self.use_444_chroma:
-                        sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
-                        sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
-                        encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
-
-                    try:
-                        success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
-                    except Exception:
-                        if frame_raw.shape[2] == 4:
-                            frame_raw = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
-                        success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
-
-                    if success:
-                        data = enc_img.tobytes()
-                    t_enc_end = time.perf_counter()
-
-                    # Network transmission
-                    t_send_start = time.perf_counter()
-                    if data:
-                        sock.sendall(struct.pack(">L", len(data)) + data)
-                    t_send_end = time.perf_counter()
 
                     if self.send_cursorless_frame_once:
                         self.send_cursorless_frame_once = False
 
-                    fps_frame_counter += 1
-                    total_capture_dur += (t_cap_end - t_cap_start)
-                    total_encode_dur += (t_enc_end - t_enc_start)
-                    total_send_dur += (t_send_end - t_send_start)
+                    # Push frame directly into the parallel encode queue; drop stale frame if backlog occurs
+                    if self.frame_queue.full():
+                        try:
+                            self.frame_queue.get_nowait()
+                        except queue.Empty:
+                            pass
 
-                    now = time.perf_counter()
-                    if now - fps_last_report_time >= 1.0:
-                        elapsed_report = now - fps_last_report_time
-                        measured_fps = fps_frame_counter / elapsed_report
-                        avg_cap_ms = (total_capture_dur / fps_frame_counter) * 1000.0
-                        avg_enc_ms = (total_encode_dur / fps_frame_counter) * 1000.0
-                        avg_send_ms = (total_send_dur / fps_frame_counter) * 1000.0
-                        avg_total_ms = avg_cap_ms + avg_enc_ms + avg_send_ms
-
-                        print(
-                            f"[DEBUG Sender Video] Live: {measured_fps:5.1f} FPS "
-                            f"(Target: {self.fps_limit} FPS | Total: {avg_total_ms:4.1f}ms "
-                            f"[Cap: {avg_cap_ms:4.1f}ms, Enc: {avg_enc_ms:4.1f}ms, Net: {avg_send_ms:4.1f}ms])"
-                        )
-
-                        fps_frame_counter = 0
-                        total_capture_dur = 0.0
-                        total_encode_dur = 0.0
-                        total_send_dur = 0.0
-                        fps_last_report_time = now
+                    self.frame_queue.put_nowait((frame_raw, cap_ms))
 
                 except (socket.error, BrokenPipeError, ConnectionResetError) as e:
                     print(f"[DEBUG Sender Video] Network socket disconnected: {e}")
                     break
                 except subprocess.TimeoutExpired:
-                    time.sleep(0.005)
+                    time.sleep(0.002)
                     continue
                 except Exception as e:
                     print(f"[DEBUG Sender Video] Frame capture notice: {e}")
-                    time.sleep(0.005)
+                    time.sleep(0.002)
                     continue
 
-                # Frame pacing
+                # Precise clock pacing
                 frame_elapsed = time.perf_counter() - t_frame_start
                 target_frame_time = 1.0 / max(1, self.fps_limit)
                 sleep_sec = target_frame_time - frame_elapsed
                 if sleep_sec > 0.001:
                     time.sleep(sleep_sec)
+
+        self.pipeline_running = False
+        encoder_worker_thread.join(timeout=0.5)
 
         if kwin_grabber:
             kwin_grabber.cleanup()
@@ -672,6 +727,7 @@ class ScreenSenderThread(QThread):
 
     def stop(self):
         self.running = False
+        self.pipeline_running = False
         self.wait(1000)
 
 
