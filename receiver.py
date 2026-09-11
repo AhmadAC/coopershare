@@ -1,4 +1,3 @@
-
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
 Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSON History Memory,
@@ -711,7 +710,7 @@ class DiscoveryBeaconThread(QThread):
         while self.running:
             try:
                 local_ip = get_local_ip()
-                pin_req = self.get_pin_req_func()
+                pin_req = bool(self.get_pin_req_func())
                 payload = json.dumps(
                     {"service": "MrCoopersScreenShare", "ip": local_ip, "pin_required": pin_req}
                 ).encode("utf-8")
@@ -791,7 +790,7 @@ class VideoServerThread(QThread):
                 return False
 
             data = json.loads(raw_payload.decode("utf-8"))
-            pin_req = self.get_pin_req_func()
+            pin_req = bool(self.get_pin_req_func())
             client_pin = str(data.get("pin", "")).strip()
             server_pin = str(self.get_pin_func()).strip()
 
@@ -1260,12 +1259,17 @@ class ReceiverMainWindow(QMainWindow):
         self.config = load_receiver_config()
         self.hide_details = self.config.get("hide_details", False)
         self.pin = f"{random.randint(1000, 9999)}"
+        self._pin_required = False
+        self.pin_req_cb: Optional[QCheckBox] = None
 
         with create_mss_instance() as sct:
             mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             scr_w, scr_h = mon["width"], mon["height"]
             mon_l, mon_t = mon["left"], mon["top"]
         self.input_injector = UniversalInputInjector(mon_l, mon_t, scr_w, scr_h)
+
+        self._setup_ui()
+        self._apply_details_visibility()
 
         self.control_thread = ControlServerThread()
         self.audio_thread = AudioServerThread()
@@ -1277,10 +1281,6 @@ class ReceiverMainWindow(QMainWindow):
         self.video_thread.client_connected.connect(self.on_connected)
         self.video_thread.client_disconnected.connect(self.on_disconnected)
         self.control_thread.command_received.connect(self.on_control_command)
-
-        # Set up UI before starting network threads so callbacks can safely access pin_req_cb
-        self._setup_ui()
-        self._apply_details_visibility()
 
         for th in (
             self.control_thread,
@@ -1295,9 +1295,12 @@ class ReceiverMainWindow(QMainWindow):
         return self.pin
 
     def is_pin_required(self) -> bool:
-        if hasattr(self, "pin_req_cb") and self.pin_req_cb is not None:
+        if self.pin_req_cb is not None:
             return self.pin_req_cb.isChecked()
-        return False
+        return self._pin_required
+
+    def _on_pin_req_toggled(self, checked: bool):
+        self._pin_required = checked
 
     def _setup_ui(self):
         self.stack = QStackedWidget()
@@ -1329,6 +1332,7 @@ class ReceiverMainWindow(QMainWindow):
         self.pin_req_cb = QCheckBox("Require 4-digit PIN to Connect")
         self.pin_req_cb.setChecked(False)
         self.pin_req_cb.setStyleSheet("color: #8f9bb3; font-size: 15px; margin-top: 10px;")
+        self.pin_req_cb.toggled.connect(self._on_pin_req_toggled)
 
         self.hint_lbl = QLabel("Right-click anywhere for menu  |  Press ESC / F11 to toggle fullscreen")
         self.hint_lbl.setStyleSheet("color: #4b5568; font-size: 13px; margin-top: 20px;")
@@ -1341,7 +1345,8 @@ class ReceiverMainWindow(QMainWindow):
 
         sb_layout.addWidget(self.details_container, alignment=Qt.AlignCenter)
 
-        self.canvas = TouchDisplayCanvas(self.control_thread)
+        self.control_thread_dummy = ControlServerThread()
+        self.canvas = TouchDisplayCanvas(self.control_thread_dummy)
         self.stack.addWidget(self.standby)
         self.stack.addWidget(self.canvas)
 

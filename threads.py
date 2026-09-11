@@ -82,33 +82,35 @@ def _extract_dict_from_dbus_meta(meta_raw) -> dict:
     return {}
 
 
-class PersistentPipeReader:
-    """High-speed persistent worker that reads exact frame payloads into a decoupled buffer."""
+class FastPipeReader:
+    """High-speed zero-copy double-buffered worker that reads exact frame payloads from Linux kernel pipe."""
 
     def __init__(self, initial_capacity: int = 1920 * 1080 * 4 + 131072):
-        self.buf = bytearray(initial_capacity)
+        self.buffers = [bytearray(initial_capacity), bytearray(initial_capacity)]
+        self.buf_idx = 0
         self.bytes_read = 0
         self.expected_size = 0
         self.fd = -1
         self.start_evt = threading.Event()
         self.done_evt = threading.Event()
         self.running = True
-        self.worker = threading.Thread(target=self._run, name="KWinPipeWorker", daemon=True)
+        self.worker = threading.Thread(target=self._run, name="FastPipeWorker", daemon=True)
         self.worker.start()
 
     def start_read(self, fd: int, expected_size: int = 0):
         self.fd = fd
         self.expected_size = expected_size
         self.bytes_read = 0
+        self.buf_idx = 1 - self.buf_idx
         self.done_evt.clear()
         self.start_evt.set()
 
-    def wait_read(self, timeout: float = 0.5) -> Optional[bytes]:
+    def wait_read(self, timeout: float = 0.5) -> Optional[memoryview]:
         signaled = self.done_evt.wait(timeout)
         if not signaled or self.bytes_read <= 0:
             return None
-        # Return an isolated copy so the capture thread can immediately read the next frame
-        return bytes(self.buf[: self.bytes_read])
+        buf = self.buffers[self.buf_idx]
+        return memoryview(buf)[: self.bytes_read]
 
     def _run(self):
         while self.running:
@@ -119,23 +121,22 @@ class PersistentPipeReader:
 
             fd = self.fd
             expected = self.expected_size
+            buf = self.buffers[self.buf_idx]
+            if expected > len(buf):
+                buf.extend(b"\x00" * (expected - len(buf) + 131072))
+            mv = memoryview(buf)
             offset = 0
 
-            while True:
-                try:
-                    to_read = min(262144, expected - offset) if expected > 0 else 262144
-                    chunk = os.read(fd, to_read)
-                    if not chunk:
-                        break
-                    chunk_len = len(chunk)
-                    if offset + chunk_len > len(self.buf):
-                        self.buf.extend(b"\x00" * (offset + chunk_len - len(self.buf) + 1048576))
-                    self.buf[offset : offset + chunk_len] = chunk
-                    offset += chunk_len
-                    if expected > 0 and offset >= expected:
-                        break
-                except Exception:
-                    break
+            try:
+                with open(fd, "rb", buffering=0, closefd=False) as f:
+                    while expected <= 0 or offset < expected:
+                        chunk_size = min(1048576, expected - offset) if expected > 0 else 1048576
+                        n = f.readinto(mv[offset : offset + chunk_size])
+                        if not n:
+                            break
+                        offset += n
+            except Exception:
+                pass
 
             self.bytes_read = offset
             self.done_evt.set()
@@ -156,7 +157,7 @@ class KWinScreenShot2Grabber:
         self.logical_w = 1536
         self.logical_h = 864
         self.dpr = 1.0
-        self.pipe_reader = PersistentPipeReader()
+        self.pipe_reader = FastPipeReader()
 
         screen = QGuiApplication.primaryScreen()
         if screen:
@@ -270,14 +271,14 @@ class KWinScreenShot2Grabber:
             else:
                 meta_raw = reply.arguments()[0]
 
-            raw_bytes = self.pipe_reader.wait_read(timeout=init_timeout)
+            raw_mv = self.pipe_reader.wait_read(timeout=init_timeout)
             os.close(r_fd)
             r_fd = -1
 
-            if not raw_bytes:
+            if not raw_mv:
                 return None
 
-            total_pixels = len(raw_bytes) // 4
+            total_pixels = len(raw_mv) // 4
             if total_pixels <= 0:
                 return None
 
@@ -299,13 +300,13 @@ class KWinScreenShot2Grabber:
                 width = int(round(height * aspect))
 
             stride = width * 4
-            if len(raw_bytes) < stride * height:
+            total_expected_bytes = stride * height
+            if len(raw_mv) < total_expected_bytes:
                 return None
 
-            # Raw memory parsing and instant conversion to standard 3-channel BGR
-            arr = np.frombuffer(raw_bytes[: stride * height], dtype=np.uint8).reshape((height, width, 4))
-            bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-            return bgr
+            # Instant zero-copy memory wrap of raw 4-channel BGRA frame
+            arr = np.frombuffer(raw_mv, dtype=np.uint8, count=total_expected_bytes).reshape((height, width, 4))
+            return arr
 
         except Exception as ex:
             print(f"[DEBUG Screen Capturer] KWin ScreenShot2 grab exception: {ex}")
@@ -461,9 +462,9 @@ class ScreenSenderThread(QThread):
         self,
         target_ip: str,
         pin: str = "",
-        quality: int = 98,
+        quality: int = 92,
         fps_limit: int = 60,
-        use_444_chroma: bool = True,
+        use_444_chroma: bool = False,
     ):
         super().__init__()
         self.target_ip = target_ip
@@ -507,10 +508,16 @@ class ScreenSenderThread(QThread):
             except queue.Empty:
                 continue
 
-            frame_bgr, t_cap_ms = item
+            frame_raw, t_cap_ms = item
 
-            # Instant 3-channel encoding with zero exception overhead
             t_enc_start = time.perf_counter()
+
+            # Offload BGRA -> BGR conversion to encoder thread
+            if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
+                frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
+            else:
+                frame_bgr = frame_raw
+
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
             if self.use_444_chroma:
@@ -643,19 +650,17 @@ class ScreenSenderThread(QThread):
                     t_cap_start = time.perf_counter()
 
                     if use_kwin:
-                        # Full physical resolution when >= 95%, high-speed logical resolution when Balanced for 60 FPS
                         use_native_res = bool(self.quality >= 95)
                         want_cursor = not (self.paused or self.send_cursorless_frame_once)
-                        # KWin draws the real system cursor directly into the framebuffer
-                        frame_bgr = kwin_grabber.grab(
+                        frame_raw = kwin_grabber.grab(
                             include_cursor=want_cursor,
                             native_resolution=use_native_res,
                         )
                     elif use_spectacle and spectacle_grabber:
-                        frame_bgr = spectacle_grabber.grab()
-                        if frame_bgr is not None and not (self.paused or self.send_cursorless_frame_once):
+                        frame_raw = spectacle_grabber.grab()
+                        if frame_raw is not None and not (self.paused or self.send_cursorless_frame_once):
                             render_cursor_on_frame(
-                                frame_bgr,
+                                frame_raw,
                                 monitor_left=mon_left,
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
@@ -663,21 +668,21 @@ class ScreenSenderThread(QThread):
                     elif not is_wayland:
                         raw_frame = sct.grab(monitor)
                         img = np.array(raw_frame)
-                        frame_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                        frame_raw = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                         if not (self.paused or self.send_cursorless_frame_once):
                             render_cursor_on_frame(
-                                frame_bgr,
+                                frame_raw,
                                 monitor_left=mon_left,
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
                             )
                     else:
-                        frame_bgr = None
+                        frame_raw = None
 
                     t_cap_end = time.perf_counter()
                     cap_ms = (t_cap_end - t_cap_start) * 1000.0
 
-                    if frame_bgr is None:
+                    if frame_raw is None:
                         if is_wayland:
                             time.sleep(0.002)
                         continue
@@ -692,7 +697,7 @@ class ScreenSenderThread(QThread):
                         except queue.Empty:
                             pass
 
-                    self.frame_queue.put_nowait((frame_bgr, cap_ms))
+                    self.frame_queue.put_nowait((frame_raw, cap_ms))
 
                 except (socket.error, BrokenPipeError, ConnectionResetError) as e:
                     print(f"[DEBUG Sender Video] Network socket disconnected: {e}")
