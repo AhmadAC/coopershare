@@ -81,12 +81,66 @@ def _extract_dict_from_dbus_meta(meta_raw) -> dict:
     return {}
 
 
+class PersistentPipeReader:
+    """High-speed persistent worker that consumes the KWin pipe into pre-allocated memory without thread overhead."""
+
+    def __init__(self, initial_capacity: int = 1920 * 1080 * 4 + 131072):
+        self.buf = bytearray(initial_capacity)
+        self.bytes_read = 0
+        self.fd = -1
+        self.start_evt = threading.Event()
+        self.done_evt = threading.Event()
+        self.running = True
+        self.worker = threading.Thread(target=self._run, name="KWinPipeWorker", daemon=True)
+        self.worker.start()
+
+    def start_read(self, fd: int):
+        self.fd = fd
+        self.bytes_read = 0
+        self.done_evt.clear()
+        self.start_evt.set()
+
+    def wait_read(self, timeout: float = 0.5) -> memoryview:
+        self.done_evt.wait(timeout)
+        return memoryview(self.buf)[: self.bytes_read]
+
+    def _run(self):
+        while self.running:
+            self.start_evt.wait()
+            self.start_evt.clear()
+            if not self.running:
+                break
+
+            fd = self.fd
+            offset = 0
+            while True:
+                try:
+                    chunk = os.read(fd, 262144)
+                    if not chunk:
+                        break
+                    chunk_len = len(chunk)
+                    if offset + chunk_len > len(self.buf):
+                        self.buf.extend(b"\x00" * (offset + chunk_len - len(self.buf) + 1048576))
+                    self.buf[offset : offset + chunk_len] = chunk
+                    offset += chunk_len
+                except Exception:
+                    break
+
+            self.bytes_read = offset
+            self.done_evt.set()
+
+    def stop(self):
+        self.running = False
+        self.start_evt.set()
+
+
 class KWinScreenShot2Grabber:
     """Zero-overhead native KDE Plasma 6 (Wayland) KWin ScreenShot2 kernel pipe capture."""
 
     def __init__(self):
         self.available = False
         self.iface = None
+        self.pipe_reader = PersistentPipeReader()
         if not sys.platform.startswith("linux"):
             return
 
@@ -145,20 +199,7 @@ class KWinScreenShot2Grabber:
                 "native-resolution": True,
             }
 
-            read_chunks = []
-
-            def _pipe_reader_worker(fd: int):
-                while True:
-                    try:
-                        chunk = os.read(fd, 262144)
-                        if not chunk:
-                            break
-                        read_chunks.append(chunk)
-                    except Exception:
-                        break
-
-            reader_thread = threading.Thread(target=_pipe_reader_worker, args=(r_fd,), daemon=True)
-            reader_thread.start()
+            self.pipe_reader.start_read(r_fd)
 
             reply = self.iface.call("CaptureWorkspace", options, q_fd)
             os.close(w_fd)
@@ -174,16 +215,12 @@ class KWinScreenShot2Grabber:
                     pass
                 q_fd2 = QDBusUnixFileDescriptor(w_fd2)
 
-                read_chunks.clear()
-                reader_thread2 = threading.Thread(target=_pipe_reader_worker, args=(r_fd2,), daemon=True)
-                reader_thread2.start()
-
+                self.pipe_reader.start_read(r_fd2)
                 reply2 = self.iface.call("CaptureActiveScreen", options, q_fd2)
                 os.close(w_fd2)
                 w_fd2 = -1
                 os.close(r_fd)
                 r_fd = r_fd2
-                reader_thread = reader_thread2
 
                 if _is_dbus_error(reply2) or not reply2.arguments():
                     err_msg2 = reply2.errorMessage() if reply2.errorMessage() else "No arguments"
@@ -199,11 +236,10 @@ class KWinScreenShot2Grabber:
             else:
                 meta_raw = reply.arguments()[0]
 
-            reader_thread.join(timeout=1.0)
+            raw_bytes = self.pipe_reader.wait_read(timeout=0.5)
             os.close(r_fd)
             r_fd = -1
 
-            raw_bytes = b"".join(read_chunks)
             if not raw_bytes:
                 return None
 
@@ -213,9 +249,7 @@ class KWinScreenShot2Grabber:
             width = int(meta.get("width", 0))
             height = int(meta.get("height", 0))
             stride = int(meta.get("stride", 0))
-            fmt_code = int(meta.get("format", 0))
 
-            # Resolve physical dimensions against fractional scaling (e.g. 1920x1080 at 125% scale)
             if width <= 0 or height <= 0 or (width * height != total_pixels):
                 screen = QGuiApplication.primaryScreen()
                 if screen:
@@ -228,7 +262,6 @@ class KWinScreenShot2Grabber:
                     elif lw * lh == total_pixels:
                         width, height = lw, lh
                     else:
-                        # Aspect ratio deduction
                         aspect = lw / lh if lh > 0 else (16.0 / 9.0)
                         h_est = int(round((total_pixels / aspect) ** 0.5))
                         w_est = int(round(h_est * aspect))
@@ -244,8 +277,7 @@ class KWinScreenShot2Grabber:
             if stride < expected_stride:
                 stride = expected_stride
 
-            expected_total_bytes = stride * height
-            if len(raw_bytes) < expected_total_bytes:
+            if len(raw_bytes) < stride * height:
                 if len(raw_bytes) >= width * height * 4:
                     stride = width * 4
                 else:
@@ -255,14 +287,8 @@ class KWinScreenShot2Grabber:
             if stride // 4 > width:
                 arr = arr[:, :width, :]
 
-            # In Wayland, KWin writes ARGB32_Premultiplied (Format 5, BGRA byte order)
-            # Format 17 is RGBA8888
-            if fmt_code in (16, 17):  # Format_RGBA8888 / Format_RGBA8888_Premultiplied
-                bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-            else:
-                bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-
-            return bgr
+            # Return the 4-channel array directly (OpenCV imencode handles BGRA natively with zero copies)
+            return arr
 
         except Exception as ex:
             print(f"[DEBUG Screen Capturer] KWin ScreenShot2 grab exception: {ex}")
@@ -277,6 +303,10 @@ class KWinScreenShot2Grabber:
                 except Exception:
                     pass
             return None
+
+    def cleanup(self):
+        if self.pipe_reader:
+            self.pipe_reader.stop()
 
 
 class SpectacleGrabber:
@@ -491,16 +521,21 @@ class ScreenSenderThread(QThread):
             os.environ.get("XDG_SESSION_TYPE") == "wayland" or os.environ.get("WAYLAND_DISPLAY") is not None
         )
 
-        # 1. Native KWin ScreenShot2 D-Bus kernel pipe grabber (KDE Plasma 6 Wayland)
         kwin_grabber = KWinScreenShot2Grabber() if is_wayland else None
         use_kwin = bool(kwin_grabber and kwin_grabber.available)
 
-        # 2. KDE Spectacle CLI Grabber (KDE Plasma fallback)
         spectacle_grabber = None
         use_spectacle = False
         if is_wayland and not use_kwin:
             spectacle_grabber = SpectacleGrabber()
             use_spectacle = spectacle_grabber.available
+
+        # Diagnostics & FPS accounting metrics
+        fps_frame_counter = 0
+        fps_last_report_time = time.perf_counter()
+        total_capture_dur = 0.0
+        total_encode_dur = 0.0
+        total_send_dur = 0.0
 
         with create_mss_instance() as sct:
             monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
@@ -509,101 +544,117 @@ class ScreenSenderThread(QThread):
 
             while self.running:
                 if self.paused and not self.send_cursorless_frame_once:
-                    self.msleep(60)
+                    time.sleep(0.04)
                     continue
 
-                t_start = time.perf_counter()
+                t_frame_start = time.perf_counter()
 
                 try:
                     data = None
+                    t_cap_start = time.perf_counter()
 
-                    # Strategy A: Zero-overhead KWin ScreenShot2 D-Bus Pipe
+                    # 1. Capture Step
                     if use_kwin:
-                        bgr = kwin_grabber.grab(
+                        frame_raw = kwin_grabber.grab(
                             include_cursor=(not self.paused and not self.send_cursorless_frame_once)
                         )
-                        if bgr is not None:
-                            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-                            if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
-                                encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
-
-                            if self.use_444_chroma:
-                                sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
-                                sampling_444_val = getattr(
-                                    cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001
-                                )
-                                encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
-
-                            success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
-                            if success:
-                                data = enc_img.tobytes()
-                        else:
-                            self.msleep(5)
-                            continue
-
-                    # Strategy B: Spectacle RAM-disk grabber (KDE Plasma fallback)
                     elif use_spectacle and spectacle_grabber:
-                        bgr = spectacle_grabber.grab()
-                        if bgr is not None:
-                            if not self.paused and not self.send_cursorless_frame_once:
-                                render_cursor_on_frame(bgr, mon_left, mon_top)
-                            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-                            if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
-                                encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
-                            success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
-                            if success:
-                                data = enc_img.tobytes()
-
-                    # Strategy C: MSS (Windows or X11 only)
-                    if data is None and not is_wayland:
+                        frame_raw = spectacle_grabber.grab()
+                        if frame_raw is not None and not self.paused and not self.send_cursorless_frame_once:
+                            render_cursor_on_frame(frame_raw, mon_left, mon_top)
+                    elif not is_wayland:
                         raw_frame = sct.grab(monitor)
                         img = np.array(raw_frame)
-                        bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
+                        frame_raw = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                         if not self.paused and not self.send_cursorless_frame_once:
-                            render_cursor_on_frame(bgr, mon_left, mon_top)
+                            render_cursor_on_frame(frame_raw, mon_left, mon_top)
+                    else:
+                        frame_raw = None
 
-                        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-                        if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
-                            encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
+                    t_cap_end = time.perf_counter()
 
-                        if self.use_444_chroma:
-                            sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
-                            sampling_444_val = getattr(
-                                cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001
-                            )
-                            encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+                    if frame_raw is None:
+                        if is_wayland:
+                            time.sleep(0.01)
+                        continue
 
-                        success, enc_img = cv2.imencode(".jpg", bgr, encode_params)
-                        if success:
-                            data = enc_img.tobytes()
+                    # 2. Fast JPEG Encoding Step (Zero-pass Huffman for sustained 60 FPS)
+                    t_enc_start = time.perf_counter()
+                    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
+                    if self.use_444_chroma:
+                        sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
+                        sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
+                        encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
+
+                    try:
+                        success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
+                    except Exception:
+                        # Fallback to BGR conversion if raw buffer channels require alignment
+                        if frame_raw.shape[2] == 4:
+                            frame_raw = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
+                        success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
+
+                    if success:
+                        data = enc_img.tobytes()
+                    t_enc_end = time.perf_counter()
+
+                    # 3. Network Transmission Step
+                    t_send_start = time.perf_counter()
                     if data:
                         sock.sendall(struct.pack(">L", len(data)) + data)
-                    elif is_wayland:
-                        self.msleep(50)
-                        continue
+                    t_send_end = time.perf_counter()
 
                     if self.send_cursorless_frame_once:
                         self.send_cursorless_frame_once = False
+
+                    # Diagnostics Accumulation
+                    fps_frame_counter += 1
+                    total_capture_dur += (t_cap_end - t_cap_start)
+                    total_encode_dur += (t_enc_end - t_enc_start)
+                    total_send_dur += (t_send_end - t_send_start)
+
+                    now = time.perf_counter()
+                    if now - fps_last_report_time >= 1.0:
+                        elapsed_report = now - fps_last_report_time
+                        measured_fps = fps_frame_counter / elapsed_report
+                        avg_cap_ms = (total_capture_dur / fps_frame_counter) * 1000.0
+                        avg_enc_ms = (total_encode_dur / fps_frame_counter) * 1000.0
+                        avg_send_ms = (total_send_dur / fps_frame_counter) * 1000.0
+                        avg_total_ms = avg_cap_ms + avg_enc_ms + avg_send_ms
+
+                        print(
+                            f"[DEBUG Sender Video] Live: {measured_fps:5.1f} FPS "
+                            f"(Target: {self.fps_limit} FPS | Total: {avg_total_ms:4.1f}ms "
+                            f"[Cap: {avg_cap_ms:4.1f}ms, Enc: {avg_enc_ms:4.1f}ms, Net: {avg_send_ms:4.1f}ms])"
+                        )
+
+                        fps_frame_counter = 0
+                        total_capture_dur = 0.0
+                        total_encode_dur = 0.0
+                        total_send_dur = 0.0
+                        fps_last_report_time = now
 
                 except (socket.error, BrokenPipeError, ConnectionResetError) as e:
                     print(f"[DEBUG Sender Video] Network socket disconnected: {e}")
                     break
                 except subprocess.TimeoutExpired:
-                    self.msleep(10)
+                    time.sleep(0.005)
                     continue
                 except Exception as e:
                     print(f"[DEBUG Sender Video] Frame capture notice: {e}")
-                    self.msleep(10)
+                    time.sleep(0.005)
                     continue
 
-                elapsed = time.perf_counter() - t_start
+                # 4. Precision Frame Pacing
+                frame_elapsed = time.perf_counter() - t_frame_start
                 target_frame_time = 1.0 / max(1, self.fps_limit)
-                sleep_sec = target_frame_time - elapsed
-                if sleep_sec > 0:
-                    self.msleep(int(sleep_sec * 1000))
+                sleep_sec = target_frame_time - frame_elapsed
+                if sleep_sec > 0.001:
+                    time.sleep(sleep_sec)
 
+        if kwin_grabber:
+            kwin_grabber.cleanup()
         if spectacle_grabber:
             spectacle_grabber.cleanup()
 
