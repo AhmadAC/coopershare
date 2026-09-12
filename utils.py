@@ -1,9 +1,9 @@
-
 """
 Persistence, image generation, low-level socket utilities, SVG vector icon renderers,
-and KDE Plasma Wayland & uinput permission helpers.
+KDE Plasma Wayland & uinput permission helpers, and Windows DWM screen capture exclusion.
 """
 
+import ctypes
 import json
 import os
 import shutil
@@ -13,7 +13,7 @@ import sys
 from typing import Optional
 
 import mss
-from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtCore import QByteArray, QEvent, QObject, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 
@@ -50,6 +50,62 @@ def save_history(history_data: dict):
         print("[DEBUG Sender] Saved history.json successfully.")
     except Exception as e:
         print(f"[DEBUG Sender] Failed to write history.json: {e}")
+
+
+# ===========================================================================
+# Windows DWM Screen Capture Exclusion
+# ===========================================================================
+
+WDA_NONE = 0x00000000
+WDA_MONITOR = 0x00000001
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+
+def exclude_from_capture(target) -> bool:
+    """
+    Excludes a window from screen capture / screen sharing on Windows
+    using SetWindowDisplayAffinity (WDA_EXCLUDEFROMCAPTURE = 0x11).
+    Ensures sender GUI overlays are completely invisible on captured frames,
+    just like on Linux.
+    """
+    if sys.platform != "win32" or not target:
+        return False
+
+    hwnd = None
+    try:
+        if isinstance(target, int):
+            hwnd = target
+        elif hasattr(target, "winId"):
+            hwnd = int(target.winId())
+        elif hasattr(target, "windowHandle") and target.windowHandle():
+            hwnd = int(target.windowHandle().winId())
+    except Exception:
+        return False
+
+    if not hwnd:
+        return False
+
+    try:
+        user32 = ctypes.windll.user32
+        res = user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        if not res:
+            res = user32.SetWindowDisplayAffinity(hwnd, WDA_MONITOR)
+        if res:
+            print(f"[DEBUG Sender Win32] Successfully excluded HWND {hwnd} from screen capture.")
+        return bool(res)
+    except Exception as e:
+        print(f"[DEBUG Sender Win32] SetWindowDisplayAffinity failed on HWND {hwnd}: {e}")
+        return False
+
+
+class WindowsCaptureExclusionFilter(QObject):
+    """Event filter that automatically excludes any top-level window/dialog from screen capture on Windows."""
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Show, QEvent.Polish):
+            if hasattr(watched, "isWindow") and watched.isWindow():
+                exclude_from_capture(watched)
+        return super().eventFilter(watched, event)
 
 
 def ensure_uinput_permissions():

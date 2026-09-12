@@ -1,4 +1,3 @@
-
 """
 MrCoopersScreenShare - Sender (PC Presenter & Remote Controller)
 Main executable launcher and bootstrap script.
@@ -53,6 +52,7 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP") != "
 
 from ui_main import FloatingSenderWindow
 from utils import (
+    WindowsCaptureExclusionFilter,
     create_application_icon,
     ensure_kde_desktop_entry,
     ensure_uinput_permissions,
@@ -73,6 +73,10 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
     app.setWindowIcon(create_application_icon())
+
+    if sys.platform == "win32":
+        exclusion_filter = WindowsCaptureExclusionFilter(app)
+        app.installEventFilter(exclusion_filter)
 
     win = FloatingSenderWindow()
     win.show()

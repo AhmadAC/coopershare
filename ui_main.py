@@ -1,9 +1,8 @@
-
 """
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
 Features persistent state loading and debounced saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
 with vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
-and a toggleable Remote TV Viewer session controller.
+toggleable Remote TV Viewer session controller, and Windows DWM capture exclusion.
 """
 
 import ctypes
@@ -59,6 +58,7 @@ from utils import (
     SVG_VOLUME_MUTE,
     SVG_VOLUME_ON,
     create_application_icon,
+    exclude_from_capture,
     load_history,
     save_history,
     svg_to_icon,
@@ -135,6 +135,14 @@ class TimerDialog(QDialog):
         input_layout.addWidget(self.timer_edit)
         input_layout.addWidget(self.timer_btn)
         layout.addLayout(input_layout)
+
+        if sys.platform == "win32":
+            exclude_from_capture(self)
+
+    def showEvent(self, event):
+        if sys.platform == "win32":
+            exclude_from_capture(self)
+        super().showEvent(event)
 
     def get_args(self) -> str:
         return self.timer_edit.text().strip().strip('"').strip("'")
@@ -236,6 +244,7 @@ class FloatingSenderWindow(QWidget):
                 )
             except Exception as e:
                 print(f"[DEBUG Sender Win32] Style init notice: {e}")
+            exclude_from_capture(self)
 
         self.enforce_always_on_top()
 
@@ -662,6 +671,8 @@ class FloatingSenderWindow(QWidget):
         self.apply_opacity(0.35)
         self.setFixedSize(48, 16)
         self.enforce_always_on_top()
+        if sys.platform == "win32":
+            exclude_from_capture(self)
 
     def expand_window(self):
         self.is_mini_mode = False
@@ -675,6 +686,8 @@ class FloatingSenderWindow(QWidget):
         self.card.adjustSize()
         self.adjustSize()
         self.enforce_always_on_top()
+        if sys.platform == "win32":
+            exclude_from_capture(self)
 
     def prompt_set_friendly_name(self):
         current_ip = self.get_selected_target_ip()
@@ -922,6 +935,8 @@ class FloatingSenderWindow(QWidget):
 
     def showEvent(self, event):
         self.enforce_always_on_top()
+        if sys.platform == "win32":
+            exclude_from_capture(self)
         super().showEvent(event)
 
     def contextMenuEvent(self, event):
@@ -953,6 +968,10 @@ class FloatingSenderWindow(QWidget):
             """
         )
 
+        if sys.platform == "win32":
+            menu.winId()
+            exclude_from_capture(menu)
+
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         has_target = bool(target_ip)
         is_viewing = bool(self.viewer_window and self.viewer_window.isVisible())
@@ -980,6 +999,10 @@ class FloatingSenderWindow(QWidget):
 
         win_menu = menu.addMenu("TV Window Control")
         win_menu.setIcon(svg_to_icon(SVG_DISPLAY, 16, "#ffffff"))
+
+        if sys.platform == "win32":
+            win_menu.winId()
+            exclude_from_capture(win_menu)
 
         max_act = QAction("Maximize / Fullscreen TV", self)
         max_act.setIcon(svg_to_icon(SVG_MAXIMIZE, 16, "#ffffff"))

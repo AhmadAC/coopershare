@@ -1,7 +1,9 @@
 """
 Interactive Remote Receiver Viewer Canvas & Control Window.
+Includes native capture exclusion on Windows to prevent feedback loop streaming.
 """
 
+import sys
 from typing import Optional
 
 from PySide6.QtCore import QPointF, QRect, Qt, Signal
@@ -9,6 +11,7 @@ from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QMouseEvent, QPainte
 from PySide6.QtWidgets import QMainWindow, QWidget
 
 from threads import ReverseScreenReceiverThread
+from utils import exclude_from_capture
 
 
 class RemoteReceiverCanvas(QWidget):
@@ -189,6 +192,14 @@ class RemoteReceiverViewerWindow(QMainWindow):
         self.stream_thread.frame_received.connect(self.canvas.update_frame)
         self.stream_thread.disconnected.connect(self.on_stream_disconnected)
         self.stream_thread.start()
+
+        if sys.platform == "win32":
+            exclude_from_capture(self)
+
+    def showEvent(self, event):
+        if sys.platform == "win32":
+            exclude_from_capture(self)
+        super().showEvent(event)
 
     def on_stream_disconnected(self):
         self.setWindowTitle(f"Receiver Desktop Viewer ({self.target_ip}) - Disconnected")
