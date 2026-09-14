@@ -12,7 +12,7 @@ Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSO
 """
 
 import ctypes
-from ctypes import Structure, byref, c_long
+from ctypes import Structure, byref, c_int, c_long, sizeof
 import json
 import logging
 import os
@@ -27,6 +27,12 @@ import threading
 import time
 from typing import Optional
 
+# Prevent standard streams crash when executed without a console window on Windows
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 # Enable Per-Monitor High DPI Awareness on Windows early
 if sys.platform == "win32":
     try:
@@ -36,6 +42,33 @@ if sys.platform == "win32":
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+# ---------------------------------------------------------------------------
+# Storage Directory Resolution (Handles AppImage, Frozen Onedir, & Fallbacks)
+# ---------------------------------------------------------------------------
+def get_storage_directory() -> str:
+    appimage = os.environ.get("APPIMAGE")
+    if appimage:
+        candidate = os.path.dirname(os.path.abspath(appimage))
+        if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+            return candidate
+
+    if getattr(sys, "frozen", False):
+        candidate = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        candidate = os.path.dirname(os.path.abspath(__file__))
+
+    if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+        return candidate
+
+    fallback = os.path.expanduser("~/.config/mrcoopers-screenshare")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+APP_DIR = get_storage_directory()
+LOG_FILE_PATH = os.path.join(APP_DIR, "mrcoopers_receiver.log")
+CONFIG_FILE_PATH = os.path.join(APP_DIR, "receiver_config.json")
 
 # ---------------------------------------------------------------------------
 # Onedir Dynamic Script Loader
@@ -56,15 +89,17 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP_REC") 
 import cv2
 import mss
 import numpy as np
-from PySide6.QtCore import QByteArray, QEvent, QPointF, QRect, Qt, QThread, Signal
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QPointF, QRect, Qt, QThread, Signal
 from PySide6.QtGui import (
     QAction,
+    QColor,
     QCursor,
     QFont,
     QIcon,
     QImage,
     QKeyEvent,
     QPainter,
+    QPalette,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -84,10 +119,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE_PATH = os.path.join(APP_DIR, "mrcoopers_receiver.log")
-CONFIG_FILE_PATH = os.path.join(APP_DIR, "receiver_config.json")
-
 logger = logging.getLogger("Receiver")
 logger.setLevel(logging.DEBUG)
 
@@ -105,6 +136,35 @@ if not logger.handlers:
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
+
+
+def create_application_icon() -> QIcon:
+    """Generates the identical crisp application icon or loads existing .ico/.png."""
+    for candidate in (os.path.join(APP_DIR, "icon.ico"), os.path.join(APP_DIR, "icon.png")):
+        if os.path.exists(candidate):
+            return QIcon(candidate)
+
+    pix = QPixmap(64, 64)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    painter.setBrush(QColor("#0078d4"))
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
+
+    painter.setBrush(QColor("#ffffff"))
+    painter.drawRoundedRect(14, 15, 36, 24, 4, 4)
+
+    painter.setBrush(QColor("#1a1e29"))
+    painter.drawRect(18, 19, 28, 16)
+
+    painter.setBrush(QColor("#ffffff"))
+    painter.drawRect(29, 41, 6, 4)
+    painter.drawRoundedRect(22, 45, 20, 3, 1, 1)
+
+    painter.end()
+    return QIcon(pix)
 
 
 def svg_to_pixmap(svg_str: str, width: int = 16, height: int = 16, color: Optional[str] = "#ffffff") -> QPixmap:
@@ -376,7 +436,7 @@ class UniversalInputInjector:
 
         if sys.platform == "win32":
             self.mode = "win32"
-            print(f"[DEBUG Receiver Injector] Using native Win32 hardware input injection on bounds ({mon_left},{mon_top},{screen_w}x{screen_h}).")
+            logger.debug(f"Using native Win32 hardware input injection on bounds ({mon_left},{mon_top},{screen_w}x{screen_h}).")
         elif USE_EVDEV:
             try:
                 min_x = min(0, mon_left)
@@ -401,9 +461,9 @@ class UniversalInputInjector:
 
                 self.ui = UInput(cap, name="mrcoopers-receiver-input")
                 self.mode = "evdev"
-                print(f"[DEBUG Receiver Injector] Linux evdev virtual pointer active ({max_x}x{max_y}).")
+                logger.debug(f"Linux evdev virtual pointer active ({max_x}x{max_y}).")
             except Exception as ex:
-                print(f"[DEBUG Receiver Injector] Linux evdev init notice: {ex}")
+                logger.debug(f"Linux evdev init notice: {ex}")
                 self.mode = "none"
 
         if self.mode == "none":
@@ -412,9 +472,9 @@ class UniversalInputInjector:
                     self.mouse = MouseController()
                     self.keyboard = KeyboardController()
                     self.mode = "pynput"
-                    print("[DEBUG Receiver Injector] Using pynput fallback.")
+                    logger.debug("Using pynput fallback.")
                 except Exception as ex:
-                    print(f"[DEBUG Receiver Injector] pynput init failed: {ex}")
+                    logger.debug(f"pynput init failed: {ex}")
                     self.mode = "unsupported"
             else:
                 self.mode = "unsupported"
@@ -996,7 +1056,7 @@ class ReverseVideoServerThread(QThread):
             except Exception:
                 break
 
-            print(f"[DEBUG Receiver Reverse Video] Stream client connected from {addr[0]}")
+            logger.debug(f"Reverse video stream client connected from {addr[0]}")
             self._stream_to_viewer(conn)
 
         if self.server_sock:
@@ -1259,23 +1319,64 @@ class ControlServerThread(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Canvas & Main Window
+# Canvas & Standby Widgets (Solid Edge Cleared & Zero White Margin Flicker)
 # ---------------------------------------------------------------------------
+
+
+class StandbyContainer(QWidget):
+    """Standby Screen Container ensuring all right-click events trigger the context menu."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#0d111a"))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton:
+            main_win = self.window()
+            if hasattr(main_win, "show_context_menu"):
+                main_win.show_context_menu(QCursor.pos())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        main_win = self.window()
+        if hasattr(main_win, "show_context_menu"):
+            main_win.show_context_menu(QCursor.pos())
+            event.accept()
+        else:
+            super().contextMenuEvent(event)
 
 
 class TouchDisplayCanvas(QWidget):
     """
     High-DPI Canvas with full hardware support for Windows 11 multi-touch events
     (QTouchEvent) and traditional mouse/trackpad events.
+    Guarantees solid edge bounds to eliminate white flickering at any resolution.
     """
 
-    def __init__(self, control_server: ControlServerThread, parent=None):
+    def __init__(self, control_server: Optional[ControlServerThread] = None, parent=None):
         super().__init__(parent)
         self.control_server = control_server
         self.current_frame: Optional[QPixmap] = None
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAutoFillBackground(False)
         self.setMouseTracking(True)
-        self.setStyleSheet("background-color: #0b0e14;")
+        self.setStyleSheet("background-color: #000000;")
 
     def update_frame(self, qimage: QImage):
         self.current_frame = QPixmap.fromImage(qimage)
@@ -1313,6 +1414,8 @@ class TouchDisplayCanvas(QWidget):
         return super().event(event)
 
     def _handle_touch_event(self, event):
+        if not self.control_server:
+            return
         points = event.points()
         if not points:
             return
@@ -1337,14 +1440,20 @@ class TouchDisplayCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        # Always fill the entire widget area with pure black to guarantee zero edge flickering
+        painter.fillRect(self.rect(), Qt.black)
+
         if self.current_frame and not self.current_frame.isNull():
-            painter.drawPixmap(self._get_video_rect(), self.current_frame)
+            # Retain smooth scaling without anti-aliasing edge artifacts on the rectangular blit
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            target_rect = self._get_video_rect()
+            painter.drawPixmap(target_rect, self.current_frame)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
-            event.ignore()
+            event.accept()
+            return
+        if not self.control_server:
             return
         norm = self._normalize_pos(event.position())
         if norm:
@@ -1353,6 +1462,8 @@ class TouchDisplayCanvas(QWidget):
             )
 
     def mouseMoveEvent(self, event):
+        if not self.control_server:
+            return
         norm = self._normalize_pos(event.position())
         if norm:
             self.control_server.send_event(
@@ -1361,7 +1472,12 @@ class TouchDisplayCanvas(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.RightButton:
-            event.ignore()
+            main_win = self.window()
+            if hasattr(main_win, "show_context_menu"):
+                main_win.show_context_menu(QCursor.pos())
+            event.accept()
+            return
+        if not self.control_server:
             return
         norm = self._normalize_pos(event.position())
         if norm:
@@ -1370,14 +1486,16 @@ class TouchDisplayCanvas(QWidget):
             )
 
     def wheelEvent(self, event):
-        self.control_server.send_event(
-            {"type": "scroll", "dy": event.angleDelta().y()}
-        )
+        if self.control_server:
+            self.control_server.send_event(
+                {"type": "scroll", "dy": event.angleDelta().y()}
+            )
 
     def contextMenuEvent(self, event):
         main_win = self.window()
         if hasattr(main_win, "show_context_menu"):
-            main_win.show_context_menu(event.globalPos())
+            main_win.show_context_menu(QCursor.pos())
+            event.accept()
         else:
             event.ignore()
 
@@ -1387,7 +1505,19 @@ class ReceiverMainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("MrCoopersScreenShare - Receiver")
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
-        self.setStyleSheet("background-color: #0b0e14;")
+
+        # Force black palette and opaque settings to eliminate DWM flash
+        palette = self.palette()
+        palette.setColor(QPalette.Window, Qt.black)
+        palette.setColor(QPalette.Base, Qt.black)
+        self.setPalette(palette)
+        self.setAutoFillBackground(False)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setStyleSheet("QMainWindow { background-color: #000000; }")
+
+        app_icon = create_application_icon()
+        self.setWindowIcon(app_icon)
 
         self.config = load_receiver_config()
         self.hide_details = self.config.get("hide_details", False)
@@ -1401,7 +1531,7 @@ class ReceiverMainWindow(QMainWindow):
             mon_l, mon_t = mon["left"], mon["top"]
         self.input_injector = UniversalInputInjector(mon_l, mon_t, scr_w, scr_h)
 
-        # Initialize network servers BEFORE setting up UI
+        # Initialize network servers with safe callbacks
         self.control_thread = ControlServerThread()
         self.audio_thread = AudioServerThread()
         self.video_thread = VideoServerThread(self.get_pin, self.is_pin_required)
@@ -1425,11 +1555,77 @@ class ReceiverMainWindow(QMainWindow):
         ):
             th.start()
 
+        self._ensure_frameless_style()
+
+    def _ensure_frameless_style(self):
+        if sys.platform == "win32":
+            try:
+                hwnd = int(self.winId())
+
+                # Set class background to pure black to eliminate white resize/erase flash
+                GCLP_HBRBACKGROUND = -10
+                black_brush = ctypes.windll.gdi32.CreateSolidBrush(0x00000000)
+                ctypes.windll.user32.SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, black_brush)
+
+                # Strip Windows title bars & standard borders
+                GWL_STYLE = -16
+                WS_CAPTION = 0x00C00000
+                WS_THICKFRAME = 0x00040000
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+                new_style = style & ~WS_CAPTION & ~WS_THICKFRAME
+                if new_style != style:
+                    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
+
+                # Disable Windows 11 rounded corners and border outline
+                DWMWA_WINDOW_CORNER_PREFERENCE = 33
+                DWMWCP_DONOTROUND = c_int(1)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    byref(DWMWCP_DONOTROUND),
+                    sizeof(DWMWCP_DONOTROUND),
+                )
+
+                DWMWA_BORDER_COLOR = 34
+                color_none = c_int(0xFFFFFFFE)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_BORDER_COLOR,
+                    byref(color_none),
+                    sizeof(color_none),
+                )
+
+                # Commit window frame style changes immediately
+                # SWP_FRAMECHANGED = 0x0020, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, 0, 0, 0, 0, 0, 0x0020 | 0x0002 | 0x0001 | 0x0004
+                )
+            except Exception as e:
+                logger.debug(f"Frameless enforcement notice: {e}")
+
+    def set_receiver_fullscreen(self, fullscreen: bool):
+        if fullscreen:
+            self.showFullScreen()
+        else:
+            self.showNormal()
+            screen = self.screen() or QApplication.primaryScreen()
+            if screen:
+                geom = screen.geometry()
+                target_w = min(1280, int(geom.width() * 0.8))
+                target_h = min(720, int(geom.height() * 0.8))
+                self.setGeometry(
+                    geom.x() + (geom.width() - target_w) // 2,
+                    geom.y() + (geom.height() - target_h) // 2,
+                    target_w,
+                    target_h,
+                )
+        self._ensure_frameless_style()
+
     def get_pin(self) -> str:
         return self.pin
 
     def is_pin_required(self) -> bool:
-        if getattr(self, "pin_req_cb", None) is not None:
+        if self.pin_req_cb is not None:
             return self.pin_req_cb.isChecked()
         return self._pin_required
 
@@ -1438,10 +1634,10 @@ class ReceiverMainWindow(QMainWindow):
 
     def _setup_ui(self):
         self.stack = QStackedWidget()
+        self.stack.setContentsMargins(0, 0, 0, 0)
         self.setCentralWidget(self.stack)
 
-        self.standby = QWidget()
-        self.standby.setStyleSheet("background-color: #0d111a;")
+        self.standby = StandbyContainer()
         sb_layout = QVBoxLayout(self.standby)
         sb_layout.setAlignment(Qt.AlignCenter)
         sb_layout.setSpacing(18)
@@ -1479,10 +1675,27 @@ class ReceiverMainWindow(QMainWindow):
 
         sb_layout.addWidget(self.details_container, alignment=Qt.AlignCenter)
 
-        # Wire canvas directly to active control thread
-        self.canvas = TouchDisplayCanvas(self.control_thread)
+        for w in (
+            self.details_container,
+            self.title_lbl,
+            self.ip_lbl,
+            self.pin_lbl,
+            self.hint_lbl,
+        ):
+            w.installEventFilter(self)
+
+        self.canvas = TouchDisplayCanvas(control_server=self.control_thread)
         self.stack.addWidget(self.standby)
         self.stack.addWidget(self.canvas)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.ContextMenu:
+            self.show_context_menu(QCursor.pos())
+            return True
+        elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.RightButton:
+            self.show_context_menu(QCursor.pos())
+            return True
+        return super().eventFilter(watched, event)
 
     def _apply_details_visibility(self):
         self.details_container.setVisible(not self.hide_details)
@@ -1606,30 +1819,16 @@ class ReceiverMainWindow(QMainWindow):
 
         if cmd_type == "window_control":
             action = cmd.get("action")
-            screen = self.screen() or QApplication.primaryScreen()
-            geom = screen.geometry() if screen else QRect(0, 0, 1920, 1080)
-
             if action == "maximize":
                 if self.isMinimized():
                     self.showNormal()
-                self.setWindowState(Qt.WindowFullScreen)
-                self.setGeometry(geom)
-                self.showFullScreen()
+                self.set_receiver_fullscreen(True)
                 self.raise_()
                 self.activateWindow()
             elif action == "normal":
                 if self.isMinimized():
                     self.showNormal()
-                self.setWindowState(Qt.WindowNoState)
-                self.showNormal()
-                target_w = min(1280, int(geom.width() * 0.8))
-                target_h = min(720, int(geom.height() * 0.8))
-                self.setGeometry(
-                    geom.x() + (geom.width() - target_w) // 2,
-                    geom.y() + (geom.height() - target_h) // 2,
-                    target_w,
-                    target_h,
-                )
+                self.set_receiver_fullscreen(False)
                 self.raise_()
                 self.activateWindow()
             elif action == "minimize":
@@ -1648,16 +1847,30 @@ class ReceiverMainWindow(QMainWindow):
         if event.key() == Qt.Key_Escape:
             self.close()
         elif event.key() == Qt.Key_F11:
-            if self.isFullScreen():
-                self.showNormal()
-            else:
-                self.showFullScreen()
+            self.set_receiver_fullscreen(not self.isFullScreen())
         super().keyPressEvent(event)
 
-    def contextMenuEvent(self, event):
-        self.show_context_menu(event.globalPos())
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
-    def show_context_menu(self, global_pos):
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.show_context_menu(QCursor.pos())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        self.show_context_menu(QCursor.pos())
+        event.accept()
+
+    def show_context_menu(self, global_pos: Optional[QPoint] = None):
+        if global_pos is None:
+            global_pos = QCursor.pos()
+
         menu = QMenu(self)
         menu.setStyleSheet(
             """
@@ -1709,11 +1922,11 @@ class ReceiverMainWindow(QMainWindow):
         if self.isFullScreen():
             fs_act = QAction("Exit Fullscreen (F11)", self)
             fs_act.setIcon(svg_to_icon(REC_SVG_EXIT_FULLSCREEN, 16, "#ffffff"))
-            fs_act.triggered.connect(self.showNormal)
+            fs_act.triggered.connect(lambda: self.set_receiver_fullscreen(False))
         else:
             fs_act = QAction("Enter Fullscreen (F11)", self)
             fs_act.setIcon(svg_to_icon(REC_SVG_FULLSCREEN, 16, "#ffffff"))
-            fs_act.triggered.connect(self.showFullScreen)
+            fs_act.triggered.connect(lambda: self.set_receiver_fullscreen(True))
         menu.addAction(fs_act)
 
         if self.stack.currentWidget() == self.canvas:
@@ -1732,11 +1945,14 @@ class ReceiverMainWindow(QMainWindow):
         menu.exec(global_pos)
 
     def on_connected(self, ip: str):
+        self.canvas.control_server = self.control_thread
         self.stack.setCurrentWidget(self.canvas)
+        self._ensure_frameless_style()
 
     def on_disconnected(self):
         self.canvas.current_frame = None
         self.stack.setCurrentWidget(self.standby)
+        self._ensure_frameless_style()
 
     def on_frame(self, img: QImage):
         self.canvas.update_frame(img)
@@ -1752,7 +1968,26 @@ class ReceiverMainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "mrcoopers.screenshare.receiver.1"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+
+    # Force application-wide black background for any transient unpainted frames
+    app_palette = app.palette()
+    app_palette.setColor(QPalette.Window, Qt.black)
+    app_palette.setColor(QPalette.Base, Qt.black)
+    app.setPalette(app_palette)
+
+    app_icon = create_application_icon()
+    app.setWindowIcon(app_icon)
+
     win = ReceiverMainWindow()
-    win.showFullScreen()
+    win.setWindowIcon(app_icon)
+    win.set_receiver_fullscreen(True)
     sys.exit(app.exec())

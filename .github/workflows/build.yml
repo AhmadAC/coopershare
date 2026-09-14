@@ -35,6 +35,9 @@ jobs:
         run: |
           pyinstaller --noconsole --onedir `
             --name "sender" `
+            --icon "icon.ico" `
+            --add-data "icon.ico;." `
+            --add-data "icon.png;." `
             --hidden-import "sounddevice" `
             --hidden-import "pynput" `
             --hidden-import "pynput.keyboard._win32" `
@@ -48,17 +51,29 @@ jobs:
         run: |
           pyinstaller --noconsole --onedir `
             --name "receiver" `
+            --icon "icon.ico" `
+            --add-data "icon.ico;." `
+            --add-data "icon.png;." `
             --hidden-import "sounddevice" `
             --hidden-import "pynput" `
+            --hidden-import "pynput.keyboard._win32" `
+            --hidden-import "pynput.mouse._win32" `
             --hidden-import "mss" `
             --hidden-import "cv2" `
             --hidden-import "PySide6.QtSvg" `
             receiver.py
 
-      - name: Bundle raw scripts & create portable ZIP archives
+      - name: Bundle raw scripts, assets & create portable ZIP archives
         run: |
           Copy-Item "sender.py" -Destination "dist\sender\sender.py"
           Copy-Item "receiver.py" -Destination "dist\receiver\receiver.py"
+          Copy-Item "icon.ico" -Destination "dist\sender\icon.ico"
+          Copy-Item "icon.png" -Destination "dist\sender\icon.png"
+          Copy-Item "icon.ico" -Destination "dist\receiver\icon.ico"
+          Copy-Item "icon.png" -Destination "dist\receiver\icon.png"
+          Get-ChildItem -Path . -Filter "*.py" | ForEach-Object {
+            Copy-Item $_.FullName -Destination "dist\sender\" -Force
+          }
           Compress-Archive -Path "dist\sender" -DestinationPath "dist\MrCoopersScreenShare-Sender-Windows.zip"
           Compress-Archive -Path "dist\receiver" -DestinationPath "dist\MrCoopersScreenShare-Receiver-Windows.zip"
 
@@ -102,6 +117,9 @@ jobs:
         run: |
           pyinstaller --noconsole --onedir \
             --name "sender" \
+            --icon "icon.png" \
+            --add-data "icon.png:." \
+            --add-data "icon.ico:." \
             --hidden-import "sounddevice" \
             --hidden-import "evdev" \
             --hidden-import "mss" \
@@ -110,8 +128,10 @@ jobs:
             --hidden-import "PySide6.QtSvg" \
             sender.py
 
-          # Copy editable script into directory for onedir portable archive
-          cp sender.py dist/sender/sender.py
+          # Copy editable scripts into directory for onedir portable archive
+          cp *.py dist/sender/ 2>/dev/null || cp sender.py dist/sender/
+          cp icon.png dist/sender/ 2>/dev/null || true
+          cp icon.ico dist/sender/ 2>/dev/null || true
           cd dist && zip -r MrCoopersScreenShare-Sender-Linux.zip sender/ && cd ..
 
       - name: Package Standalone AppImage for Fedora 44 Kinoite (FUSE3 Native)
@@ -127,7 +147,12 @@ jobs:
           # Copy PyInstaller bundled onedir payload
           cp -r dist/sender/* AppDir/usr/bin/
 
-          # 2. Generate crisp SVG application icon
+          # 2. Place crisp SVG and PNG application icons
+          if [ -f "icon.png" ]; then
+            cp icon.png AppDir/usr/share/icons/hicolor/256x256/apps/mrcoopers-screenshare-sender.png
+            cp icon.png AppDir/.DirIcon
+          fi
+
           cat << 'EOF' > AppDir/mrcoopers-screenshare-sender.svg
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
             <rect width="64" height="64" rx="14" fill="#0078d4"/>
@@ -137,8 +162,10 @@ jobs:
             <rect x="22" y="45" width="20" height="3" rx="1.5" fill="#ffffff"/>
           </svg>
           EOF
-          cp AppDir/mrcoopers-screenshare-sender.svg AppDir/.DirIcon
           cp AppDir/mrcoopers-screenshare-sender.svg AppDir/usr/share/icons/hicolor/256x256/apps/mrcoopers-screenshare-sender.svg
+          if [ ! -f "icon.png" ]; then
+            cp AppDir/mrcoopers-screenshare-sender.svg AppDir/.DirIcon
+          fi
 
           # 3. Create desktop file with mandatory KDE Plasma 6 Wayland permission interfaces
           cat << 'EOF' > AppDir/mrcoopers-screenshare-sender.desktop

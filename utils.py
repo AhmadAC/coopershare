@@ -1,6 +1,7 @@
 """
 Persistence, image generation, low-level socket utilities, SVG vector icon renderers,
 KDE Plasma Wayland & uinput permission helpers, and Windows DWM screen capture exclusion.
+Supports generating history.json outside Linux AppImages and frozen executables.
 """
 
 import ctypes
@@ -19,13 +20,40 @@ from PySide6.QtSvg import QSvgRenderer
 
 
 def get_app_directory() -> str:
-    """Returns the base directory where the application is located."""
+    """Returns the base directory where the application binary or script is located."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
-HISTORY_FILE_PATH = os.path.join(get_app_directory(), "history.json")
+def get_storage_directory() -> str:
+    """
+    Returns the persistent storage directory for history.json and configurations.
+    If running inside an AppImage, returns the folder containing the .AppImage file
+    (so history.json is generated right outside the AppImage), falling back to
+    ~/.config/mrcoopers-screenshare if the AppImage folder is read-only.
+    """
+    appimage = os.environ.get("APPIMAGE")
+    if appimage:
+        candidate = os.path.dirname(os.path.abspath(appimage))
+        if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+            return candidate
+
+    if getattr(sys, "frozen", False):
+        candidate = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        candidate = os.path.dirname(os.path.abspath(__file__))
+
+    if os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+        return candidate
+
+    fallback = os.path.expanduser("~/.config/mrcoopers-screenshare")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+STORAGE_DIR = get_storage_directory()
+HISTORY_FILE_PATH = os.path.join(STORAGE_DIR, "history.json")
 
 
 def load_history() -> dict:
@@ -38,18 +66,19 @@ def load_history() -> dict:
                     data["devices"] = {}
                 return data
         except Exception as e:
-            print(f"[DEBUG Sender] Failed to read history.json: {e}")
+            print(f"[DEBUG Sender] Failed to read history.json from {HISTORY_FILE_PATH}: {e}")
     return {"last_ip": "", "devices": {}}
 
 
 def save_history(history_data: dict):
-    """Saves the history data dict to history.json."""
+    """Saves the history data dict to history.json outside the AppImage or executable."""
     try:
+        os.makedirs(os.path.dirname(HISTORY_FILE_PATH), exist_ok=True)
         with open(HISTORY_FILE_PATH, "w", encoding="utf-8") as f:
             json.dump(history_data, f, indent=4)
-        print("[DEBUG Sender] Saved history.json successfully.")
+        print(f"[DEBUG Sender] Saved history.json successfully to {HISTORY_FILE_PATH}")
     except Exception as e:
-        print(f"[DEBUG Sender] Failed to write history.json: {e}")
+        print(f"[DEBUG Sender] Failed to write history.json to {HISTORY_FILE_PATH}: {e}")
 
 
 # ===========================================================================
@@ -162,10 +191,17 @@ def ensure_kde_desktop_entry(force: bool = False):
     apps_dir = os.path.expanduser("~/.local/share/applications")
     os.makedirs(apps_dir, exist_ok=True)
 
-    app_dir = get_app_directory()
-    sender_path = os.path.join(app_dir, "sender.py")
+    appimage_bin = os.environ.get("APPIMAGE")
+    if appimage_bin and os.path.exists(appimage_bin):
+        app_dir = os.path.dirname(os.path.abspath(appimage_bin))
+        sender_exec = appimage_bin
+    else:
+        app_dir = get_app_directory()
+        sender_path = os.path.join(app_dir, "sender.py")
+        sender_exec = f"{sys.executable} {sender_path}"
+
     icon_png = os.path.join(app_dir, "icon.png")
-    icon_val = icon_png if os.path.exists(icon_png) else "video-display"
+    icon_val = icon_png if os.path.exists(icon_png) else "mrcoopers-screenshare-sender"
 
     proc_self_exe = ""
     try:
@@ -191,7 +227,7 @@ Version=1.0
 Type=Application
 Name=MrCoopersScreenShare Sender
 Comment=Screen sharing and touch controller
-Exec={sys_py} {sender_path}
+Exec={sender_exec}
 Path={app_dir}
 Icon={icon_val}
 Terminal=false
@@ -264,7 +300,16 @@ X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,zkde_screencast_unstab
 
 
 def create_application_icon() -> QIcon:
-    """Generates a high-DPI desktop and taskbar icon for MrCoopersScreenShare."""
+    """Generates or loads a high-DPI desktop and taskbar icon for MrCoopersScreenShare."""
+    for candidate in (
+        os.path.join(STORAGE_DIR, "icon.ico"),
+        os.path.join(STORAGE_DIR, "icon.png"),
+        os.path.join(get_app_directory(), "icon.ico"),
+        os.path.join(get_app_directory(), "icon.png"),
+    ):
+        if os.path.exists(candidate):
+            return QIcon(candidate)
+
     pix = QPixmap(64, 64)
     pix.fill(Qt.transparent)
     painter = QPainter(pix)
