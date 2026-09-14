@@ -6,7 +6,8 @@ Features persistent state loading and debounced saving to history.json (Quality 
 with vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
 cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WirePlumber),
 toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, Windows DWM capture exclusion,
-multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown, and offset context menu.
+multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown,
+and z-order guarded topmost dropdown popups that always render in front of the GUI on Windows 11.
 """
 
 import ctypes
@@ -264,6 +265,81 @@ class EditTvDialog(QDialog):
         return name, cleaned_ips
 
 
+class TopmostComboBox(QComboBox):
+    """QComboBox that guarantees its popup container stays in front of topmost parent windows."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._is_popup_open = False
+
+        container = self.view().window()
+        if container:
+            container.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+
+        view = self.view()
+        view.setStyleSheet(
+            """
+            QListView {
+                background-color: #1a1e29;
+                color: #ffffff;
+                border: 1px solid #3d475f;
+                border-radius: 6px;
+                outline: none;
+                padding: 4px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 12px;
+            }
+            QListView::item {
+                min-height: 24px;
+                padding: 4px 8px;
+                border-radius: 4px;
+                color: #ffffff;
+            }
+            QListView::item:selected, QListView::item:hover {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            """
+        )
+
+    def showPopup(self):
+        self._is_popup_open = True
+        super().showPopup()
+
+        popup = self.view().window()
+        if popup:
+            popup.raise_()
+            if sys.platform == "win32":
+                try:
+                    hwnd = int(popup.winId())
+                    GWL_EXSTYLE = -20
+                    WS_EX_TOPMOST = 0x00000008
+                    ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOPMOST)
+                    HWND_TOPMOST = -1
+                    ctypes.windll.user32.SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0x0001 | 0x0002 | 0x0040,  # SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
+                    )
+                    ctypes.windll.user32.BringWindowToTop(hwnd)
+                    exclude_from_capture(hwnd)
+                except Exception:
+                    pass
+            popup.raise_()
+
+    def hidePopup(self):
+        self._is_popup_open = False
+        super().hidePopup()
+        parent_win = self.window()
+        if parent_win and hasattr(parent_win, "enforce_always_on_top"):
+            QTimer.singleShot(100, parent_win.enforce_always_on_top)
+
+
 class FloatingSenderWindow(QWidget):
 
     def __init__(self):
@@ -359,6 +435,23 @@ class FloatingSenderWindow(QWidget):
 
         self.enforce_always_on_top()
 
+    def is_any_popup_open(self) -> bool:
+        for combo in (
+            getattr(self, "device_combo", None),
+            getattr(self, "fps_combo", None),
+            getattr(self, "quality_combo", None),
+        ):
+            if combo is not None:
+                if getattr(combo, "_is_popup_open", False):
+                    return True
+                try:
+                    view = combo.view()
+                    if view and view.isVisible():
+                        return True
+                except Exception:
+                    pass
+        return False
+
     def apply_opacity(self, opacity: float):
         self.current_opacity = max(0.1, min(1.0, float(opacity)))
 
@@ -373,6 +466,9 @@ class FloatingSenderWindow(QWidget):
             self._update_mini_bar_style()
 
     def enforce_always_on_top(self):
+        if self.is_any_popup_open():
+            return
+
         if sys.platform == "win32":
             try:
                 hwnd = int(self.winId())
@@ -399,6 +495,8 @@ class FloatingSenderWindow(QWidget):
         self.raise_()
 
     def _on_topmost_timer(self):
+        if self.is_any_popup_open():
+            return
         if self.is_mini_mode and not self.isMinimized():
             self.enforce_always_on_top()
 
@@ -424,6 +522,9 @@ class FloatingSenderWindow(QWidget):
 
     def changeEvent(self, event: QEvent):
         if event.type() in (QEvent.WindowStateChange, QEvent.ActivationChange):
+            if self.is_any_popup_open():
+                super().changeEvent(event)
+                return
             if self.is_mini_mode:
                 if self.isMinimized():
                     self.showNormal()
@@ -451,6 +552,46 @@ class FloatingSenderWindow(QWidget):
             QLineEdit, QComboBox {{
                 background: #262c3b; border: 1px solid #3d475f;
                 color: #ffffff; border-radius: 6px; padding: 5px 8px; font-size: 12px;
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 22px;
+                border-left-width: 0px;
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }}
+            QComboBox::down-arrow {{
+                width: 0px;
+                height: 0px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #8f9bb3;
+                margin-right: 6px;
+            }}
+            QComboBox::down-arrow:hover {{
+                border-top: 5px solid #ffffff;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: #1a1e29;
+                color: #ffffff;
+                border: 1px solid #3d475f;
+                border-radius: 6px;
+                selection-background-color: #0078d4;
+                selection-color: #ffffff;
+                outline: none;
+                padding: 4px;
+            }}
+            QComboBox QAbstractItemView::item {{
+                min-height: 24px;
+                padding: 4px 8px;
+                border-radius: 4px;
+                color: #ffffff;
+            }}
+            QComboBox QAbstractItemView::item:selected,
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: #0078d4;
+                color: #ffffff;
             }}
             QPushButton {{
                 background-color: #0078d4; color: white; border: none;
@@ -491,7 +632,6 @@ class FloatingSenderWindow(QWidget):
         self.title_lbl = QLabel("MrCoopersScreenShare")
         self.title_lbl.setStyleSheet("font-weight: bold; color: #00a2ed;")
 
-        # GUI FPS Badge (updates every second with near-zero CPU footprint)
         self.fps_badge = QLabel("")
         self.fps_badge.setVisible(False)
         self.fps_badge.setStyleSheet(
@@ -529,7 +669,7 @@ class FloatingSenderWindow(QWidget):
 
         # Row 1: Target Device Dropdown / IP Selector + Share Button
         ip_row = QHBoxLayout()
-        self.device_combo = QComboBox()
+        self.device_combo = TopmostComboBox()
         self.device_combo.setEditable(True)
         self.device_combo.setFocusPolicy(Qt.StrongFocus)
         self.device_combo.setPlaceholderText("Select TV or Enter IP...")
@@ -537,7 +677,6 @@ class FloatingSenderWindow(QWidget):
         self.device_combo.lineEdit().returnPressed.connect(self.toggle_connect)
         self.device_combo.currentIndexChanged.connect(self._on_device_index_changed)
 
-        # Install event filter to allow Up/Down arrow navigation from combobox or its lineEdit
         self.device_combo.installEventFilter(self)
         self.device_combo.lineEdit().installEventFilter(self)
 
@@ -550,7 +689,7 @@ class FloatingSenderWindow(QWidget):
 
         # Row 2: Live-Adjustable FPS & Ultra-Quality Preset Selector
         qual_row = QHBoxLayout()
-        self.fps_combo = QComboBox()
+        self.fps_combo = TopmostComboBox()
         self.fps_combo.addItems(["60 FPS", "30 FPS", "120 FPS", "15 FPS"])
         saved_fps = self.history_data.get("fps_preset", "")
         if saved_fps:
@@ -565,7 +704,7 @@ class FloatingSenderWindow(QWidget):
             self.fps_combo.setCurrentIndex(0)
         self.fps_combo.currentIndexChanged.connect(self.on_fps_changed)
 
-        self.quality_combo = QComboBox()
+        self.quality_combo = TopmostComboBox()
         self.quality_combo.addItems(
             [
                 "Ultra Crisp (60 FPS, 89%)",
@@ -722,12 +861,10 @@ class FloatingSenderWindow(QWidget):
         self.main_layout.addWidget(self.stack)
         self.expand_window()
 
-        # Query host physical mute state cross-platform (Windows & Linux PipeWire)
         self.is_host_muted = HostAudioController.get_host_mute()
         self._update_host_mute_ui()
 
     def on_fps_updated(self, fps: float):
-        """Updates the GUI FPS badge once a second."""
         if self.stream_thread and self.stream_thread.isRunning() and not self.is_paused:
             self.fps_badge.setText(f"{fps:.0f} FPS")
             self.fps_badge.setVisible(True)
@@ -825,7 +962,6 @@ class FloatingSenderWindow(QWidget):
             exclude_from_capture(self)
 
     def _get_tv_info_for_selection(self) -> tuple[str, list[str]]:
-        """Retrieves friendly name and all associated IP addresses for the current TV selection."""
         current_ip = self.get_selected_target_ip()
         current_text = self.device_combo.currentText().strip()
         devices = self.history_data.get("devices", {})
@@ -858,13 +994,11 @@ class FloatingSenderWindow(QWidget):
 
             devices = self.history_data.get("devices", {})
 
-            # Clean up old IPs that belonged to this TV name
             if tv_name:
                 for old_ip in list(devices.keys()):
                     if devices[old_ip] == tv_name and old_ip not in new_ips:
                         del devices[old_ip]
 
-            # Save all IPs for this friendly TV name
             effective_name = new_name if new_name else (tv_name if tv_name else new_ips[0])
             for ip in new_ips:
                 devices[ip] = effective_name
@@ -875,7 +1009,6 @@ class FloatingSenderWindow(QWidget):
             self._schedule_history_save()
             self._populate_device_list()
 
-            # Select newly modified TV in dropdown
             for i in range(self.device_combo.count()):
                 if self.device_combo.itemData(i) in new_ips:
                     self.device_combo.setCurrentIndex(i)
@@ -1045,7 +1178,6 @@ class FloatingSenderWindow(QWidget):
         return self.input_enabled
 
     def eventFilter(self, watched, event):
-        """Intercepts keyboard events on the device combobox/lineEdit for arrow key navigation."""
         if hasattr(self, "device_combo") and (
             watched == self.device_combo or watched == self.device_combo.lineEdit()
         ):
@@ -1081,12 +1213,18 @@ class FloatingSenderWindow(QWidget):
         super().keyPressEvent(event)
 
     def enterEvent(self, event):
+        if self.is_any_popup_open():
+            super().enterEvent(event)
+            return
         if self.is_mini_mode and not self.is_pulsing:
             self.apply_opacity(1.0)
         self.enforce_always_on_top()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        if self.is_any_popup_open():
+            super().leaveEvent(event)
+            return
         if self.is_mini_mode and not self.is_pulsing:
             self.apply_opacity(0.35)
         self.enforce_always_on_top()
@@ -1094,7 +1232,8 @@ class FloatingSenderWindow(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.enforce_always_on_top()
+            if not self.is_any_popup_open():
+                self.enforce_always_on_top()
             self._drag_start_pos = event.globalPosition().toPoint()
             self._window_start_pos = self.pos()
             self._is_dragging = False
@@ -1119,7 +1258,8 @@ class FloatingSenderWindow(QWidget):
                     self.toggle_pause()
                 else:
                     self.expand_window()
-            self.enforce_always_on_top()
+            if not self.is_any_popup_open():
+                self.enforce_always_on_top()
 
     def showEvent(self, event):
         self.enforce_always_on_top()
@@ -1259,7 +1399,6 @@ class FloatingSenderWindow(QWidget):
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
 
-        # Calculate position directly next to the GUI window (not behind or overlapping)
         win_geom = self.frameGeometry()
         screen = self.screen() or QGuiApplication.primaryScreen()
         screen_geom = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
@@ -1268,16 +1407,13 @@ class FloatingSenderWindow(QWidget):
         menu_w = max(240, menu_hint.width())
         menu_h = menu_hint.height()
 
-        # Display immediately to the right of the GUI window
         target_x = win_geom.right() + 6
         if target_x + menu_w > screen_geom.right():
-            # If overflowing screen on the right, display to the left of the GUI window
             target_x = win_geom.left() - menu_w - 6
 
         if target_x < screen_geom.left():
             target_x = screen_geom.left() + 4
 
-        # Align vertically with top of the window
         target_y = win_geom.top()
         if target_y + menu_h > screen_geom.bottom():
             target_y = max(screen_geom.top() + 4, screen_geom.bottom() - menu_h - 6)
@@ -1286,7 +1422,6 @@ class FloatingSenderWindow(QWidget):
 
         target_pos = QPoint(target_x, target_y)
 
-        # Pause topmost timer while menu is active so window does not jump in front of menu
         self.topmost_timer.stop()
 
         if sys.platform == "win32":
