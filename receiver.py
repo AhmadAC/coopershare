@@ -8,7 +8,7 @@ Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSO
           Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput),
           UDP Discovery Beacon, 4-Digit PIN Authentication,
           Vector SVG Icons replacing emojis,
-          Hardware Multi-Touch QTouchEvent Processing with Synthetic Mouse Event Suppression.
+          Hardware Multi-Touch QTouchEvent Processing.
 """
 
 import ctypes
@@ -139,7 +139,7 @@ if not logger.handlers:
 
 
 def create_application_icon() -> QIcon:
-    """Generates the application icon or loads existing .ico/.png."""
+    """Generates the identical crisp application icon or loads existing .ico/.png."""
     for candidate in (os.path.join(APP_DIR, "icon.ico"), os.path.join(APP_DIR, "icon.png")):
         if os.path.exists(candidate):
             return QIcon(candidate)
@@ -191,6 +191,7 @@ def svg_to_icon(svg_str: str, size: int = 16, color: Optional[str] = "#ffffff") 
     return QIcon(pix)
 
 
+# Clean Vector SVGs for Receiver
 REC_SVG_ROCKET = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/></svg>"""
 REC_SVG_TIMER = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>"""
 REC_SVG_INFO = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>"""
@@ -235,6 +236,30 @@ try:
 except Exception as e:
     AUDIO_AVAILABLE = False
     logger.warning(f"sounddevice audio unavailable: {e}")
+
+# Universal Input Injection (evdev / pynput)
+USE_EVDEV = False
+if sys.platform.startswith("linux"):
+    try:
+        import evdev
+        from evdev import AbsInfo, UInput, ecodes as e
+
+        USE_EVDEV = True
+    except Exception:
+        USE_EVDEV = False
+
+Button = None
+MouseController = None
+KeyboardController = None
+Key = None
+try:
+    from pynput.keyboard import Controller as KeyboardController, Key
+    from pynput.mouse import Button, Controller as MouseController
+
+    PYNPUT_AVAILABLE = True
+except Exception as e:
+    PYNPUT_AVAILABLE = False
+    logger.warning(f"pynput input library unavailable: {e}")
 
 VIDEO_PORT = 9988
 CONTROL_PORT = 9989
@@ -281,6 +306,11 @@ def create_mss_instance():
     return mss.mss()
 
 
+# ---------------------------------------------------------------------------
+# Mouse Cursor Overlay
+# ---------------------------------------------------------------------------
+
+
 class POINT(Structure):
     _fields_ = [("x", c_long), ("y", c_long)]
 
@@ -322,8 +352,496 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
 
 
 # ---------------------------------------------------------------------------
+# Universal Input Injector (Direct Win32 API + evdev Wayland / pynput Fallback)
+# ---------------------------------------------------------------------------
+
+
+class UniversalInputInjector:
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_RIGHTDOWN = 0x0008
+    MOUSEEVENTF_RIGHTUP = 0x0010
+    MOUSEEVENTF_MIDDLEDOWN = 0x0020
+    MOUSEEVENTF_MIDDLEUP = 0x0040
+    MOUSEEVENTF_WHEEL = 0x0800
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+    KEYEVENTF_KEYUP = 0x0002
+
+    QT_KEY_TO_VK = {
+        0x01000000: 0x1B,
+        0x01000001: 0x09,
+        0x01000002: 0x09,
+        0x01000003: 0x08,
+        0x01000004: 0x0D,
+        0x01000005: 0x0D,
+        0x01000006: 0x2D,
+        0x01000007: 0x2E,
+        0x01000008: 0x13,
+        0x01000009: 0x2A,
+        0x01000010: 0x24,
+        0x01000011: 0x23,
+        0x01000012: 0x25,
+        0x01000013: 0x26,
+        0x01000014: 0x27,
+        0x01000015: 0x28,
+        0x01000016: 0x21,
+        0x01000017: 0x22,
+        0x01000020: 0x10,
+        0x01000021: 0x11,
+        0x01000022: 0x5B,
+        0x01000023: 0x12,
+        0x01000024: 0x14,
+        0x01000025: 0x90,
+        0x01000026: 0x91,
+        0x20: 0x20,
+    }
+
+    for _i in range(1, 25):
+        QT_KEY_TO_VK[0x01000030 + _i - 1] = 0x70 + _i - 1
+
+    NAME_TO_VK = {
+        "return": 0x0D,
+        "enter": 0x0D,
+        "backspace": 0x08,
+        "tab": 0x09,
+        "escape": 0x1B,
+        "space": 0x20,
+        "delete": 0x2E,
+        "shift": 0x10,
+        "control": 0x11,
+        "ctrl": 0x11,
+        "alt": 0x12,
+        "meta": 0x5B,
+        "up": 0x26,
+        "down": 0x28,
+        "left": 0x25,
+        "right": 0x27,
+        "home": 0x24,
+        "end": 0x23,
+        "pageup": 0x21,
+        "page_up": 0x21,
+        "pagedown": 0x22,
+        "page_down": 0x22,
+    }
+
+    def __init__(self, mon_left: int, mon_top: int, screen_w: int, screen_h: int):
+        self.mon_left = mon_left
+        self.mon_top = mon_top
+        self.screen_w = max(1, screen_w)
+        self.screen_h = max(1, screen_h)
+        self.mode = "none"
+        self.mouse = None
+        self.keyboard = None
+        self.ui = None
+
+        if sys.platform == "win32":
+            self.mode = "win32"
+            logger.debug(f"Using native Win32 hardware input injection on bounds ({mon_left},{mon_top},{screen_w}x{screen_h}).")
+        elif USE_EVDEV:
+            try:
+                min_x = min(0, mon_left)
+                max_x = max(self.screen_w, mon_left + self.screen_w)
+                min_y = min(0, mon_top)
+                max_y = max(self.screen_h, mon_top + self.screen_h)
+
+                cap = {
+                    e.EV_KEY: [
+                        e.BTN_LEFT,
+                        e.BTN_RIGHT,
+                        e.BTN_MIDDLE,
+                        e.BTN_TOUCH,
+                        e.BTN_TOOL_FINGER,
+                    ],
+                    e.EV_ABS: [
+                        (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=1)),
+                        (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=1)),
+                    ],
+                    e.EV_REL: [e.REL_WHEEL],
+                }
+
+                self.ui = UInput(cap, name="mrcoopers-receiver-input")
+                self.mode = "evdev"
+                logger.debug(f"Linux evdev virtual pointer active ({max_x}x{max_y}).")
+            except Exception as ex:
+                logger.debug(f"Linux evdev init notice: {ex}")
+                self.mode = "none"
+
+        if self.mode == "none":
+            if PYNPUT_AVAILABLE:
+                try:
+                    self.mouse = MouseController()
+                    self.keyboard = KeyboardController()
+                    self.mode = "pynput"
+                    logger.debug("Using pynput fallback.")
+                except Exception as ex:
+                    logger.debug(f"pynput init failed: {ex}")
+                    self.mode = "unsupported"
+            else:
+                self.mode = "unsupported"
+
+    def execute(self, event: dict):
+        ev_type = event.get("type")
+        nx = event.get("x")
+        ny = event.get("y")
+
+        if nx is not None and ny is not None:
+            px = self.mon_left + int(np.clip(nx, 0.0, 1.0) * (self.screen_w - 1))
+            py = self.mon_top + int(np.clip(ny, 0.0, 1.0) * (self.screen_h - 1))
+        else:
+            px, py = None, None
+
+        if self.mode == "win32":
+            try:
+                if px is not None and py is not None:
+                    ctypes.windll.user32.SetCursorPos(int(px), int(py))
+
+                if ev_type in ("touch_down", "mouse_down"):
+                    btn = event.get("button", "left")
+                    if btn == "right":
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+                    elif btn == "middle":
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
+                    else:
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+
+                elif ev_type in ("touch_up", "mouse_up"):
+                    btn = event.get("button", "left")
+                    if btn == "right":
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+                    elif btn == "middle":
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
+                    else:
+                        ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+                elif ev_type == "scroll":
+                    dy = event.get("dy", 0)
+                    delta = 120 if dy > 0 else -120
+                    ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+
+                elif ev_type in ("key_down", "key_up"):
+                    key_code = event.get("key_code", 0)
+                    key_name = str(event.get("key", "")).lower().replace("key_", "")
+                    text = event.get("text", "")
+
+                    vk = self.QT_KEY_TO_VK.get(key_code)
+                    if not vk:
+                        vk = self.NAME_TO_VK.get(key_name)
+
+                    if not vk and 0x20 <= key_code <= 0x7E:
+                        vk = key_code
+
+                    if not vk and text:
+                        vk_scan = ctypes.windll.user32.VkKeyScanW(ord(text[0]))
+                        if vk_scan != -1:
+                            vk = vk_scan & 0xFF
+
+                    if vk:
+                        flags = 0 if ev_type == "key_down" else self.KEYEVENTF_KEYUP
+                        if vk in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E):
+                            flags |= self.KEYEVENTF_EXTENDEDKEY
+                        ctypes.windll.user32.keybd_event(vk, 0, flags, 0)
+                return
+            except Exception as ex:
+                logger.error(f"Win32 input injection exception: {ex}")
+
+        elif self.mode == "evdev" and self.ui:
+            try:
+                if px is not None and py is not None:
+                    self.ui.write(e.EV_ABS, e.ABS_X, int(px))
+                    self.ui.write(e.EV_ABS, e.ABS_Y, int(py))
+
+                if ev_type in ("touch_down", "mouse_down"):
+                    btn_type = event.get("button", "left")
+                    btn_code = (
+                        e.BTN_RIGHT
+                        if btn_type == "right"
+                        else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    )
+                    if btn_code == e.BTN_LEFT:
+                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
+                    self.ui.write(e.EV_KEY, btn_code, 1)
+                    self.ui.syn()
+
+                elif ev_type in ("touch_up", "mouse_up"):
+                    btn_type = event.get("button", "left")
+                    btn_code = (
+                        e.BTN_RIGHT
+                        if btn_type == "right"
+                        else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    )
+                    if btn_code == e.BTN_LEFT:
+                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
+                    self.ui.write(e.EV_KEY, btn_code, 0)
+                    self.ui.syn()
+
+                elif ev_type in ("touch_move", "mouse_move"):
+                    self.ui.syn()
+
+                elif ev_type == "scroll":
+                    dy = 1 if event.get("dy", 0) > 0 else -1
+                    self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
+                    self.ui.syn()
+                return
+            except Exception as ex:
+                logger.error(f"evdev input injection exception: {ex}")
+
+        # Linux / pynput Fallback
+        if self.mouse:
+            if px is not None and py is not None:
+                self.mouse.position = (px, py)
+
+            if ev_type in ("touch_down", "mouse_down"):
+                btn = Button.right if event.get("button") == "right" else (
+                    Button.middle if event.get("button") == "middle" else Button.left
+                )
+                self.mouse.press(btn)
+
+            elif ev_type in ("touch_up", "mouse_up"):
+                btn = Button.right if event.get("button") == "right" else (
+                    Button.middle if event.get("button") == "middle" else Button.left
+                )
+                self.mouse.release(btn)
+
+            elif ev_type == "scroll":
+                dy = event.get("dy", 0)
+                self.mouse.scroll(0, 1 if dy > 0 else -1)
+
+        if self.keyboard and ev_type in ("key_down", "key_up"):
+            text = event.get("text", "")
+            key_name = str(event.get("key", "")).lower().replace("key_", "")
+            target_key = text if text else key_name
+            if target_key:
+                try:
+                    if ev_type == "key_down":
+                        self.keyboard.press(target_key)
+                    else:
+                        self.keyboard.release(target_key)
+                except Exception:
+                    pass
+
+    def close(self):
+        if self.mode == "evdev" and self.ui:
+            try:
+                self.ui.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Receiver Local Dialogs (With JSON History Memory)
+# ---------------------------------------------------------------------------
+
+
+class LocalRunScriptDialog(QDialog):
+    def __init__(self, config: dict, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.setWindowTitle("Run Script / Executable on Display")
+        self.setFixedWidth(520)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #1a1e29;
+                border: 1px solid #3d475f;
+                border-radius: 10px;
+            }
+            QLabel {
+                color: #ffffff;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 12px;
+            }
+            QLineEdit, QComboBox {
+                background: #262c3b;
+                border: 1px solid #3d475f;
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 7px 10px;
+                font-size: 12px;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 7px 16px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton#browse_btn, QPushButton#cancel_btn {
+                background-color: #262c3b;
+                border: 1px solid #3d475f;
+            }
+            QPushButton#browse_btn:hover, QPushButton#cancel_btn:hover {
+                background-color: #333c4d;
+            }
+            """
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(8)
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(svg_to_pixmap(REC_SVG_ROCKET, 20, 20, "#00a2ed"))
+        title_lbl = QLabel("Run Application / Script on Display")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 15px; color: #00a2ed;")
+        header_layout.addWidget(icon_lbl)
+        header_layout.addWidget(title_lbl)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+
+        layout.addWidget(QLabel("Executable / Shortcut / Script Path:"))
+        path_layout = QHBoxLayout()
+        self.path_combo = QComboBox()
+        self.path_combo.setEditable(True)
+        self.path_combo.lineEdit().setPlaceholderText("Select or enter .exe, .lnk, .bat, .py...")
+
+        recent_scripts = self.config.get("recent_scripts", [])
+        last_path = self.config.get("last_script_path", "")
+        if last_path and last_path not in recent_scripts:
+            recent_scripts.insert(0, last_path)
+
+        for p in recent_scripts:
+            self.path_combo.addItem(p)
+        if last_path:
+            self.path_combo.setEditText(last_path)
+
+        self.browse_btn = QPushButton("Browse...")
+        self.browse_btn.setObjectName("browse_btn")
+        self.browse_btn.clicked.connect(self._browse_file)
+        path_layout.addWidget(self.path_combo)
+        path_layout.addWidget(self.browse_btn)
+        layout.addLayout(path_layout)
+
+        layout.addWidget(QLabel("Arguments (sys.argv, optional):"))
+        self.args_edit = QLineEdit()
+        self.args_edit.setPlaceholderText("e.g. 30 --fullscreen -v (optional)")
+        self.args_edit.setText(self.config.get("last_script_args", ""))
+        self.args_edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.args_edit)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("cancel_btn")
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self.run_btn = QPushButton("Execute Now")
+        self.run_btn.setIcon(svg_to_icon(REC_SVG_ROCKET, 14, "#ffffff"))
+        self.run_btn.clicked.connect(self.accept)
+
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addWidget(self.run_btn)
+        layout.addLayout(btn_layout)
+
+    def _browse_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Executable or Script",
+            APP_DIR,
+            "Executables & Shortcuts (*.exe *.lnk *.bat *.cmd *.py *.sh);;All Files (*.*)",
+        )
+        if file_path:
+            self.path_combo.setEditText(file_path)
+
+    def get_data(self) -> tuple[str, str]:
+        return self.path_combo.currentText().strip(), self.args_edit.text().strip()
+
+
+class LocalTimerDialog(QDialog):
+    def __init__(self, config: dict, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.setWindowTitle("Set Display Timer")
+        self.setFixedWidth(380)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #1a1e29;
+                border: 1px solid #3d475f;
+                border-radius: 10px;
+            }
+            QLabel {
+                color: #ffffff;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 12px;
+            }
+            QLineEdit {
+                background: #262c3b;
+                border: 1px solid #3d475f;
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 7px 10px;
+                font-size: 13px;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 7px 18px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton#cancel_btn {
+                background-color: #262c3b;
+                border: 1px solid #3d475f;
+            }
+            """
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(8)
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(svg_to_pixmap(REC_SVG_TIMER, 20, 20, "#00d084"))
+        title_lbl = QLabel("Start Timer on Receiver Display")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 15px; color: #00d084;")
+        header_layout.addWidget(icon_lbl)
+        header_layout.addWidget(title_lbl)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+
+        layout.addWidget(QLabel("Enter duration (e.g. 30, 5m, 10:00, or raw number):"))
+        self.timer_edit = QLineEdit()
+        self.timer_edit.setPlaceholderText("30, 5m, 10:00...")
+        raw_prev = self.config.get("last_timer_args", "").strip().strip('"').strip("'")
+        self.timer_edit.setText(raw_prev)
+        self.timer_edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.timer_edit)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("cancel_btn")
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self.start_btn = QPushButton("Start Timer")
+        self.start_btn.setIcon(svg_to_icon(REC_SVG_TIMER, 14, "#ffffff"))
+        self.start_btn.clicked.connect(self.accept)
+
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addWidget(self.start_btn)
+        layout.addLayout(btn_layout)
+
+    def get_args(self) -> str:
+        val = self.timer_edit.text().strip().strip('"').strip("'")
+        return val
+
+
+# ---------------------------------------------------------------------------
 # Server & Communication Threads
 # ---------------------------------------------------------------------------
+
 
 class DiscoveryBeaconThread(QThread):
     def __init__(self, get_pin_func, get_pin_req_func):
@@ -776,9 +1294,12 @@ class ControlServerThread(QThread):
                 try:
                     msg = json.dumps(event_data).encode("utf-8")
                     self.client_conn.sendall(struct.pack(">L", len(msg)) + msg)
+                    logger.debug(f"[Touch Send] {event_data.get('type')} at {event_data.get('x')}, {event_data.get('y')}")
                 except Exception as ex:
                     logger.error(f"Failed to transmit touch event: {ex}")
                     self.client_conn = None
+            else:
+                logger.warning("send_event called but no active client connection exists!")
 
     def stop(self):
         self.running = False
@@ -798,10 +1319,13 @@ class ControlServerThread(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Canvas & Standby Widgets
+# Canvas & Standby Widgets (Solid Edge Cleared & Zero White Margin Flicker)
 # ---------------------------------------------------------------------------
 
+
 class StandbyContainer(QWidget):
+    """Standby Screen Container ensuring all right-click events trigger the context menu."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
@@ -838,8 +1362,9 @@ class StandbyContainer(QWidget):
 
 class TouchDisplayCanvas(QWidget):
     """
-    High-DPI Canvas with multi-touch event filtering that suppresses
-    synthetic mouse events on Windows 11 touchscreens.
+    High-DPI Canvas with full hardware support for Windows 11 multi-touch events
+    (QTouchEvent) and traditional mouse/trackpad events.
+    Guarantees solid edge bounds to eliminate white flickering at any resolution.
     """
 
     def __init__(self, control_server: Optional[ControlServerThread] = None, parent=None):
@@ -915,19 +1440,16 @@ class TouchDisplayCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        # Always fill the entire widget area with pure black to guarantee zero edge flickering
         painter.fillRect(self.rect(), Qt.black)
 
         if self.current_frame and not self.current_frame.isNull():
+            # Retain smooth scaling without anti-aliasing edge artifacts on the rectangular blit
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             target_rect = self._get_video_rect()
             painter.drawPixmap(target_rect, self.current_frame)
 
     def mousePressEvent(self, event):
-        # Ignore synthetic mouse events generated by Windows from touch input
-        if hasattr(event, "source") and event.source() == Qt.MouseEventSynthesizedBySystem:
-            event.accept()
-            return
-
         if event.button() == Qt.RightButton:
             event.accept()
             return
@@ -940,10 +1462,6 @@ class TouchDisplayCanvas(QWidget):
             )
 
     def mouseMoveEvent(self, event):
-        if hasattr(event, "source") and event.source() == Qt.MouseEventSynthesizedBySystem:
-            event.accept()
-            return
-
         if not self.control_server:
             return
         norm = self._normalize_pos(event.position())
@@ -953,10 +1471,6 @@ class TouchDisplayCanvas(QWidget):
             )
 
     def mouseReleaseEvent(self, event):
-        if hasattr(event, "source") and event.source() == Qt.MouseEventSynthesizedBySystem:
-            event.accept()
-            return
-
         if event.button() == Qt.RightButton:
             main_win = self.window()
             if hasattr(main_win, "show_context_menu"):
@@ -992,6 +1506,7 @@ class ReceiverMainWindow(QMainWindow):
         self.setWindowTitle("MrCoopersScreenShare - Receiver")
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
 
+        # Force black palette and opaque settings to eliminate DWM flash
         palette = self.palette()
         palette.setColor(QPalette.Window, Qt.black)
         palette.setColor(QPalette.Base, Qt.black)
@@ -1010,7 +1525,13 @@ class ReceiverMainWindow(QMainWindow):
         self._pin_required = False
         self.pin_req_cb: Optional[QCheckBox] = None
 
-        # Initialize network servers
+        with create_mss_instance() as sct:
+            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            scr_w, scr_h = mon["width"], mon["height"]
+            mon_l, mon_t = mon["left"], mon["top"]
+        self.input_injector = UniversalInputInjector(mon_l, mon_t, scr_w, scr_h)
+
+        # Initialize network servers with safe callbacks
         self.control_thread = ControlServerThread()
         self.audio_thread = AudioServerThread()
         self.video_thread = VideoServerThread(self.get_pin, self.is_pin_required)
@@ -1040,10 +1561,13 @@ class ReceiverMainWindow(QMainWindow):
         if sys.platform == "win32":
             try:
                 hwnd = int(self.winId())
+
+                # Set class background to pure black to eliminate white resize/erase flash
                 GCLP_HBRBACKGROUND = -10
                 black_brush = ctypes.windll.gdi32.CreateSolidBrush(0x00000000)
                 ctypes.windll.user32.SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, black_brush)
 
+                # Strip Windows title bars & standard borders
                 GWL_STYLE = -16
                 WS_CAPTION = 0x00C00000
                 WS_THICKFRAME = 0x00040000
@@ -1052,6 +1576,7 @@ class ReceiverMainWindow(QMainWindow):
                 if new_style != style:
                     ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
 
+                # Disable Windows 11 rounded corners and border outline
                 DWMWA_WINDOW_CORNER_PREFERENCE = 33
                 DWMWCP_DONOTROUND = c_int(1)
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -1070,6 +1595,8 @@ class ReceiverMainWindow(QMainWindow):
                     sizeof(color_none),
                 )
 
+                # Commit window frame style changes immediately
+                # SWP_FRAMECHANGED = 0x0020, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004
                 ctypes.windll.user32.SetWindowPos(
                     hwnd, 0, 0, 0, 0, 0, 0x0020 | 0x0002 | 0x0001 | 0x0004
                 )
@@ -1261,7 +1788,7 @@ class ReceiverMainWindow(QMainWindow):
                 creationflags=creationflags,
                 start_new_session=True if sys.platform != "win32" else False,
             )
-            logger.info(f"Launched timer: {cmd}")
+            logger.info(f"Launched timer with raw sys.argv: {cmd}")
         except Exception as ex:
             logger.error(f"Failed to run timer: {ex}")
 
@@ -1280,6 +1807,11 @@ class ReceiverMainWindow(QMainWindow):
 
     def on_control_command(self, cmd: dict):
         cmd_type = cmd.get("type")
+
+        if cmd_type == "remote_input":
+            event_data = cmd.get("event", {})
+            self.input_injector.execute(event_data)
+            return
 
         if cmd_type == "open_file_picker":
             self.open_local_script_dialog()
@@ -1431,213 +1963,8 @@ class ReceiverMainWindow(QMainWindow):
         self.reverse_video_thread.stop()
         self.audio_thread.stop()
         self.control_thread.stop()
+        self.input_injector.close()
         event.accept()
-
-
-class LocalRunScriptDialog(QDialog):
-    def __init__(self, config: dict, parent=None):
-        super().__init__(parent)
-        self.config = config
-        self.setWindowTitle("Run Script / Executable on Display")
-        self.setFixedWidth(520)
-        self.setStyleSheet(
-            """
-            QDialog {
-                background-color: #1a1e29;
-                border: 1px solid #3d475f;
-                border-radius: 10px;
-            }
-            QLabel {
-                color: #ffffff;
-                font-family: 'Segoe UI', sans-serif;
-                font-size: 12px;
-            }
-            QLineEdit, QComboBox {
-                background: #262c3b;
-                border: 1px solid #3d475f;
-                color: #ffffff;
-                border-radius: 6px;
-                padding: 7px 10px;
-                font-size: 12px;
-            }
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                font-weight: bold;
-                font-size: 12px;
-                padding: 7px 16px;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton#browse_btn, QPushButton#cancel_btn {
-                background-color: #262c3b;
-                border: 1px solid #3d475f;
-            }
-            QPushButton#browse_btn:hover, QPushButton#cancel_btn:hover {
-                background-color: #333c4d;
-            }
-            """
-        )
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(14)
-
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(8)
-        icon_lbl = QLabel()
-        icon_lbl.setPixmap(svg_to_pixmap(REC_SVG_ROCKET, 20, 20, "#00a2ed"))
-        title_lbl = QLabel("Run Application / Script on Display")
-        title_lbl.setStyleSheet("font-weight: bold; font-size: 15px; color: #00a2ed;")
-        header_layout.addWidget(icon_lbl)
-        header_layout.addWidget(title_lbl)
-        header_layout.addStretch()
-        layout.addLayout(header_layout)
-
-        layout.addWidget(QLabel("Executable / Shortcut / Script Path:"))
-        path_layout = QHBoxLayout()
-        self.path_combo = QComboBox()
-        self.path_combo.setEditable(True)
-        self.path_combo.lineEdit().setPlaceholderText("Select or enter .exe, .lnk, .bat, .py...")
-
-        recent_scripts = self.config.get("recent_scripts", [])
-        last_path = self.config.get("last_script_path", "")
-        if last_path and last_path not in recent_scripts:
-            recent_scripts.insert(0, last_path)
-
-        for p in recent_scripts:
-            self.path_combo.addItem(p)
-        if last_path:
-            self.path_combo.setEditText(last_path)
-
-        self.browse_btn = QPushButton("Browse...")
-        self.browse_btn.setObjectName("browse_btn")
-        self.browse_btn.clicked.connect(self._browse_file)
-        path_layout.addWidget(self.path_combo)
-        path_layout.addWidget(self.browse_btn)
-        layout.addLayout(path_layout)
-
-        layout.addWidget(QLabel("Arguments (sys.argv, optional):"))
-        self.args_edit = QLineEdit()
-        self.args_edit.setPlaceholderText("e.g. 30 --fullscreen -v (optional)")
-        self.args_edit.setText(self.config.get("last_script_args", ""))
-        self.args_edit.returnPressed.connect(self.accept)
-        layout.addWidget(self.args_edit)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setObjectName("cancel_btn")
-        self.cancel_btn.clicked.connect(self.reject)
-
-        self.run_btn = QPushButton("Execute Now")
-        self.run_btn.setIcon(svg_to_icon(REC_SVG_ROCKET, 14, "#ffffff"))
-        self.run_btn.clicked.connect(self.accept)
-
-        btn_layout.addWidget(self.cancel_btn)
-        btn_layout.addWidget(self.run_btn)
-        layout.addLayout(btn_layout)
-
-    def _browse_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Executable or Script",
-            APP_DIR,
-            "Executables & Shortcuts (*.exe *.lnk *.bat *.cmd *.py *.sh);;All Files (*.*)",
-        )
-        if file_path:
-            self.path_combo.setEditText(file_path)
-
-    def get_data(self) -> tuple[str, str]:
-        return self.path_combo.currentText().strip(), self.args_edit.text().strip()
-
-
-class LocalTimerDialog(QDialog):
-    def __init__(self, config: dict, parent=None):
-        super().__init__(parent)
-        self.config = config
-        self.setWindowTitle("Set Display Timer")
-        self.setFixedWidth(380)
-        self.setStyleSheet(
-            """
-            QDialog {
-                background-color: #1a1e29;
-                border: 1px solid #3d475f;
-                border-radius: 10px;
-            }
-            QLabel {
-                color: #ffffff;
-                font-family: 'Segoe UI', sans-serif;
-                font-size: 12px;
-            }
-            QLineEdit {
-                background: #262c3b;
-                border: 1px solid #3d475f;
-                color: #ffffff;
-                border-radius: 6px;
-                padding: 7px 10px;
-                font-size: 13px;
-            }
-            QPushButton {
-                background-color: #0078d4;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                font-weight: bold;
-                font-size: 12px;
-                padding: 7px 18px;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton#cancel_btn {
-                background-color: #262c3b;
-                border: 1px solid #3d475f;
-            }
-            """
-        )
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(14)
-
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(8)
-        icon_lbl = QLabel()
-        icon_lbl.setPixmap(svg_to_pixmap(REC_SVG_TIMER, 20, 20, "#00d084"))
-        title_lbl = QLabel("Start Timer on Receiver Display")
-        title_lbl.setStyleSheet("font-weight: bold; font-size: 15px; color: #00d084;")
-        header_layout.addWidget(icon_lbl)
-        header_layout.addWidget(title_lbl)
-        header_layout.addStretch()
-        layout.addLayout(header_layout)
-
-        layout.addWidget(QLabel("Enter duration (e.g. 30, 5m, 10:00, or raw number):"))
-        self.timer_edit = QLineEdit()
-        self.timer_edit.setPlaceholderText("30, 5m, 10:00...")
-        raw_prev = self.config.get("last_timer_args", "").strip().strip('"').strip("'")
-        self.timer_edit.setText(raw_prev)
-        self.timer_edit.returnPressed.connect(self.accept)
-        layout.addWidget(self.timer_edit)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setObjectName("cancel_btn")
-        self.cancel_btn.clicked.connect(self.reject)
-
-        self.start_btn = QPushButton("Start Timer")
-        self.start_btn.setIcon(svg_to_icon(REC_SVG_TIMER, 14, "#ffffff"))
-        self.start_btn.clicked.connect(self.accept)
-
-        btn_layout.addWidget(self.cancel_btn)
-        btn_layout.addWidget(self.start_btn)
-        layout.addLayout(btn_layout)
-
-    def get_args(self) -> str:
-        val = self.timer_edit.text().strip().strip('"').strip("'")
-        return val
 
 
 if __name__ == "__main__":
@@ -1651,6 +1978,7 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
 
+    # Force application-wide black background for any transient unpainted frames
     app_palette = app.palette()
     app_palette.setColor(QPalette.Window, Qt.black)
     app_palette.setColor(QPalette.Base, Qt.black)

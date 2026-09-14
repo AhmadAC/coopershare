@@ -132,7 +132,8 @@ class RemoteReceiverCanvas(QWidget):
         )
 
     def keyPressEvent(self, event: QKeyEvent):
-        key_code = event.key()
+        nvk = event.nativeVirtualKey()
+        key_code = nvk if nvk else event.key()
         key_name = event.keyCombination().key().name.replace("Key_", "")
         text = event.text()
 
@@ -150,7 +151,8 @@ class RemoteReceiverCanvas(QWidget):
         event.accept()
 
     def keyReleaseEvent(self, event: QKeyEvent):
-        key_code = event.key()
+        nvk = event.nativeVirtualKey()
+        key_code = nvk if nvk else event.key()
         key_name = event.keyCombination().key().name.replace("Key_", "")
         text = event.text()
 

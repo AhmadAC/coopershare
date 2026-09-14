@@ -176,6 +176,7 @@ except Exception:
 
 
 class UniversalInputInjector:
+    MOUSEEVENTF_MOVE = 0x0001
     MOUSEEVENTF_LEFTDOWN = 0x0002
     MOUSEEVENTF_LEFTUP = 0x0004
     MOUSEEVENTF_RIGHTDOWN = 0x0008
@@ -237,6 +238,12 @@ class UniversalInputInjector:
             else:
                 self.mode = "unsupported"
 
+    def update_geometry(self, screen_w: int, screen_h: int, mon_left: int = 0, mon_top: int = 0):
+        self.screen_w = max(1, screen_w)
+        self.screen_h = max(1, screen_h)
+        self.mon_left = mon_left
+        self.mon_top = mon_top
+
     def execute(self, event: dict):
         ev_type = event.get("type")
         nx = event.get("x")
@@ -254,6 +261,7 @@ class UniversalInputInjector:
             try:
                 if px is not None and py is not None:
                     ctypes.windll.user32.SetCursorPos(int(px), int(py))
+
                 if ev_type in ("touch_down", "mouse_down"):
                     btn = event.get("button", "left")
                     if btn == "right":
@@ -262,6 +270,7 @@ class UniversalInputInjector:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0)
                     else:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+
                 elif ev_type in ("touch_up", "mouse_up"):
                     btn = event.get("button", "left")
                     if btn == "right":
@@ -270,14 +279,20 @@ class UniversalInputInjector:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
                     else:
                         ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+                elif ev_type in ("touch_move", "mouse_move"):
+                    ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_MOVE, 0, 0, 0, 0)
+
                 elif ev_type == "scroll":
                     dy = event.get("dy", 0)
                     delta = 120 if dy > 0 else -120
                     ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+
                 elif ev_type == "key_down":
                     vk = event.get("key_code")
                     if vk:
                         ctypes.windll.user32.keybd_event(vk & 0xFF, 0, 0, 0)
+
                 elif ev_type == "key_up":
                     vk = event.get("key_code")
                     if vk:
@@ -290,6 +305,7 @@ class UniversalInputInjector:
                 if abs_x is not None and abs_y is not None:
                     self.native_uinput.write_event(EV_ABS, ABS_X, abs_x)
                     self.native_uinput.write_event(EV_ABS, ABS_Y, abs_y)
+                    self.native_uinput.syn()
 
                 if ev_type in ("touch_down", "mouse_down"):
                     btn_type = event.get("button", "left")
@@ -318,6 +334,7 @@ class UniversalInputInjector:
                 if abs_x is not None and abs_y is not None:
                     self.ui.write(e.EV_ABS, e.ABS_X, abs_x)
                     self.ui.write(e.EV_ABS, e.ABS_Y, abs_y)
+                    self.ui.syn()
 
                 if ev_type in ("touch_down", "mouse_down"):
                     btn_type = event.get("button", "left")
