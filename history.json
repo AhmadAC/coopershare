@@ -1,10 +1,10 @@
 {
     "last_ip": "172.31.60.175",
     "devices": {
-        "172.31.60.175": "408 STEAM",
+        "172.31.60.175": "STEAM 408",
         "192.168.90.221": "317 CS"
     },
-    "quality_preset": "Ultra Crisp (60 FPS, 89%)",
+    "quality_preset": "Balanced (72%)",
     "touch_input": false,
     "tv_volume": 34,
     "allow_audio_when_paused": false,

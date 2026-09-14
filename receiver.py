@@ -8,7 +8,8 @@ Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSO
           Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput),
           UDP Discovery Beacon, 4-Digit PIN Authentication,
           Vector SVG Icons replacing emojis,
-          Hardware Multi-Touch QTouchEvent Processing.
+          Hardware Multi-Touch QTouchEvent Processing,
+          Native Win32 Taskbar & Window Icon Binding (WM_SETICON & Shell PE Resource Extraction).
 """
 
 import ctypes
@@ -79,7 +80,17 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP_REC") 
 import cv2
 import mss
 import numpy as np
-from PySide6.QtCore import QByteArray, QEvent, QPoint, QPointF, QRect, Qt, QThread, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QFileInfo,
+    QPoint,
+    QPointF,
+    QRect,
+    Qt,
+    QThread,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -98,6 +109,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QFileIconProvider,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -128,33 +140,203 @@ if not logger.handlers:
     logger.addHandler(console_handler)
 
 
+def find_icon_file() -> Optional[str]:
+    """Resolves path to icon.ico or icon.png across PyInstaller bundles, executable dirs, and storage."""
+    candidates = []
+
+    # 1. PyInstaller extracted temporary directory (_MEIPASS)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.extend([
+            os.path.join(meipass, "icon.ico"),
+            os.path.join(meipass, "icon.png"),
+        ])
+
+    # 2. Directory containing the executable and PyInstaller 6+ _internal folder
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.extend([
+            os.path.join(exe_dir, "icon.ico"),
+            os.path.join(exe_dir, "icon.png"),
+            os.path.join(exe_dir, "_internal", "icon.ico"),
+            os.path.join(exe_dir, "_internal", "icon.png"),
+        ])
+
+    # 3. Application directory (APP_DIR)
+    candidates.extend([
+        os.path.join(APP_DIR, "icon.ico"),
+        os.path.join(APP_DIR, "icon.png"),
+    ])
+
+    # 4. Source script directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.extend([
+        os.path.join(script_dir, "icon.ico"),
+        os.path.join(script_dir, "icon.png"),
+    ])
+
+    for path in candidates:
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
+
 def create_application_icon() -> QIcon:
-    """Generates the identical crisp application icon or loads existing .ico/.png."""
-    for candidate in (os.path.join(APP_DIR, "icon.ico"), os.path.join(APP_DIR, "icon.png")):
-        if os.path.exists(candidate):
-            return QIcon(candidate)
+    """Generates the crisp multi-resolution application icon or loads existing .ico/.png/PE executable."""
+    icon_path = find_icon_file()
+    if icon_path:
+        icon = QIcon(icon_path)
+        if not icon.isNull():
+            return icon
 
-    pix = QPixmap(64, 64)
-    pix.fill(Qt.transparent)
-    painter = QPainter(pix)
-    painter.setRenderHint(QPainter.Antialiasing, True)
+    # If running as a frozen Windows PE executable, extract embedded icon via Windows Shell
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        try:
+            provider = QFileIconProvider()
+            exe_icon = provider.icon(QFileInfo(sys.executable))
+            if not exe_icon.isNull():
+                return exe_icon
+        except Exception:
+            pass
 
-    painter.setBrush(QColor("#0078d4"))
-    painter.setPen(Qt.NoPen)
-    painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
+    # Programmatic multi-resolution icon generation (16, 24, 32, 48, 64, 128, 256)
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        pix = QPixmap(size, size)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing, True)
 
-    painter.setBrush(QColor("#ffffff"))
-    painter.drawRoundedRect(14, 15, 36, 24, 4, 4)
+        scale = size / 64.0
+        painter.setBrush(QColor("#0078d4"))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(
+            int(4 * scale),
+            int(4 * scale),
+            int(56 * scale),
+            int(56 * scale),
+            int(14 * scale),
+            int(14 * scale),
+        )
 
-    painter.setBrush(QColor("#1a1e29"))
-    painter.drawRect(18, 19, 28, 16)
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(
+            int(14 * scale),
+            int(15 * scale),
+            int(36 * scale),
+            int(24 * scale),
+            int(4 * scale),
+            int(4 * scale),
+        )
 
-    painter.setBrush(QColor("#ffffff"))
-    painter.drawRect(29, 41, 6, 4)
-    painter.drawRoundedRect(22, 45, 20, 3, 1, 1)
+        painter.setBrush(QColor("#1a1e29"))
+        painter.drawRect(
+            int(18 * scale),
+            int(19 * scale),
+            int(28 * scale),
+            int(16 * scale),
+        )
 
-    painter.end()
-    return QIcon(pix)
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRect(
+            int(29 * scale),
+            int(41 * scale),
+            int(6 * scale),
+            int(4 * scale),
+        )
+        painter.drawRoundedRect(
+            int(22 * scale),
+            int(45 * scale),
+            int(20 * scale),
+            int(3 * scale),
+            int(1.5 * scale),
+            int(1.5 * scale),
+        )
+
+        painter.end()
+        icon.addPixmap(pix)
+
+    # Persist generated assets to APP_DIR so native Win32 APIs can reference them
+    try:
+        ico_dest = os.path.join(APP_DIR, "icon.ico")
+        png_dest = os.path.join(APP_DIR, "icon.png")
+        if not os.path.exists(png_dest):
+            pix_256 = icon.pixmap(256, 256)
+            pix_256.save(png_dest, "PNG")
+        if not os.path.exists(ico_dest):
+            pix_64 = icon.pixmap(64, 64)
+            pix_64.save(ico_dest, "ICO")
+    except Exception:
+        pass
+
+    return icon
+
+
+def apply_win32_window_icon(hwnd: int):
+    """Binds native Win32 window and class icons (WM_SETICON / GCLP_HICON) for taskbar and Alt-Tab."""
+    if sys.platform != "win32" or not hwnd:
+        return
+
+    WM_SETICON = 0x0080
+    ICON_SMALL = 0
+    ICON_BIG = 1
+    IMAGE_ICON = 1
+    LR_LOADFROMFILE = 0x00000010
+    LR_DEFAULTSIZE = 0x00000040
+    GCLP_HICON = -14
+    GCLP_HICONSM = -34
+
+    h_icon_big = None
+    h_icon_small = None
+
+    # 1. Attempt loading directly from resolved .ico file
+    ico_path = find_icon_file()
+    if ico_path and ico_path.lower().endswith(".ico") and os.path.isfile(ico_path):
+        try:
+            h_icon_big = ctypes.windll.user32.LoadImageW(
+                None, ico_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+            )
+            cx_sm = ctypes.windll.user32.GetSystemMetrics(49)  # SM_CXSMICON
+            cy_sm = ctypes.windll.user32.GetSystemMetrics(50)  # SM_CYSMICON
+            h_icon_small = ctypes.windll.user32.LoadImageW(
+                None, ico_path, IMAGE_ICON, cx_sm, cy_sm, LR_LOADFROMFILE
+            )
+        except Exception:
+            pass
+
+    # 2. If running frozen executable, extract PE icon resource directly
+    if (not h_icon_big or not h_icon_small) and getattr(sys, "frozen", False):
+        try:
+            h_inst = ctypes.windll.kernel32.GetModuleHandleW(None)
+            h_icon_extracted = ctypes.windll.shell32.ExtractIconW(h_inst, sys.executable, 0)
+            if h_icon_extracted and h_icon_extracted != 1:
+                if not h_icon_big:
+                    h_icon_big = h_icon_extracted
+                if not h_icon_small:
+                    h_icon_small = h_icon_extracted
+        except Exception:
+            pass
+
+    # 3. Bind Win32 message and class pointers
+    if h_icon_big:
+        try:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, h_icon_big)
+            ctypes.windll.user32.SetClassLongPtrW(hwnd, GCLP_HICON, h_icon_big)
+        except Exception:
+            pass
+
+    if h_icon_small:
+        try:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_icon_small)
+            ctypes.windll.user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, h_icon_small)
+        except Exception:
+            pass
+    elif h_icon_big:
+        try:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_icon_big)
+            ctypes.windll.user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, h_icon_big)
+        except Exception:
+            pass
 
 
 def svg_to_pixmap(svg_str: str, width: int = 16, height: int = 16, color: Optional[str] = "#ffffff") -> QPixmap:
@@ -1545,6 +1727,10 @@ class ReceiverMainWindow(QMainWindow):
 
         self._ensure_frameless_style()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._ensure_frameless_style()
+
     def _ensure_frameless_style(self):
         if sys.platform == "win32":
             try:
@@ -1555,12 +1741,14 @@ class ReceiverMainWindow(QMainWindow):
                 black_brush = ctypes.windll.gdi32.CreateSolidBrush(0x00000000)
                 ctypes.windll.user32.SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, black_brush)
 
-                # Strip Windows title bars & standard borders
+                # Strip Windows title bars & standard borders while preserving WS_SYSMENU and WS_MINIMIZEBOX for taskbar icon
                 GWL_STYLE = -16
                 WS_CAPTION = 0x00C00000
                 WS_THICKFRAME = 0x00040000
+                WS_SYSMENU = 0x00080000
+                WS_MINIMIZEBOX = 0x00020000
                 style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
-                new_style = style & ~WS_CAPTION & ~WS_THICKFRAME
+                new_style = (style & ~WS_CAPTION & ~WS_THICKFRAME) | WS_SYSMENU | WS_MINIMIZEBOX
                 if new_style != style:
                     ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
 
@@ -1587,6 +1775,9 @@ class ReceiverMainWindow(QMainWindow):
                 ctypes.windll.user32.SetWindowPos(
                     hwnd, 0, 0, 0, 0, 0, 0x0020 | 0x0002 | 0x0001 | 0x0004
                 )
+
+                # Explicitly bind native Win32 window icon to ensure taskbar representation
+                apply_win32_window_icon(hwnd)
             except Exception as e:
                 logger.debug(f"Frameless enforcement notice: {e}")
 
@@ -1976,5 +2167,6 @@ if __name__ == "__main__":
 
     win = ReceiverMainWindow()
     win.setWindowIcon(app_icon)
+    win.show()
     win.set_receiver_fullscreen(True)
     sys.exit(app.exec())
