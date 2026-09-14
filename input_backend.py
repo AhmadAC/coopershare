@@ -11,12 +11,16 @@ Supports:
 
 import ctypes
 from ctypes import Structure, c_char, c_int, c_uint16, c_uint32
-import fcntl
 import os
 import struct
 import sys
 import time
 import numpy as np
+
+try:
+    import fcntl
+except (ImportError, ModuleNotFoundError):
+    fcntl = None
 
 # ---------------------------------------------------------------------------
 # Linux Kernel Input Subsystem Constants (linux/input.h & linux/uinput.h)
@@ -74,6 +78,9 @@ class PurePythonLinuxUInput:
     """Direct zero-dependency Linux /dev/uinput virtual hardware absolute pointer & keyboard."""
 
     def __init__(self, max_abs: int = UINPUT_MAX_ABS):
+        if fcntl is None:
+            raise NotImplementedError("fcntl module is not available on this platform.")
+
         self.fd = -1
         uinput_path = None
         for cand in ("/dev/uinput", "/dev/input/uinput"):
@@ -137,7 +144,7 @@ class PurePythonLinuxUInput:
         time.sleep(0.15)
 
     def write_event(self, ev_type: int, code: int, value: int):
-        if self.fd >= 0:
+        if self.fd >= 0 and fcntl is not None:
             is_64bit = struct.calcsize("P") == 8
             fmt = "qqHHi" if is_64bit else "iiHHi"
             payload = struct.pack(fmt, 0, 0, ev_type, code, value)
@@ -149,7 +156,8 @@ class PurePythonLinuxUInput:
     def close(self):
         if self.fd >= 0:
             try:
-                fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+                if fcntl is not None:
+                    fcntl.ioctl(self.fd, UI_DEV_DESTROY)
                 os.close(self.fd)
             except Exception:
                 pass
@@ -221,7 +229,7 @@ class UniversalInputInjector:
                 except Exception:
                     pass
 
-            if self.mode == "none":
+            if self.mode == "none" and fcntl is not None:
                 try:
                     self.native_uinput = PurePythonLinuxUInput(max_abs=UINPUT_MAX_ABS)
                     self.mode = "direct_uinput"

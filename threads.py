@@ -6,7 +6,11 @@ Supports native Windows WASAPI loopback, KDE Plasma 6 KWin D-Bus ScreenShot2 ker
 pipelined asynchronous streaming, KDE Spectacle fallback, and MSS hardware capture.
 """
 
-import fcntl
+try:
+    import fcntl
+except (ImportError, ModuleNotFoundError):
+    fcntl = None
+
 import json
 import os
 import queue
@@ -22,8 +26,12 @@ from typing import Optional
 import cv2
 import numpy as np
 from PySide6.QtCore import QThread, Signal
-from PySide6.QtDBus import QDBusMessage
 from PySide6.QtGui import QGuiApplication, QImage
+
+try:
+    from PySide6.QtDBus import QDBusMessage
+except (ImportError, ModuleNotFoundError):
+    QDBusMessage = None
 
 from audio_backend import NativeWindowsWasapiLoopback
 from config import (
@@ -44,9 +52,9 @@ if AUDIO_AVAILABLE:
     import sounddevice as sd
 
 
-def _is_dbus_error(msg: QDBusMessage) -> bool:
+def _is_dbus_error(msg) -> bool:
     """Safely determines if a QDBusMessage is an error across all Qt/PySide versions."""
-    if not msg:
+    if msg is None or QDBusMessage is None:
         return True
     try:
         err_msg = msg.errorMessage()
@@ -162,7 +170,10 @@ class KWinScreenShot2Grabber:
         self.logical_w = 1536
         self.logical_h = 864
         self.dpr = 1.0
-        self.pipe_reader = FastPipeReader()
+        self.pipe_reader = None
+
+        if not sys.platform.startswith("linux") or fcntl is None:
+            return
 
         screen = QGuiApplication.primaryScreen()
         if screen:
@@ -172,8 +183,7 @@ class KWinScreenShot2Grabber:
             self.native_w = int(round(self.logical_w * self.dpr))
             self.native_h = int(round(self.logical_h * self.dpr))
 
-        if not sys.platform.startswith("linux"):
-            return
+        self.pipe_reader = FastPipeReader()
 
         try:
             from PySide6.QtDBus import QDBusConnection, QDBusInterface
@@ -207,7 +217,7 @@ class KWinScreenShot2Grabber:
         native_resolution: bool = False,
         init_timeout: float = 0.25,
     ) -> Optional[np.ndarray]:
-        if not self.iface:
+        if not self.iface or not self.pipe_reader or fcntl is None:
             return None
         r_fd, w_fd = -1, -1
         try:

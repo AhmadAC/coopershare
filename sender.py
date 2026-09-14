@@ -16,16 +16,6 @@ if sys.platform.startswith("linux"):
     if "QT_QPA_PLATFORM" not in os.environ:
         os.environ["QT_QPA_PLATFORM"] = "wayland;xcb"
 
-# Enable Per-Monitor High DPI Awareness on Windows early
-if sys.platform == "win32":
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 

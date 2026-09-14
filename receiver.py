@@ -33,16 +33,6 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
-# Enable Per-Monitor High DPI Awareness on Windows early
-if sys.platform == "win32":
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-
 # ---------------------------------------------------------------------------
 # Storage Directory Resolution (Handles AppImage, Frozen Onedir, & Fallbacks)
 # ---------------------------------------------------------------------------
@@ -1440,11 +1430,9 @@ class TouchDisplayCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        # Always fill the entire widget area with pure black to guarantee zero edge flickering
         painter.fillRect(self.rect(), Qt.black)
 
         if self.current_frame and not self.current_frame.isNull():
-            # Retain smooth scaling without anti-aliasing edge artifacts on the rectangular blit
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             target_rect = self._get_video_rect()
             painter.drawPixmap(target_rect, self.current_frame)
@@ -1596,7 +1584,6 @@ class ReceiverMainWindow(QMainWindow):
                 )
 
                 # Commit window frame style changes immediately
-                # SWP_FRAMECHANGED = 0x0020, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004
                 ctypes.windll.user32.SetWindowPos(
                     hwnd, 0, 0, 0, 0, 0, 0x0020 | 0x0002 | 0x0001 | 0x0004
                 )
