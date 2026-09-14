@@ -1,13 +1,155 @@
 """
-Cross-Platform Universal Input Injector supporting native Win32 API (Windows),
-evdev direct touchscreen and pointer injection (Linux Wayland / X11), and pynput fallback.
+Cross-Platform Universal Input Injector.
+Supports:
+- Native Win32 API (Windows)
+- Direct Linux Kernel /dev/uinput virtual absolute pointer driver (Zero external dependencies on Wayland / X11)
+- python-evdev driver (if installed)
+- pynput fallback (X11 only)
 """
 
 import ctypes
+from ctypes import Structure, c_char, c_int, c_uint16, c_uint32
+import fcntl
 import os
+import struct
 import sys
+import time
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Linux Kernel Input Subsystem Constants (linux/input.h & linux/uinput.h)
+# ---------------------------------------------------------------------------
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_REL = 0x02
+EV_ABS = 0x03
+
+SYN_REPORT = 0
+
+BTN_LEFT = 0x110
+BTN_RIGHT = 0x111
+BTN_MIDDLE = 0x112
+BTN_SIDE = 0x113
+BTN_EXTRA = 0x114
+
+REL_WHEEL = 0x08
+
+ABS_X = 0x00
+ABS_Y = 0x01
+
+# Linux uinput ioctl codes
+UI_SET_EVBIT = 0x40045564
+UI_SET_KEYBIT = 0x40045565
+UI_SET_RELBIT = 0x40045566
+UI_SET_ABSBIT = 0x40045567
+UI_SET_PROPBIT = 0x4004556E
+UI_DEV_CREATE = 0x5501
+UI_DEV_DESTROY = 0x5502
+
+# Input property: marks device as an on-screen pointer cursor
+INPUT_PROP_POINTER = 0x00
+
+# High-resolution coordinate normalization space
+UINPUT_MAX_ABS = 32767
+
+
+class UInputUserDev(Structure):
+    _fields_ = [
+        ("name", c_char * 80),
+        ("id_bustype", c_uint16),
+        ("id_vendor", c_uint16),
+        ("id_product", c_uint16),
+        ("id_version", c_uint16),
+        ("ff_effects_max", c_uint32),
+        ("absmax", c_int * 64),
+        ("absmin", c_int * 64),
+        ("absfuzz", c_int * 64),
+        ("absflat", c_int * 64),
+    ]
+
+
+class PurePythonLinuxUInput:
+    """Direct zero-dependency Linux /dev/uinput virtual hardware absolute pointer."""
+
+    def __init__(self, max_abs: int = UINPUT_MAX_ABS):
+        self.fd = -1
+        uinput_path = None
+        for cand in ("/dev/uinput", "/dev/input/uinput"):
+            if os.path.exists(cand):
+                uinput_path = cand
+                break
+
+        if not uinput_path:
+            raise FileNotFoundError("Linux /dev/uinput device node not found.")
+
+        try:
+            self.fd = os.open(uinput_path, os.O_WRONLY | os.O_NONBLOCK)
+        except PermissionError:
+            raise PermissionError(
+                f"Permission denied on {uinput_path}. "
+                f"Run: sudo setfacl -m u:$USER:rw {uinput_path}"
+            )
+
+        # 1. Declare event types
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_SYN)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        for btn in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA):
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, btn)
+
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_REL)
+        fcntl.ioctl(self.fd, UI_SET_RELBIT, REL_WHEEL)
+
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_ABS)
+        fcntl.ioctl(self.fd, UI_SET_ABSBIT, ABS_X)
+        fcntl.ioctl(self.fd, UI_SET_ABSBIT, ABS_Y)
+
+        # 2. Tell libinput and KWin this is an on-screen cursor pointer
+        try:
+            fcntl.ioctl(self.fd, UI_SET_PROPBIT, INPUT_PROP_POINTER)
+        except Exception:
+            pass
+
+        # 3. Configure device identity and axis ranges
+        udev = UInputUserDev()
+        udev.name = b"MrCoopersScreenShare-Virtual-Pointer"
+        udev.id_bustype = 0x03  # BUS_USB
+        udev.id_vendor = 0x1234
+        udev.id_product = 0x5678
+        udev.id_version = 1
+
+        udev.absmin[ABS_X] = 0
+        udev.absmax[ABS_X] = max_abs
+        udev.absmin[ABS_Y] = 0
+        udev.absmax[ABS_Y] = max_abs
+
+        os.write(self.fd, bytes(udev))
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+        # Allow udev and KWin compositor time to bind the new virtual device node
+        time.sleep(0.15)
+
+    def write_event(self, ev_type: int, code: int, value: int):
+        if self.fd >= 0:
+            # 64-bit Linux struct input_event: timeval (8 bytes sec, 8 bytes usec), uint16, uint16, int32 (24 bytes)
+            is_64bit = struct.calcsize("P") == 8
+            fmt = "qqHHi" if is_64bit else "iiHHi"
+            payload = struct.pack(fmt, 0, 0, ev_type, code, value)
+            os.write(self.fd, payload)
+
+    def syn(self):
+        self.write_event(EV_SYN, SYN_REPORT, 0)
+
+    def close(self):
+        if self.fd >= 0:
+            try:
+                fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = -1
+
+
+# Optional python-evdev driver
 USE_EVDEV = False
 if sys.platform.startswith("linux"):
     try:
@@ -18,6 +160,7 @@ if sys.platform.startswith("linux"):
     except Exception:
         USE_EVDEV = False
 
+# Optional pynput mouse fallback
 Button = None
 MouseController = None
 try:
@@ -44,45 +187,54 @@ class UniversalInputInjector:
         self.mode = "none"
         self.mouse = None
         self.ui = None
+        self.native_uinput = None
+
+        # Track button states to prevent redundant event bounces
+        self._btn_down = {"left": False, "right": False, "middle": False}
 
         if sys.platform == "win32":
             self.mode = "win32"
             print(f"[DEBUG Injector] Using native Win32 hardware input injection on bounds ({mon_left},{mon_top},{screen_w}x{screen_h}).")
-        elif USE_EVDEV:
-            try:
-                min_x = min(0, mon_left)
-                max_x = max(self.screen_w, mon_left + self.screen_w)
-                min_y = min(0, mon_top)
-                max_y = max(self.screen_h, mon_top + self.screen_h)
 
-                cap = {
-                    e.EV_KEY: [
-                        e.BTN_LEFT,
-                        e.BTN_RIGHT,
-                        e.BTN_MIDDLE,
-                        e.BTN_TOUCH,
-                        e.BTN_TOOL_FINGER,
-                    ],
-                    e.EV_ABS: [
-                        (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=1)),
-                        (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=1)),
-                    ],
-                    e.EV_REL: [e.REL_WHEEL],
-                }
+        elif sys.platform.startswith("linux"):
+            # 1. Try python-evdev absolute pointer
+            if USE_EVDEV:
+                try:
+                    cap = {
+                        e.EV_KEY: [
+                            e.BTN_LEFT,
+                            e.BTN_RIGHT,
+                            e.BTN_MIDDLE,
+                            e.BTN_SIDE,
+                            e.BTN_EXTRA,
+                        ],
+                        e.EV_ABS: [
+                            (e.ABS_X, AbsInfo(value=0, min=0, max=UINPUT_MAX_ABS, fuzz=0, flat=0, resolution=1)),
+                            (e.ABS_Y, AbsInfo(value=0, min=0, max=UINPUT_MAX_ABS, fuzz=0, flat=0, resolution=1)),
+                        ],
+                        e.EV_REL: [e.REL_WHEEL],
+                    }
 
-                self.ui = UInput(cap, name="mrcoopers-virtual-input")
-                self.mode = "evdev"
-                print(f"[DEBUG Injector] Linux evdev kernel virtual pointer active ({max_x}x{max_y}).")
-            except PermissionError as p_err:
-                print(
-                    f"\n[ERROR Injector] Permission denied on /dev/uinput: {p_err}\n"
-                    "Run: sudo setfacl -m u:$USER:rw /dev/uinput\n"
-                )
-                self.mode = "none"
-            except Exception as ex:
-                print(f"[DEBUG Injector] evdev init failed: {ex}")
-                self.mode = "none"
+                    self.ui = UInput(cap, name="mrcoopers-virtual-pointer", input_props=[0])
+                    self.mode = "evdev"
+                    print(f"[DEBUG Injector] Linux evdev virtual absolute pointer active (0..{UINPUT_MAX_ABS}).")
+                except PermissionError:
+                    print("\n[ERROR Injector] Permission denied on /dev/uinput. Run: sudo setfacl -m u:$USER:rw /dev/uinput\n")
+                except Exception as ex:
+                    print(f"[DEBUG Injector] evdev init notice: {ex}")
 
+            # 2. Try zero-dependency direct Linux /dev/uinput kernel driver
+            if self.mode == "none":
+                try:
+                    self.native_uinput = PurePythonLinuxUInput(max_abs=UINPUT_MAX_ABS)
+                    self.mode = "direct_uinput"
+                    print(f"[DEBUG Injector] Native Linux /dev/uinput kernel pointer active (0..{UINPUT_MAX_ABS}).")
+                except PermissionError as p_err:
+                    print(f"\n[ERROR Injector] {p_err}\n")
+                except Exception as ex:
+                    print(f"[DEBUG Injector] Native uinput init notice: {ex}")
+
+        # 3. Fallback to pynput on X11
         if self.mode == "none":
             if MouseController is not None:
                 try:
@@ -100,11 +252,14 @@ class UniversalInputInjector:
         nx = event.get("x")
         ny = event.get("y")
 
+        # Calculate coordinates for Win32 and pynput
         if nx is not None and ny is not None:
             px = self.mon_left + int(np.clip(nx, 0.0, 1.0) * (self.screen_w - 1))
             py = self.mon_top + int(np.clip(ny, 0.0, 1.0) * (self.screen_h - 1))
+            abs_x = int(np.clip(nx, 0.0, 1.0) * UINPUT_MAX_ABS)
+            abs_y = int(np.clip(ny, 0.0, 1.0) * UINPUT_MAX_ABS)
         else:
-            px, py = None, None
+            px, py, abs_x, abs_y = None, None, None, None
 
         if self.mode == "win32":
             try:
@@ -133,37 +288,60 @@ class UniversalInputInjector:
             except Exception as ex:
                 print(f"[DEBUG Injector Win32] Execution failed: {ex}")
 
-        elif self.mode == "evdev" and self.ui:
+        elif self.mode == "direct_uinput" and self.native_uinput:
             try:
-                if px is not None and py is not None:
-                    self.ui.write(e.EV_ABS, e.ABS_X, int(px))
-                    self.ui.write(e.EV_ABS, e.ABS_Y, int(py))
+                # Update absolute cursor position
+                if abs_x is not None and abs_y is not None:
+                    self.native_uinput.write_event(EV_ABS, ABS_X, abs_x)
+                    self.native_uinput.write_event(EV_ABS, ABS_Y, abs_y)
 
                 if ev_type in ("touch_down", "mouse_down"):
                     btn_type = event.get("button", "left")
-                    btn_code = (
-                        e.BTN_RIGHT
-                        if btn_type == "right"
-                        else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
-                    )
-                    if btn_code == e.BTN_LEFT:
-                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
-                    self.ui.write(e.EV_KEY, btn_code, 1)
-                    self.ui.syn()
-                    print(f"[DEBUG Injector evdev] Touch Down at ({px}, {py}) btn={btn_type}")
+                    btn_code = BTN_RIGHT if btn_type == "right" else (BTN_MIDDLE if btn_type == "middle" else BTN_LEFT)
+                    if not self._btn_down.get(btn_type, False):
+                        self._btn_down[btn_type] = True
+                        self.native_uinput.write_event(EV_KEY, btn_code, 1)
+                    self.native_uinput.syn()
 
                 elif ev_type in ("touch_up", "mouse_up"):
                     btn_type = event.get("button", "left")
-                    btn_code = (
-                        e.BTN_RIGHT
-                        if btn_type == "right"
-                        else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
-                    )
-                    if btn_code == e.BTN_LEFT:
-                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
-                    self.ui.write(e.EV_KEY, btn_code, 0)
+                    btn_code = BTN_RIGHT if btn_type == "right" else (BTN_MIDDLE if btn_type == "middle" else BTN_LEFT)
+                    if self._btn_down.get(btn_type, False):
+                        self._btn_down[btn_type] = False
+                        self.native_uinput.write_event(EV_KEY, btn_code, 0)
+                    self.native_uinput.syn()
+
+                elif ev_type in ("touch_move", "mouse_move"):
+                    self.native_uinput.syn()
+
+                elif ev_type == "scroll":
+                    dy = 1 if event.get("dy", 0) > 0 else -1
+                    self.native_uinput.write_event(EV_REL, REL_WHEEL, dy)
+                    self.native_uinput.syn()
+            except Exception as ex:
+                print(f"[DEBUG Injector uinput] Execution failed: {ex}")
+
+        elif self.mode == "evdev" and self.ui:
+            try:
+                if abs_x is not None and abs_y is not None:
+                    self.ui.write(e.EV_ABS, e.ABS_X, abs_x)
+                    self.ui.write(e.EV_ABS, e.ABS_Y, abs_y)
+
+                if ev_type in ("touch_down", "mouse_down"):
+                    btn_type = event.get("button", "left")
+                    btn_code = e.BTN_RIGHT if btn_type == "right" else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    if not self._btn_down.get(btn_type, False):
+                        self._btn_down[btn_type] = True
+                        self.ui.write(e.EV_KEY, btn_code, 1)
                     self.ui.syn()
-                    print(f"[DEBUG Injector evdev] Touch Up at ({px}, {py}) btn={btn_type}")
+
+                elif ev_type in ("touch_up", "mouse_up"):
+                    btn_type = event.get("button", "left")
+                    btn_code = e.BTN_RIGHT if btn_type == "right" else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    if self._btn_down.get(btn_type, False):
+                        self._btn_down[btn_type] = False
+                        self.ui.write(e.EV_KEY, btn_code, 0)
+                    self.ui.syn()
 
                 elif ev_type in ("touch_move", "mouse_move"):
                     self.ui.syn()
@@ -196,8 +374,13 @@ class UniversalInputInjector:
                 self.mouse.scroll(0, 1 if event.get("dy", 0) > 0 else -1)
 
     def close(self):
+        if self.native_uinput:
+            self.native_uinput.close()
+            self.native_uinput = None
+
         if self.mode == "evdev" and self.ui:
             try:
                 self.ui.close()
             except Exception:
                 pass
+            self.ui = None
