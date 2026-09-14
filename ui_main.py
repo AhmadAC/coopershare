@@ -452,9 +452,9 @@ class FloatingSenderWindow(QWidget):
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(
             [
-                "Pixel-Perfect 1:1 (95% 4:4:4 - Smooth 60 FPS)",
-                "Maximum Detail (98% 4:4:4 - High Bandwidth)",
-                "Ultra Crisp (92%)",
+                "Ultra Crisp (60 FPS, 89%)",
+                "Pixel-Perfect 1:1 (95% 4:4:4)",
+                "Maximum Detail (98% 4:4:4)",
                 "High Quality (82%)",
                 "Balanced (72%)",
                 "Studio 4:4:4 (88%)",
@@ -471,13 +471,10 @@ class FloatingSenderWindow(QWidget):
                 elif "pixel-perfect" in str(saved_quality).lower() and "pixel-perfect" in txt.lower():
                     matched_q = i
                     break
-                elif "studio" in str(saved_quality).lower() and "studio" in txt.lower():
-                    matched_q = i
-                    break
-                elif "4:4:4" in str(saved_quality) and "studio" in txt.lower():
-                    matched_q = i
-                    break
                 elif "ultra" in str(saved_quality).lower() and "ultra" in txt.lower():
+                    matched_q = i
+                    break
+                elif "studio" in str(saved_quality).lower() and "studio" in txt.lower():
                     matched_q = i
                     break
                 elif "high" in str(saved_quality).lower() and "high" in txt.lower():
@@ -491,7 +488,7 @@ class FloatingSenderWindow(QWidget):
             self.quality_combo.setCurrentIndex(0)
         self.quality_combo.currentIndexChanged.connect(self.on_quality_changed)
         self.quality_combo.setToolTip(
-            "Pixel-Perfect 1:1 (95% 4:4:4) guarantees full native physical resolution with zero chroma subsampling at high FPS."
+            "Ultra Crisp (60 FPS, 89%) renders text razor-sharp while sustaining full 60 FPS without network lag."
         )
 
         qual_row.addWidget(self.fps_combo)
@@ -1113,8 +1110,8 @@ class FloatingSenderWindow(QWidget):
             return 98, True, True
         elif "pixel-perfect" in text or "95%" in text:
             return 95, True, True
-        elif "ultra" in text or "92%" in text:
-            return 92, False, True
+        elif "ultra" in text or "89%" in text or "92%" in text:
+            return 89, False, False
         elif "high" in text or "82%" in text:
             return 82, False, False
         elif "balanced" in text or "72%" in text:
@@ -1122,7 +1119,7 @@ class FloatingSenderWindow(QWidget):
         elif "studio" in text or "4:4:4" in text:
             return 88, True, True
         else:
-            return 95, True, True
+            return 89, False, False
 
     def on_quality_changed(self, index: int):
         target_quality, use_444, native_res = self._get_quality_settings(index)

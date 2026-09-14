@@ -189,7 +189,7 @@ class KWinScreenShot2Grabber:
             self.iface = _get_interface()
             if self.iface.isValid():
                 for attempt in range(2):
-                    test_frame = self.grab(include_cursor=True, native_resolution=True, init_timeout=1.5)
+                    test_frame = self.grab(include_cursor=True, native_resolution=False, init_timeout=1.5)
                     if test_frame is not None and test_frame.size > 0:
                         self.available = True
                         print(
@@ -212,7 +212,7 @@ class KWinScreenShot2Grabber:
     def grab(
         self,
         include_cursor: bool = True,
-        native_resolution: bool = True,
+        native_resolution: bool = False,
         init_timeout: float = 0.25,
     ) -> Optional[np.ndarray]:
         if not self.iface:
@@ -466,10 +466,10 @@ class ScreenSenderThread(QThread):
         self,
         target_ip: str,
         pin: str = "",
-        quality: int = 95,
+        quality: int = 89,
         fps_limit: int = 60,
-        use_444_chroma: bool = True,
-        native_resolution: bool = True,
+        use_444_chroma: bool = False,
+        native_resolution: bool = False,
     ):
         super().__init__()
         self.target_ip = target_ip
@@ -493,12 +493,13 @@ class ScreenSenderThread(QThread):
         self._enc_durations = []
         self._net_durations = []
         self._frames_sent = 0
+        self._last_net_duration = 0.0
 
     def set_fps_limit(self, fps: int):
         self.fps_limit = max(1, fps)
         print(f"[DEBUG Sender Video] Dynamic framerate adjusted to: {self.fps_limit} FPS")
 
-    def set_quality_params(self, quality: int, use_444: bool, native_resolution: bool = True):
+    def set_quality_params(self, quality: int, use_444: bool, native_resolution: bool = False):
         self.quality = quality
         self.use_444_chroma = use_444
         self.native_resolution = native_resolution
@@ -511,7 +512,7 @@ class ScreenSenderThread(QThread):
         self.send_cursorless_frame_once = True
 
     def _encoder_worker(self):
-        """Stage 2: Dedicated worker for parallel JPEG encoding off the capture thread."""
+        """Stage 2: High-speed concurrent worker for parallel SIMD JPEG encoding."""
         while self.pipeline_running:
             try:
                 item = self.raw_queue.get(timeout=0.04)
@@ -521,7 +522,13 @@ class ScreenSenderThread(QThread):
             frame_raw, t_cap_ms = item
 
             t_enc_start = time.perf_counter()
-            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+
+            # Dynamic congestion throttle: adapt quality slightly if link is congesting
+            eff_quality = self.quality
+            if self._last_net_duration > 22.0:
+                eff_quality = max(70, self.quality - 4)
+
+            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), eff_quality]
 
             if self.use_444_chroma:
                 sampling_factor_id = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR", 10)
@@ -569,6 +576,7 @@ class ScreenSenderThread(QThread):
                 break
             t_send_end = time.perf_counter()
             t_send_ms = (t_send_end - t_send_start) * 1000.0
+            self._last_net_duration = t_send_ms
 
             with self._stats_lock:
                 self._frames_sent += 1
@@ -608,7 +616,7 @@ class ScreenSenderThread(QThread):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_SIZE)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
             except Exception as e:
                 print(f"[DEBUG Sender Video] SO_SNDBUF setting notice: {e}")
 
@@ -687,7 +695,7 @@ class ScreenSenderThread(QThread):
                     t_cap_start = time.perf_counter()
 
                     if use_kwin:
-                        use_native_res = bool(self.native_resolution or self.quality >= 90)
+                        use_native_res = bool(self.native_resolution and self.quality >= 95)
                         want_cursor = not (self.paused or self.send_cursorless_frame_once)
                         frame_raw = kwin_grabber.grab(
                             include_cursor=want_cursor,
