@@ -84,10 +84,14 @@ def _extract_dict_from_dbus_meta(meta_raw) -> dict:
 
 
 class FastPipeReader:
-    """High-speed zero-copy double-buffered worker that reads exact frame payloads from Linux kernel pipe."""
+    """High-speed zero-copy triple-buffered worker that reads exact frame payloads from Linux kernel pipe."""
 
     def __init__(self, initial_capacity: int = 1920 * 1080 * 4 + 131072):
-        self.buffers = [bytearray(initial_capacity), bytearray(initial_capacity)]
+        self.buffers = [
+            bytearray(initial_capacity),
+            bytearray(initial_capacity),
+            bytearray(initial_capacity),
+        ]
         self.buf_idx = 0
         self.bytes_read = 0
         self.expected_size = 0
@@ -102,7 +106,7 @@ class FastPipeReader:
         self.fd = fd
         self.expected_size = expected_size
         self.bytes_read = 0
-        self.buf_idx = 1 - self.buf_idx
+        self.buf_idx = (self.buf_idx + 1) % len(self.buffers)
         self.done_evt.clear()
         self.start_evt.set()
 
@@ -129,13 +133,13 @@ class FastPipeReader:
             offset = 0
 
             try:
-                with open(fd, "rb", buffering=0, closefd=False) as f:
-                    while expected <= 0 or offset < expected:
-                        chunk_size = min(1048576, expected - offset) if expected > 0 else 1048576
-                        n = f.readinto(mv[offset : offset + chunk_size])
-                        if not n:
-                            break
-                        offset += n
+                while expected <= 0 or offset < expected:
+                    chunk_size = min(1048576, expected - offset) if expected > 0 else 1048576
+                    chunk = os.read(fd, chunk_size)
+                    if not chunk:
+                        break
+                    mv[offset : offset + len(chunk)] = chunk
+                    offset += len(chunk)
             except Exception:
                 pass
 
@@ -305,7 +309,6 @@ class KWinScreenShot2Grabber:
             if len(raw_mv) < total_expected_bytes:
                 return None
 
-            # Instant zero-copy memory wrap of raw 4-channel BGRA frame
             arr = np.frombuffer(raw_mv, dtype=np.uint8, count=total_expected_bytes).reshape((height, width, 4))
             return arr
 
@@ -463,9 +466,10 @@ class ScreenSenderThread(QThread):
         self,
         target_ip: str,
         pin: str = "",
-        quality: int = 92,
+        quality: int = 95,
         fps_limit: int = 60,
-        use_444_chroma: bool = False,
+        use_444_chroma: bool = True,
+        native_resolution: bool = True,
     ):
         super().__init__()
         self.target_ip = target_ip
@@ -473,52 +477,50 @@ class ScreenSenderThread(QThread):
         self.quality = quality
         self.fps_limit = fps_limit
         self.use_444_chroma = use_444_chroma
+        self.native_resolution = native_resolution
         self.running = True
         self.paused = False
         self.send_cursorless_frame_once = False
 
-        # Asynchronous frame queue
-        self.frame_queue = queue.Queue(maxsize=1)
+        # 3-Stage Concurrent Pipeline Queues (Capture -> Encode -> Network Send)
+        self.raw_queue = queue.Queue(maxsize=1)
+        self.send_queue = queue.Queue(maxsize=1)
         self.pipeline_running = False
+
+        # Telemetry metrics
+        self._stats_lock = threading.Lock()
+        self._cap_durations = []
+        self._enc_durations = []
+        self._net_durations = []
+        self._frames_sent = 0
 
     def set_fps_limit(self, fps: int):
         self.fps_limit = max(1, fps)
         print(f"[DEBUG Sender Video] Dynamic framerate adjusted to: {self.fps_limit} FPS")
 
-    def set_quality_params(self, quality: int, use_444: bool):
+    def set_quality_params(self, quality: int, use_444: bool, native_resolution: bool = True):
         self.quality = quality
         self.use_444_chroma = use_444
+        self.native_resolution = native_resolution
         print(
-            f"[DEBUG Sender Video] Dynamic quality adjusted to: {self.quality}% (4:4:4={self.use_444_chroma})"
+            f"[DEBUG Sender Video] Dynamic quality adjusted to: {self.quality}% "
+            f"(4:4:4={self.use_444_chroma}, 1:1 Native={self.native_resolution})"
         )
 
     def trigger_cursorless_frame(self):
         self.send_cursorless_frame_once = True
 
-    def _encoder_network_worker(self, sock: socket.socket):
-        """Dedicated concurrent worker for parallel JPEG encoding and socket transmission."""
-        fps_frame_counter = 0
-        fps_last_report_time = time.perf_counter()
-        total_capture_dur = 0.0
-        total_encode_dur = 0.0
-        total_send_dur = 0.0
-
+    def _encoder_worker(self):
+        """Stage 2: Dedicated worker for parallel JPEG encoding off the capture thread."""
         while self.pipeline_running:
             try:
-                item = self.frame_queue.get(timeout=0.04)
+                item = self.raw_queue.get(timeout=0.04)
             except queue.Empty:
                 continue
 
             frame_raw, t_cap_ms = item
 
             t_enc_start = time.perf_counter()
-
-            # Offload BGRA -> BGR conversion to encoder thread
-            if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
-                frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
-            else:
-                frame_bgr = frame_raw
-
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
             if self.use_444_chroma:
@@ -526,51 +528,81 @@ class ScreenSenderThread(QThread):
                 sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
                 encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
 
-            success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
-            data = enc_img.tobytes() if success else None
+            try:
+                success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
+            except Exception:
+                if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
+                    frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
+                else:
+                    frame_bgr = frame_raw
+                success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
+
             t_enc_end = time.perf_counter()
+            t_enc_ms = (t_enc_end - t_enc_start) * 1000.0
 
-            # Concurrent Network Transmission
+            if success and enc_img is not None and self.pipeline_running:
+                data = enc_img.tobytes()
+                if self.send_queue.full():
+                    try:
+                        self.send_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                self.send_queue.put_nowait((data, t_cap_ms, t_enc_ms))
+
+    def _network_sender_worker(self, sock: socket.socket):
+        """Stage 3: Dedicated concurrent worker for socket transmission decoupled from encoder."""
+        last_report_time = time.perf_counter()
+
+        while self.pipeline_running:
+            try:
+                item = self.send_queue.get(timeout=0.04)
+            except queue.Empty:
+                continue
+
+            data, t_cap_ms, t_enc_ms = item
+
             t_send_start = time.perf_counter()
-            if data and self.pipeline_running:
-                try:
-                    sock.sendall(struct.pack(">L", len(data)) + data)
-                except Exception:
-                    self.pipeline_running = False
-                    break
+            try:
+                sock.sendall(struct.pack(">L", len(data)) + data)
+            except Exception:
+                self.pipeline_running = False
+                break
             t_send_end = time.perf_counter()
+            t_send_ms = (t_send_end - t_send_start) * 1000.0
 
-            # Telemetry Tracking
-            fps_frame_counter += 1
-            total_capture_dur += t_cap_ms
-            total_encode_dur += (t_enc_end - t_enc_start) * 1000.0
-            total_send_dur += (t_send_end - t_send_start) * 1000.0
+            with self._stats_lock:
+                self._frames_sent += 1
+                self._cap_durations.append(t_cap_ms)
+                self._enc_durations.append(t_enc_ms)
+                self._net_durations.append(t_send_ms)
 
             now = time.perf_counter()
-            if now - fps_last_report_time >= 1.0:
-                elapsed_report = now - fps_last_report_time
-                measured_fps = fps_frame_counter / elapsed_report
-                avg_cap_ms = total_capture_dur / fps_frame_counter
-                avg_enc_ms = total_encode_dur / fps_frame_counter
-                avg_send_ms = total_send_dur / fps_frame_counter
-                avg_cycle_ms = 1000.0 / measured_fps if measured_fps > 0 else 0.0
+            if now - last_report_time >= 1.0:
+                elapsed = now - last_report_time
+                with self._stats_lock:
+                    count = self._frames_sent
+                    avg_cap = sum(self._cap_durations) / count if count > 0 else 0.0
+                    avg_enc = sum(self._enc_durations) / count if count > 0 else 0.0
+                    avg_net = sum(self._net_durations) / count if count > 0 else 0.0
+                    self._frames_sent = 0
+                    self._cap_durations.clear()
+                    self._enc_durations.clear()
+                    self._net_durations.clear()
 
+                measured_fps = count / elapsed
+                payload_kb = len(data) / 1024.0
                 print(
                     f"[DEBUG Sender Video] Live: {measured_fps:5.1f} FPS "
-                    f"(Target: {self.fps_limit} FPS | Cycle: {avg_cycle_ms:4.1f}ms "
-                    f"[Cap: {avg_cap_ms:4.1f}ms, Enc: {avg_enc_ms:4.1f}ms, Net: {avg_send_ms:4.1f}ms])"
+                    f"(Target: {self.fps_limit} FPS | Size: {payload_kb:.0f}KB | "
+                    f"Cap: {avg_cap:4.1f}ms, Enc: {avg_enc:4.1f}ms, Net: {avg_net:4.1f}ms)"
                 )
-
-                fps_frame_counter = 0
-                total_capture_dur = 0.0
-                total_encode_dur = 0.0
-                total_send_dur = 0.0
-                fps_last_report_time = now
+                last_report_time = now
 
     def run(self):
         print(
             f"[DEBUG Sender Video] Connecting to {self.target_ip}:{VIDEO_PORT} "
-            f"(PIN: '{self.pin}', Quality: {self.quality}, 4:4:4 Chroma: {self.use_444_chroma})..."
+            f"(PIN: '{self.pin}', Quality: {self.quality}, 4:4:4 Chroma: {self.use_444_chroma}, "
+            f"1:1 Native: {self.native_resolution})..."
         )
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -625,12 +657,16 @@ class ScreenSenderThread(QThread):
             spectacle_grabber = SpectacleGrabber()
             use_spectacle = spectacle_grabber.available
 
-        # Start concurrent encoder/transmitter worker
+        # Spin up concurrent 3-stage worker threads
         self.pipeline_running = True
-        encoder_worker_thread = threading.Thread(
-            target=self._encoder_network_worker, args=(sock,), daemon=True
+        enc_worker = threading.Thread(
+            target=self._encoder_worker, name="EncoderWorker", daemon=True
         )
-        encoder_worker_thread.start()
+        net_worker = threading.Thread(
+            target=self._network_sender_worker, args=(sock,), name="NetSenderWorker", daemon=True
+        )
+        enc_worker.start()
+        net_worker.start()
 
         screen = QGuiApplication.primaryScreen()
         screen_dpr = float(screen.devicePixelRatio()) if screen else 1.0
@@ -651,7 +687,7 @@ class ScreenSenderThread(QThread):
                     t_cap_start = time.perf_counter()
 
                     if use_kwin:
-                        use_native_res = bool(self.quality >= 95)
+                        use_native_res = bool(self.native_resolution or self.quality >= 90)
                         want_cursor = not (self.paused or self.send_cursorless_frame_once)
                         frame_raw = kwin_grabber.grab(
                             include_cursor=want_cursor,
@@ -691,14 +727,14 @@ class ScreenSenderThread(QThread):
                     if self.send_cursorless_frame_once:
                         self.send_cursorless_frame_once = False
 
-                    # Push frame directly into the parallel encode queue without blocking
-                    if self.frame_queue.full():
+                    # Push frame directly into the concurrent raw queue without blocking
+                    if self.raw_queue.full():
                         try:
-                            self.frame_queue.get_nowait()
+                            self.raw_queue.get_nowait()
                         except queue.Empty:
                             pass
 
-                    self.frame_queue.put_nowait((frame_raw, cap_ms))
+                    self.raw_queue.put_nowait((frame_raw, cap_ms))
 
                 except (socket.error, BrokenPipeError, ConnectionResetError) as e:
                     print(f"[DEBUG Sender Video] Network socket disconnected: {e}")
@@ -719,7 +755,8 @@ class ScreenSenderThread(QThread):
                     time.sleep(sleep_sec)
 
         self.pipeline_running = False
-        encoder_worker_thread.join(timeout=0.5)
+        enc_worker.join(timeout=0.4)
+        net_worker.join(timeout=0.4)
 
         if kwin_grabber:
             kwin_grabber.cleanup()

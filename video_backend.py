@@ -45,8 +45,12 @@ def render_cursor_on_frame(
         else:
             scale_factor = 1.0
 
-    cx = int(round((gx - monitor_left) * scale_factor))
-    cy = int(round((gy - monitor_top) * scale_factor))
+    if sys.platform == "win32":
+        cx = int(round(gx - monitor_left))
+        cy = int(round(gy - monitor_top))
+    else:
+        cx = int(round((gx - monitor_left) * scale_factor))
+        cy = int(round((gy - monitor_top) * scale_factor))
 
     h, w = bgr_image.shape[:2]
     if 0 <= cx < w and 0 <= cy < h:

@@ -451,14 +451,30 @@ class FloatingSenderWindow(QWidget):
 
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(
-            ["Ultra Crisp (92%)", "High Quality (82%)", "Balanced (72%)", "Studio 4:4:4 (88%)"]
+            [
+                "Pixel-Perfect 1:1 (95% 4:4:4 - Smooth 60 FPS)",
+                "Maximum Detail (98% 4:4:4 - High Bandwidth)",
+                "Ultra Crisp (92%)",
+                "High Quality (82%)",
+                "Balanced (72%)",
+                "Studio 4:4:4 (88%)",
+            ]
         )
         saved_quality = self.history_data.get("quality_preset", "")
         if saved_quality:
             matched_q = -1
             for i in range(self.quality_combo.count()):
                 txt = self.quality_combo.itemText(i)
-                if "4:4:4" in str(saved_quality) and "4:4:4" in txt:
+                if "98%" in str(saved_quality) and "98%" in txt:
+                    matched_q = i
+                    break
+                elif "pixel-perfect" in str(saved_quality).lower() and "pixel-perfect" in txt.lower():
+                    matched_q = i
+                    break
+                elif "studio" in str(saved_quality).lower() and "studio" in txt.lower():
+                    matched_q = i
+                    break
+                elif "4:4:4" in str(saved_quality) and "studio" in txt.lower():
                     matched_q = i
                     break
                 elif "ultra" in str(saved_quality).lower() and "ultra" in txt.lower():
@@ -475,7 +491,7 @@ class FloatingSenderWindow(QWidget):
             self.quality_combo.setCurrentIndex(0)
         self.quality_combo.currentIndexChanged.connect(self.on_quality_changed)
         self.quality_combo.setToolTip(
-            "Ultra Crisp (92%) maintains razor-sharp text while ensuring high network throughput."
+            "Pixel-Perfect 1:1 (95% 4:4:4) guarantees full native physical resolution with zero chroma subsampling at high FPS."
         )
 
         qual_row.addWidget(self.fps_combo)
@@ -1088,21 +1104,34 @@ class FloatingSenderWindow(QWidget):
         if self.stream_thread:
             self.stream_thread.set_fps_limit(chosen_fps)
 
-    def on_quality_changed(self, index: int):
-        if index == 0:
-            target_quality, use_444 = 92, False
-        elif index == 1:
-            target_quality, use_444 = 82, False
-        elif index == 2:
-            target_quality, use_444 = 72, False
+    def _get_quality_settings(self, index: Optional[int] = None) -> tuple[int, bool, bool]:
+        """Returns (target_quality, use_444, native_res) for current or given quality preset index."""
+        if index is None:
+            index = self.quality_combo.currentIndex()
+        text = self.quality_combo.itemText(index).lower()
+        if "98%" in text:
+            return 98, True, True
+        elif "pixel-perfect" in text or "95%" in text:
+            return 95, True, True
+        elif "ultra" in text or "92%" in text:
+            return 92, False, True
+        elif "high" in text or "82%" in text:
+            return 82, False, False
+        elif "balanced" in text or "72%" in text:
+            return 72, False, False
+        elif "studio" in text or "4:4:4" in text:
+            return 88, True, True
         else:
-            target_quality, use_444 = 88, True
+            return 95, True, True
+
+    def on_quality_changed(self, index: int):
+        target_quality, use_444, native_res = self._get_quality_settings(index)
 
         self.history_data["quality_preset"] = self.quality_combo.currentText()
         self._schedule_history_save()
 
         if self.stream_thread:
-            self.stream_thread.set_quality_params(target_quality, use_444)
+            self.stream_thread.set_quality_params(target_quality, use_444, native_res)
 
     def on_tv_volume_changed(self, val: int):
         self.tv_vol_val_lbl.setText(f"{val}%")
@@ -1171,15 +1200,7 @@ class FloatingSenderWindow(QWidget):
         chosen_fps = fps_map.get(self.fps_combo.currentIndex(), 60)
         pin_code = self.pin_input.text().strip()
 
-        quality_idx = self.quality_combo.currentIndex()
-        if quality_idx == 0:
-            target_quality, use_444 = 92, False
-        elif quality_idx == 1:
-            target_quality, use_444 = 82, False
-        elif quality_idx == 2:
-            target_quality, use_444 = 72, False
-        else:
-            target_quality, use_444 = 88, True
+        target_quality, use_444, native_res = self._get_quality_settings()
 
         self.connect_btn.setText("Stop")
         self.connect_btn.setStyleSheet("background-color: #d83b01;")
@@ -1192,6 +1213,7 @@ class FloatingSenderWindow(QWidget):
             quality=target_quality,
             fps_limit=chosen_fps,
             use_444_chroma=use_444,
+            native_resolution=native_res,
         )
         self.stream_thread.status_changed.connect(self.on_stream_status)
         self.stream_thread.start()
