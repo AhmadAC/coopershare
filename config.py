@@ -1,3 +1,4 @@
+
 """
 Global configuration constants and environment flags.
 """
@@ -12,15 +13,13 @@ REVERSE_VIDEO_PORT = 9992
 
 DEFAULT_SAMPLE_RATE = 48000
 CHANNELS = 2
-SOCKET_BUFFER_SIZE = 2 * 1024 * 1024  # 2MB High-Throughput Buffer
+SOCKET_BUFFER_SIZE = 4 * 1024 * 1024
 
-# Audio availability fallback check
 try:
     import sounddevice as sd
 
     AUDIO_AVAILABLE = True
-except Exception as e:
-    print(f"[DEBUG Sender Audio] sounddevice unavailable: {e}")
+except Exception:
     AUDIO_AVAILABLE = False
 
 IS_WIN = sys.platform == "win32"

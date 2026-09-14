@@ -1,3 +1,6 @@
+
+# threads.py
+
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 Supports native Windows WASAPI loopback, KDE Plasma 6 KWin D-Bus ScreenShot2 kernel pipe capture,
@@ -15,7 +18,6 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 from typing import Optional
 
 import cv2
@@ -33,7 +35,6 @@ from config import (
     DEFAULT_SAMPLE_RATE,
     DISCOVERY_PORT,
     REVERSE_VIDEO_PORT,
-    SOCKET_BUFFER_SIZE,
     VIDEO_PORT,
 )
 from input_backend import UniversalInputInjector
@@ -192,21 +193,13 @@ class KWinScreenShot2Grabber:
                     test_frame = self.grab(include_cursor=True, native_resolution=False, init_timeout=1.5)
                     if test_frame is not None and test_frame.size > 0:
                         self.available = True
-                        print(
-                            f"[DEBUG Screen Capturer] Native KDE Plasma 6 KWin screencopy active ({test_frame.shape[1]}x{test_frame.shape[0]})."
-                        )
                         break
                     else:
                         if attempt == 0:
                             ensure_kde_desktop_entry(force=True)
                             time.sleep(0.3)
                             self.iface = _get_interface()
-            else:
-                print(
-                    f"[DEBUG Screen Capturer] KWin ScreenShot2 interface unavailable: {self.iface.lastError().message()}"
-                )
-        except Exception as e:
-            print(f"[DEBUG Screen Capturer] KWin ScreenShot2 probe error: {e}")
+        except Exception:
             self.available = False
 
     def grab(
@@ -247,8 +240,6 @@ class KWinScreenShot2Grabber:
             q_fd = None
 
             if _is_dbus_error(reply) or not reply.arguments():
-                err_msg = reply.errorMessage() if reply.errorMessage() else "No arguments"
-
                 r_fd2, w_fd2 = os.pipe()
                 try:
                     fcntl.fcntl(r_fd2, 1031, 1048576)
@@ -265,10 +256,6 @@ class KWinScreenShot2Grabber:
                 r_fd = r_fd2
 
                 if _is_dbus_error(reply2) or not reply2.arguments():
-                    err_msg2 = reply2.errorMessage() if reply2.errorMessage() else "No arguments"
-                    print(
-                        f"[DEBUG Screen Capturer] KWin D-Bus error: {err_msg} | Fallback error: {err_msg2}"
-                    )
                     os.close(r_fd)
                     r_fd = -1
                     return None
@@ -312,8 +299,7 @@ class KWinScreenShot2Grabber:
             arr = np.frombuffer(raw_mv, dtype=np.uint8, count=total_expected_bytes).reshape((height, width, 4))
             return arr
 
-        except Exception as ex:
-            print(f"[DEBUG Screen Capturer] KWin ScreenShot2 grab exception: {ex}")
+        except Exception:
             if w_fd != -1:
                 try:
                     os.close(w_fd)
@@ -346,9 +332,8 @@ class SpectacleGrabber:
                 r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4.0)
                 if r.returncode == 0 and os.path.exists(self.temp_file) and os.path.getsize(self.temp_file) > 100:
                     self.available = True
-                    print(f"[DEBUG Screen Capturer] KDE Spectacle background capture active ({self.bin_path}).")
-            except Exception as e:
-                print(f"[DEBUG Screen Capturer] Spectacle probe notice: {e}")
+            except Exception:
+                pass
             finally:
                 if os.path.exists(self.temp_file):
                     try:
@@ -391,7 +376,6 @@ def probe_grim(grim_bin: str) -> tuple[bool, list[str]]:
             timeout=0.8,
         )
         if r.returncode == 0 and len(r.stdout) > 100:
-            print("[DEBUG Sender Video] Wayland screencopy active via grim (JPEG).")
             return True, ["-t", "jpeg"]
     except Exception:
         pass
@@ -404,7 +388,6 @@ def probe_grim(grim_bin: str) -> tuple[bool, list[str]]:
             timeout=0.8,
         )
         if r.returncode == 0 and len(r.stdout) > 100:
-            print("[DEBUG Sender Video] Wayland screencopy active via grim (PPM).")
             return True, ["-t", "ppm"]
     except Exception:
         pass
@@ -420,7 +403,6 @@ class DiscoveryListenerThread(QThread):
         self.running = True
 
     def run(self):
-        print(f"[DEBUG Sender Discovery] Listening for UDP beacons on port {DISCOVERY_PORT}...")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -433,8 +415,7 @@ class DiscoveryListenerThread(QThread):
         sock.settimeout(1.0)
         try:
             sock.bind(("", DISCOVERY_PORT))
-        except Exception as e:
-            print(f"[DEBUG Sender Discovery] UDP bind error on port {DISCOVERY_PORT}: {e}")
+        except Exception:
             return
 
         while self.running:
@@ -447,9 +428,7 @@ class DiscoveryListenerThread(QThread):
                     self.device_found.emit(rec_ip, pin_req)
             except socket.timeout:
                 continue
-            except Exception as e:
-                if self.running:
-                    print(f"[DEBUG Sender Discovery] Decode error: {e}")
+            except Exception:
                 continue
 
         sock.close()
@@ -461,6 +440,7 @@ class DiscoveryListenerThread(QThread):
 
 class ScreenSenderThread(QThread):
     status_changed = Signal(str, bool)
+    fps_updated = Signal(float)
 
     def __init__(
         self,
@@ -487,26 +467,17 @@ class ScreenSenderThread(QThread):
         self.send_queue = queue.Queue(maxsize=1)
         self.pipeline_running = False
 
-        # Telemetry metrics
         self._stats_lock = threading.Lock()
-        self._cap_durations = []
-        self._enc_durations = []
-        self._net_durations = []
         self._frames_sent = 0
         self._last_net_duration = 0.0
 
     def set_fps_limit(self, fps: int):
         self.fps_limit = max(1, fps)
-        print(f"[DEBUG Sender Video] Dynamic framerate adjusted to: {self.fps_limit} FPS")
 
     def set_quality_params(self, quality: int, use_444: bool, native_resolution: bool = False):
         self.quality = quality
         self.use_444_chroma = use_444
         self.native_resolution = native_resolution
-        print(
-            f"[DEBUG Sender Video] Dynamic quality adjusted to: {self.quality}% "
-            f"(4:4:4={self.use_444_chroma}, 1:1 Native={self.native_resolution})"
-        )
 
     def trigger_cursorless_frame(self):
         self.send_cursorless_frame_once = True
@@ -521,9 +492,6 @@ class ScreenSenderThread(QThread):
 
             frame_raw, t_cap_ms = item
 
-            t_enc_start = time.perf_counter()
-
-            # Dynamic congestion throttle: adapt quality slightly if link is congesting
             eff_quality = self.quality
             if self._last_net_duration > 22.0:
                 eff_quality = max(70, self.quality - 4)
@@ -544,9 +512,6 @@ class ScreenSenderThread(QThread):
                     frame_bgr = frame_raw
                 success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
 
-            t_enc_end = time.perf_counter()
-            t_enc_ms = (t_enc_end - t_enc_start) * 1000.0
-
             if success and enc_img is not None and self.pipeline_running:
                 data = enc_img.tobytes()
                 if self.send_queue.full():
@@ -554,7 +519,7 @@ class ScreenSenderThread(QThread):
                         self.send_queue.get_nowait()
                     except queue.Empty:
                         pass
-                self.send_queue.put_nowait((data, t_cap_ms, t_enc_ms))
+                self.send_queue.put_nowait(data)
 
     def _network_sender_worker(self, sock: socket.socket):
         """Stage 3: Dedicated concurrent worker for socket transmission decoupled from encoder."""
@@ -562,11 +527,9 @@ class ScreenSenderThread(QThread):
 
         while self.pipeline_running:
             try:
-                item = self.send_queue.get(timeout=0.04)
+                data = self.send_queue.get(timeout=0.04)
             except queue.Empty:
                 continue
-
-            data, t_cap_ms, t_enc_ms = item
 
             t_send_start = time.perf_counter()
             try:
@@ -575,50 +538,30 @@ class ScreenSenderThread(QThread):
                 self.pipeline_running = False
                 break
             t_send_end = time.perf_counter()
-            t_send_ms = (t_send_end - t_send_start) * 1000.0
-            self._last_net_duration = t_send_ms
+            self._last_net_duration = (t_send_end - t_send_start) * 1000.0
 
             with self._stats_lock:
                 self._frames_sent += 1
-                self._cap_durations.append(t_cap_ms)
-                self._enc_durations.append(t_enc_ms)
-                self._net_durations.append(t_send_ms)
 
             now = time.perf_counter()
             if now - last_report_time >= 1.0:
                 elapsed = now - last_report_time
                 with self._stats_lock:
                     count = self._frames_sent
-                    avg_cap = sum(self._cap_durations) / count if count > 0 else 0.0
-                    avg_enc = sum(self._enc_durations) / count if count > 0 else 0.0
-                    avg_net = sum(self._net_durations) / count if count > 0 else 0.0
                     self._frames_sent = 0
-                    self._cap_durations.clear()
-                    self._enc_durations.clear()
-                    self._net_durations.clear()
 
-                measured_fps = count / elapsed
-                payload_kb = len(data) / 1024.0
-                print(
-                    f"[DEBUG Sender Video] Live: {measured_fps:5.1f} FPS "
-                    f"(Target: {self.fps_limit} FPS | Size: {payload_kb:.0f}KB | "
-                    f"Cap: {avg_cap:4.1f}ms, Enc: {avg_enc:4.1f}ms, Net: {avg_net:4.1f}ms)"
-                )
+                measured_fps = count / elapsed if elapsed > 0 else 0.0
+                self.fps_updated.emit(measured_fps)
                 last_report_time = now
 
     def run(self):
-        print(
-            f"[DEBUG Sender Video] Connecting to {self.target_ip}:{VIDEO_PORT} "
-            f"(PIN: '{self.pin}', Quality: {self.quality}, 4:4:4 Chroma: {self.use_444_chroma}, "
-            f"1:1 Native: {self.native_resolution})..."
-        )
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
-            except Exception as e:
-                print(f"[DEBUG Sender Video] SO_SNDBUF setting notice: {e}")
+            except Exception:
+                pass
 
             sock.settimeout(4.0)
             sock.connect((self.target_ip, VIDEO_PORT))
@@ -636,7 +579,6 @@ class ScreenSenderThread(QThread):
                 raise ConnectionError("Failed to receive authentication response.")
 
             resp = json.loads(resp_bytes.decode("utf-8"))
-            print(f"[DEBUG Sender Video] Handshake response: {resp}")
 
             if not resp.get("auth", False):
                 err_msg = resp.get("msg", "Auth Failed")
@@ -645,10 +587,8 @@ class ScreenSenderThread(QThread):
                 return
 
             sock.settimeout(None)
-            print(f"[DEBUG Sender Video] Connected & Authorized. Streaming at {self.fps_limit} FPS...")
             self.status_changed.emit(f"Streaming ({self.fps_limit} FPS)", True)
         except Exception as e:
-            print(f"[DEBUG Sender Video] Connection error: {e}")
             self.status_changed.emit(f"Connect Error: {e}", False)
             return
 
@@ -665,7 +605,6 @@ class ScreenSenderThread(QThread):
             spectacle_grabber = SpectacleGrabber()
             use_spectacle = spectacle_grabber.available
 
-        # Spin up concurrent 3-stage worker threads
         self.pipeline_running = True
         enc_worker = threading.Thread(
             target=self._encoder_worker, name="EncoderWorker", daemon=True
@@ -735,7 +674,6 @@ class ScreenSenderThread(QThread):
                     if self.send_cursorless_frame_once:
                         self.send_cursorless_frame_once = False
 
-                    # Push frame directly into the concurrent raw queue without blocking
                     if self.raw_queue.full():
                         try:
                             self.raw_queue.get_nowait()
@@ -744,18 +682,15 @@ class ScreenSenderThread(QThread):
 
                     self.raw_queue.put_nowait((frame_raw, cap_ms))
 
-                except (socket.error, BrokenPipeError, ConnectionResetError) as e:
-                    print(f"[DEBUG Sender Video] Network socket disconnected: {e}")
+                except (socket.error, BrokenPipeError, ConnectionResetError):
                     break
                 except subprocess.TimeoutExpired:
                     time.sleep(0.002)
                     continue
-                except Exception as e:
-                    print(f"[DEBUG Sender Video] Frame capture notice: {e}")
+                except Exception:
                     time.sleep(0.002)
                     continue
 
-                # Clock pacing
                 frame_elapsed = time.perf_counter() - t_frame_start
                 target_frame_time = 1.0 / max(1, self.fps_limit)
                 sleep_sec = target_frame_time - frame_elapsed
@@ -776,7 +711,6 @@ class ScreenSenderThread(QThread):
         except Exception:
             pass
 
-        print("[DEBUG Sender Video] Video streaming thread stopped.")
         self.status_changed.emit("Disconnected", False)
 
     def stop(self):
@@ -803,10 +737,6 @@ class AudioSenderThread(QThread):
         use_native_wasapi = wasapi.start()
         sample_rate = wasapi.sample_rate if use_native_wasapi else DEFAULT_SAMPLE_RATE
 
-        print(
-            f"[DEBUG Sender Audio] Connecting to {self.target_ip}:{AUDIO_PORT} "
-            f"(Native WASAPI: {use_native_wasapi}, Rate: {sample_rate} Hz, TV Volume: {int(self.volume * 100)}%)..."
-        )
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -815,9 +745,7 @@ class AudioSenderThread(QThread):
 
             self.sock.sendall(struct.pack(">I", sample_rate))
             self.sock.settimeout(None)
-            print("[DEBUG Sender Audio] Connected & streaming live desktop audio.")
-        except Exception as e:
-            print(f"[DEBUG Sender Audio] Connection failed: {e}")
+        except Exception:
             wasapi.stop()
             return
 
@@ -828,8 +756,7 @@ class AudioSenderThread(QThread):
                 if chunk and self.sock:
                     try:
                         self.sock.sendall(chunk)
-                    except Exception as ex:
-                        print(f"[DEBUG Sender Audio] Transmit error: {ex}")
+                    except Exception:
                         break
                 else:
                     self.msleep(4)
@@ -865,15 +792,14 @@ class AudioSenderThread(QThread):
                     ):
                         while self.running:
                             self.msleep(100)
-                except Exception as ex:
-                    print(f"[DEBUG Sender Audio] Audio capture notice: {ex}")
+                except Exception:
+                    pass
 
         if self.sock:
             try:
                 self.sock.close()
             except Exception:
                 pass
-        print("[DEBUG Sender Audio] Audio sender stopped.")
 
     def stop(self):
         self.running = False
@@ -917,10 +843,8 @@ class InputReceiverThread(QThread):
                 sock.connect((self.target_ip, CONTROL_PORT))
                 sock.settimeout(0.5)
                 self.sock = sock
-                print(f"[DEBUG Sender Control] Connected to Receiver Control on {self.target_ip}:{CONTROL_PORT}")
                 return True
-            except Exception as e:
-                print(f"[DEBUG Sender Control] Control socket connect failed to {self.target_ip}:{CONTROL_PORT}: {e}")
+            except Exception:
                 return False
 
     def send_command(self, cmd: dict):
@@ -931,8 +855,7 @@ class InputReceiverThread(QThread):
                 try:
                     data = json.dumps(cmd).encode("utf-8")
                     self.sock.sendall(struct.pack(">L", len(data)) + data)
-                except Exception as e:
-                    print(f"[DEBUG Sender Control] Failed to transmit command: {e}")
+                except Exception:
                     try:
                         self.sock.close()
                     except Exception:
@@ -940,16 +863,13 @@ class InputReceiverThread(QThread):
                     self.sock = None
 
     def run(self):
-        print(f"[DEBUG Sender Control] Control worker started for {self.target_ip}:{CONTROL_PORT}...")
         injector = None
         try:
             injector = UniversalInputInjector(
                 self.scr_w, self.scr_h, mon_left=self.mon_l, mon_top=self.mon_t
             )
-            print(f"[DEBUG Sender Control] Input injector ready: mode={injector.mode} on {self.scr_w}x{self.scr_h}")
-        except Exception as ex:
-            print(f"[ERROR Sender Control] Failed to initialize injector: {ex}")
-            traceback.print_exc()
+        except Exception:
+            pass
 
         self._ensure_socket_connected()
 
@@ -965,7 +885,6 @@ class InputReceiverThread(QThread):
             try:
                 packet = self.sock.recv(2048)
                 if not packet:
-                    print("[DEBUG Sender Control] Control socket closed by receiver.")
                     with self._send_lock:
                         try:
                             self.sock.close()
@@ -979,9 +898,7 @@ class InputReceiverThread(QThread):
                 continue
             except (BlockingIOError, InterruptedError):
                 continue
-            except Exception as ex:
-                if self.running:
-                    print(f"[DEBUG Sender Control] Socket read notice: {ex}")
+            except Exception:
                 with self._send_lock:
                     try:
                         if self.sock:
@@ -1002,14 +919,11 @@ class InputReceiverThread(QThread):
 
                 try:
                     event = json.loads(raw_msg.decode("utf-8"))
-                    print(f"[DEBUG Sender Control] Event received from TV: {event}")
                     if self.is_input_enabled_func():
                         if injector:
                             injector.execute(event)
-                    else:
-                        print("[DEBUG Sender Control] Touch input ignored because 'TV Touch Control' is unchecked.")
-                except Exception as ex:
-                    print(f"[DEBUG Sender Control] Event execution error: {ex}")
+                except Exception:
+                    pass
 
         if injector:
             injector.close()
@@ -1020,7 +934,6 @@ class InputReceiverThread(QThread):
             except Exception:
                 pass
             self.sock = None
-        print("[DEBUG Sender Control] Input receiver thread stopped.")
 
     def stop(self):
         self.running = False
@@ -1045,16 +958,13 @@ class ReverseScreenReceiverThread(QThread):
         self.running = True
 
     def run(self):
-        print(f"[DEBUG Sender Viewer] Connecting to reverse screen stream at {self.target_ip}:{self.port}...")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(4.0)
             sock.connect((self.target_ip, self.port))
             sock.settimeout(0.5)
-            print("[DEBUG Sender Viewer] Connected to Receiver Screen Stream.")
-        except Exception as e:
-            print(f"[DEBUG Sender Viewer] Connection to receiver stream failed: {e}")
+        except Exception:
             self.disconnected.emit()
             return
 
@@ -1106,9 +1016,7 @@ class ReverseScreenReceiverThread(QThread):
 
             except ConnectionResetError:
                 break
-            except Exception as e:
-                if self.running:
-                    print(f"[DEBUG Sender Viewer] Frame processing error: {e}")
+            except Exception:
                 break
 
         try:
@@ -1120,3 +1028,13 @@ class ReverseScreenReceiverThread(QThread):
     def stop(self):
         self.running = False
         self.wait(1000)
+
+    def closeEvent(self, event):
+        self._flush_history_save()
+        self.stop_sharing()
+        if self.control_thread:
+            self.control_thread.stop()
+            self.control_thread = None
+        if self.discovery_thread:
+            self.discovery_thread.stop()
+        event.accept()

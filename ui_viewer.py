@@ -1,3 +1,5 @@
+# ui_viewer.py
+
 """
 Interactive Remote Receiver Viewer Canvas & Control Window.
 Includes native capture exclusion on Windows to prevent feedback loop streaming.
@@ -77,7 +79,6 @@ class RemoteReceiverCanvas(QWidget):
                 if event.button() == Qt.RightButton
                 else ("middle" if event.button() == Qt.MiddleButton else "left")
             )
-            print(f"[DEBUG Viewer Canvas] Mouse Press: {btn} at norm=({norm[0]:.4f}, {norm[1]:.4f})")
             self.send_command_func(
                 {
                     "type": "remote_input",
@@ -111,7 +112,6 @@ class RemoteReceiverCanvas(QWidget):
                 if event.button() == Qt.RightButton
                 else ("middle" if event.button() == Qt.MiddleButton else "left")
             )
-            print(f"[DEBUG Viewer Canvas] Mouse Release: {btn} at norm=({norm[0]:.4f}, {norm[1]:.4f})")
             self.send_command_func(
                 {
                     "type": "remote_input",
@@ -126,7 +126,6 @@ class RemoteReceiverCanvas(QWidget):
 
     def wheelEvent(self, event):
         dy = event.angleDelta().y()
-        print(f"[DEBUG Viewer Canvas] Mouse Wheel: dy={dy}")
         self.send_command_func(
             {"type": "remote_input", "event": {"type": "scroll", "dy": dy}}
         )
@@ -135,8 +134,6 @@ class RemoteReceiverCanvas(QWidget):
         key_code = event.key()
         key_name = event.keyCombination().key().name.replace("Key_", "")
         text = event.text()
-
-        print(f"[DEBUG Viewer Canvas] Key Press: code=0x{key_code:X}, name='{key_name}', text='{text}'")
 
         self.send_command_func(
             {
@@ -155,8 +152,6 @@ class RemoteReceiverCanvas(QWidget):
         key_code = event.key()
         key_name = event.keyCombination().key().name.replace("Key_", "")
         text = event.text()
-
-        print(f"[DEBUG Viewer Canvas] Key Release: code=0x{key_code:X}, name='{key_name}', text='{text}'")
 
         self.send_command_func(
             {
@@ -209,3 +204,4 @@ class RemoteReceiverViewerWindow(QMainWindow):
             self.stream_thread.stop()
         self.viewer_closed.emit()
         event.accept()
+

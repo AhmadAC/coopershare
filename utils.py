@@ -1,3 +1,5 @@
+# utils.py
+
 """
 Persistence, image generation, low-level socket utilities, SVG vector icon renderers,
 KDE Plasma Wayland & uinput permission helpers, and Windows DWM screen capture exclusion.
@@ -27,12 +29,6 @@ def get_app_directory() -> str:
 
 
 def get_storage_directory() -> str:
-    """
-    Returns the persistent storage directory for history.json and configurations.
-    If running inside an AppImage, returns the folder containing the .AppImage file
-    (so history.json is generated right outside the AppImage), falling back to
-    ~/.config/mrcoopers-screenshare if the AppImage folder is read-only.
-    """
     appimage = os.environ.get("APPIMAGE")
     if appimage:
         candidate = os.path.dirname(os.path.abspath(appimage))
@@ -57,7 +53,6 @@ HISTORY_FILE_PATH = os.path.join(STORAGE_DIR, "history.json")
 
 
 def load_history() -> dict:
-    """Loads saved devices, settings, and last connected IP from history.json."""
     if os.path.exists(HISTORY_FILE_PATH):
         try:
             with open(HISTORY_FILE_PATH, "r", encoding="utf-8") as f:
@@ -65,25 +60,19 @@ def load_history() -> dict:
                 if not isinstance(data.get("devices"), dict):
                     data["devices"] = {}
                 return data
-        except Exception as e:
-            print(f"[DEBUG Sender] Failed to read history.json from {HISTORY_FILE_PATH}: {e}")
+        except Exception:
+            pass
     return {"last_ip": "", "devices": {}}
 
 
 def save_history(history_data: dict):
-    """Saves the history data dict to history.json outside the AppImage or executable."""
     try:
         os.makedirs(os.path.dirname(HISTORY_FILE_PATH), exist_ok=True)
         with open(HISTORY_FILE_PATH, "w", encoding="utf-8") as f:
             json.dump(history_data, f, indent=4)
-        print(f"[DEBUG Sender] Saved history.json successfully to {HISTORY_FILE_PATH}")
-    except Exception as e:
-        print(f"[DEBUG Sender] Failed to write history.json to {HISTORY_FILE_PATH}: {e}")
+    except Exception:
+        pass
 
-
-# ===========================================================================
-# Windows DWM Screen Capture Exclusion
-# ===========================================================================
 
 WDA_NONE = 0x00000000
 WDA_MONITOR = 0x00000001
@@ -91,12 +80,6 @@ WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 
 def exclude_from_capture(target) -> bool:
-    """
-    Excludes a window from screen capture / screen sharing on Windows
-    using SetWindowDisplayAffinity (WDA_EXCLUDEFROMCAPTURE = 0x11).
-    Ensures sender GUI overlays are completely invisible on captured frames,
-    just like on Linux.
-    """
     if sys.platform != "win32" or not target:
         return False
 
@@ -119,17 +102,12 @@ def exclude_from_capture(target) -> bool:
         res = user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
         if not res:
             res = user32.SetWindowDisplayAffinity(hwnd, WDA_MONITOR)
-        if res:
-            print(f"[DEBUG Sender Win32] Successfully excluded HWND {hwnd} from screen capture.")
         return bool(res)
-    except Exception as e:
-        print(f"[DEBUG Sender Win32] SetWindowDisplayAffinity failed on HWND {hwnd}: {e}")
+    except Exception:
         return False
 
 
 class WindowsCaptureExclusionFilter(QObject):
-    """Event filter that automatically excludes any top-level window/dialog from screen capture on Windows."""
-
     def eventFilter(self, watched, event):
         if event.type() in (QEvent.Show, QEvent.Polish):
             if hasattr(watched, "isWindow") and watched.isWindow():
@@ -138,10 +116,6 @@ class WindowsCaptureExclusionFilter(QObject):
 
 
 def ensure_uinput_permissions():
-    """
-    Checks write access to /dev/uinput on Linux and installs a standard udev rule
-    if permissions are missing.
-    """
     if not sys.platform.startswith("linux"):
         return
 
@@ -158,20 +132,14 @@ def ensure_uinput_permissions():
                     f.write(rule_content)
                 subprocess.run(["udevadm", "control", "--reload-rules"], check=False)
                 subprocess.run(["udevadm", "trigger"], check=False)
-                print("[INFO] Automatically created uinput udev rule.")
         except Exception:
             pass
 
 
 def ensure_kde_desktop_entry(force: bool = False):
-    """
-    Ensures environment overrides and desktop entries exist for KWin ScreenShot2
-    D-Bus authorization under KDE Plasma 6 Wayland.
-    """
     if not sys.platform.startswith("linux"):
         return
 
-    # 1. Register systemd environment configuration for kwin_wayland
     env_dir = os.path.expanduser("~/.config/environment.d")
     os.makedirs(env_dir, exist_ok=True)
     kwin_conf = os.path.join(env_dir, "10-kwin-screencopy.conf")
@@ -183,11 +151,9 @@ def ensure_kde_desktop_entry(force: bool = False):
         try:
             with open(kwin_conf, "w", encoding="utf-8") as f:
                 f.write(env_content)
-            print(f"[INFO] Registered KWin session environment override: {kwin_conf}")
-        except Exception as e:
-            print(f"[DEBUG KDE Permissions] Failed writing environment config: {e}")
+        except Exception:
+            pass
 
-    # 2. Register application desktop entries
     apps_dir = os.path.expanduser("~/.local/share/applications")
     os.makedirs(apps_dir, exist_ok=True)
 
@@ -276,9 +242,8 @@ X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,zkde_screencast_unstab
                     f.write(content)
                 os.chmod(path, 0o755)
                 updated = True
-                print(f"[INFO] Registered KDE permission entry: {path}")
-            except Exception as e:
-                print(f"[DEBUG KDE Permissions] Failed writing {path}: {e}")
+            except Exception:
+                pass
 
     if updated or force:
         for update_cmd in [
@@ -294,13 +259,11 @@ X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,zkde_screencast_unstab
                         stderr=subprocess.DEVNULL,
                         timeout=3,
                     )
-                    print(f"[INFO] Rebuilt desktop cache with {update_cmd[0]}")
                 except Exception:
                     pass
 
 
 def create_application_icon() -> QIcon:
-    """Generates or loads a high-DPI desktop and taskbar icon for MrCoopersScreenShare."""
     for candidate in (
         os.path.join(STORAGE_DIR, "icon.ico"),
         os.path.join(STORAGE_DIR, "icon.png"),
@@ -334,7 +297,6 @@ def create_application_icon() -> QIcon:
 
 
 def svg_to_pixmap(svg_str: str, width: int = 16, height: int = 16, color: Optional[str] = "#ffffff") -> QPixmap:
-    """Renders raw SVG vector markup directly onto a crisp transparent QPixmap."""
     if color:
         svg_str = svg_str.replace("currentColor", color)
     renderer = QSvgRenderer(QByteArray(svg_str.encode("utf-8")))
@@ -348,14 +310,9 @@ def svg_to_pixmap(svg_str: str, width: int = 16, height: int = 16, color: Option
 
 
 def svg_to_icon(svg_str: str, size: int = 16, color: Optional[str] = "#ffffff") -> QIcon:
-    """Generates a high-DPI QIcon from raw SVG markup."""
     pix = svg_to_pixmap(svg_str, size, size, color)
     return QIcon(pix)
 
-
-# ===========================================================================
-# Standard Professional SVG Vector Icons
-# ===========================================================================
 
 SVG_STATUS_DOT = """<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5" fill="currentColor"/></svg>"""
 SVG_CHEVRON_DOWN = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>"""
@@ -372,17 +329,10 @@ SVG_RESTORE = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stro
 SVG_MINIMIZE = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>"""
 SVG_TAG = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>"""
 SVG_TRASH = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>"""
-SVG_TOUCH = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10m-4-6l4-4 4 4"/><circle cx="12" cy="16" r="4"/></svg>"""
-SVG_ROCKET = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/></svg>"""
-SVG_FULLSCREEN = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><polyline points="21 15 21 21 15 21"/><polyline points="3 9 3 3 9 3"/></svg>"""
-SVG_EXIT_FULLSCREEN = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><polyline points="14 14 20 14 20 20"/><polyline points="10 10 4 10 4 4"/></svg>"""
-SVG_DISCONNECT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="2" x2="22" y2="22"/></svg>"""
 SVG_LOGOUT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>"""
-SVG_INFO = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>"""
 
 
 def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
-    """Reads exactly `count` bytes from socket or returns None on error/disconnect."""
     buf = bytearray()
     while len(buf) < count:
         try:
@@ -398,7 +348,6 @@ def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
 
 
 def create_mss_instance():
-    """Returns an mss instance without deprecation warnings."""
     if hasattr(mss, "MSS"):
         return mss.MSS()
     return mss.mss()

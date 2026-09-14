@@ -1,3 +1,6 @@
+
+#input_backend.py
+
 """
 Cross-Platform Universal Input Injector.
 Supports:
@@ -130,7 +133,6 @@ class PurePythonLinuxUInput:
 
     def write_event(self, ev_type: int, code: int, value: int):
         if self.fd >= 0:
-            # 64-bit Linux struct input_event: timeval (8 bytes sec, 8 bytes usec), uint16, uint16, int32 (24 bytes)
             is_64bit = struct.calcsize("P") == 8
             fmt = "qqHHi" if is_64bit else "iiHHi"
             payload = struct.pack(fmt, 0, 0, ev_type, code, value)
@@ -149,7 +151,6 @@ class PurePythonLinuxUInput:
             self.fd = -1
 
 
-# Optional python-evdev driver
 USE_EVDEV = False
 if sys.platform.startswith("linux"):
     try:
@@ -160,7 +161,6 @@ if sys.platform.startswith("linux"):
     except Exception:
         USE_EVDEV = False
 
-# Optional pynput mouse fallback
 Button = None
 MouseController = None
 try:
@@ -189,15 +189,12 @@ class UniversalInputInjector:
         self.ui = None
         self.native_uinput = None
 
-        # Track button states to prevent redundant event bounces
         self._btn_down = {"left": False, "right": False, "middle": False}
 
         if sys.platform == "win32":
             self.mode = "win32"
-            print(f"[DEBUG Injector] Using native Win32 hardware input injection on bounds ({mon_left},{mon_top},{screen_w}x{screen_h}).")
 
         elif sys.platform.startswith("linux"):
-            # 1. Try python-evdev absolute pointer
             if USE_EVDEV:
                 try:
                     cap = {
@@ -217,32 +214,22 @@ class UniversalInputInjector:
 
                     self.ui = UInput(cap, name="mrcoopers-virtual-pointer", input_props=[0])
                     self.mode = "evdev"
-                    print(f"[DEBUG Injector] Linux evdev virtual absolute pointer active (0..{UINPUT_MAX_ABS}).")
-                except PermissionError:
-                    print("\n[ERROR Injector] Permission denied on /dev/uinput. Run: sudo setfacl -m u:$USER:rw /dev/uinput\n")
-                except Exception as ex:
-                    print(f"[DEBUG Injector] evdev init notice: {ex}")
+                except Exception:
+                    pass
 
-            # 2. Try zero-dependency direct Linux /dev/uinput kernel driver
             if self.mode == "none":
                 try:
                     self.native_uinput = PurePythonLinuxUInput(max_abs=UINPUT_MAX_ABS)
                     self.mode = "direct_uinput"
-                    print(f"[DEBUG Injector] Native Linux /dev/uinput kernel pointer active (0..{UINPUT_MAX_ABS}).")
-                except PermissionError as p_err:
-                    print(f"\n[ERROR Injector] {p_err}\n")
-                except Exception as ex:
-                    print(f"[DEBUG Injector] Native uinput init notice: {ex}")
+                except Exception:
+                    pass
 
-        # 3. Fallback to pynput on X11
         if self.mode == "none":
             if MouseController is not None:
                 try:
                     self.mouse = MouseController()
                     self.mode = "pynput"
-                    print("[DEBUG Injector] Using pynput mouse controller fallback.")
-                except Exception as ex:
-                    print(f"[DEBUG Injector] pynput init failed: {ex}")
+                except Exception:
                     self.mode = "unsupported"
             else:
                 self.mode = "unsupported"
@@ -252,7 +239,6 @@ class UniversalInputInjector:
         nx = event.get("x")
         ny = event.get("y")
 
-        # Calculate coordinates for Win32 and pynput
         if nx is not None and ny is not None:
             px = self.mon_left + int(np.clip(nx, 0.0, 1.0) * (self.screen_w - 1))
             py = self.mon_top + int(np.clip(ny, 0.0, 1.0) * (self.screen_h - 1))
@@ -285,12 +271,11 @@ class UniversalInputInjector:
                     dy = event.get("dy", 0)
                     delta = 120 if dy > 0 else -120
                     ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
-            except Exception as ex:
-                print(f"[DEBUG Injector Win32] Execution failed: {ex}")
+            except Exception:
+                pass
 
         elif self.mode == "direct_uinput" and self.native_uinput:
             try:
-                # Update absolute cursor position
                 if abs_x is not None and abs_y is not None:
                     self.native_uinput.write_event(EV_ABS, ABS_X, abs_x)
                     self.native_uinput.write_event(EV_ABS, ABS_Y, abs_y)
@@ -318,8 +303,8 @@ class UniversalInputInjector:
                     dy = 1 if event.get("dy", 0) > 0 else -1
                     self.native_uinput.write_event(EV_REL, REL_WHEEL, dy)
                     self.native_uinput.syn()
-            except Exception as ex:
-                print(f"[DEBUG Injector uinput] Execution failed: {ex}")
+            except Exception:
+                pass
 
         elif self.mode == "evdev" and self.ui:
             try:
@@ -350,8 +335,8 @@ class UniversalInputInjector:
                     dy = 1 if event.get("dy", 0) > 0 else -1
                     self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
                     self.ui.syn()
-            except Exception as ex:
-                print(f"[DEBUG Injector evdev] Execution failed: {ex}")
+            except Exception:
+                pass
 
         elif self.mode == "pynput" and self.mouse:
             if px is not None and py is not None:
@@ -384,3 +369,4 @@ class UniversalInputInjector:
             except Exception:
                 pass
             self.ui = None
+

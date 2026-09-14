@@ -1,5 +1,4 @@
-#################### START OF FILE: audio_backend.py ####################
-
+# audio_backend.py
 """
 Native 64-bit Windows WASAPI Desktop Audio Loopback & Physical Speaker Mute Controller (ctypes COM).
 Provides safe cross-platform fallbacks for non-Windows environments (Linux / macOS).
@@ -137,8 +136,7 @@ class HostAudioController:
             set_mute = WINFUNCTYPE(HRESULT, c_void_p, c_int, c_void_p)(ep_vtbl[14])
             hr = set_mute(p_ep_vol, 1 if mute else 0, None)
             return hr == 0
-        except Exception as ex:
-            print(f"[DEBUG Host Audio] Set mute exception: {ex}")
+        except Exception:
             return False
         finally:
             _release_com_ptr(p_ep_vol)
@@ -311,17 +309,11 @@ class NativeWindowsWasapiLoopback:
             start_func(self.audio_client)
 
             self.initialized = True
-            print(
-                f"[DEBUG Sender Audio] Native WASAPI loopback active. Rate: {self.sample_rate} Hz, "
-                f"Channels: {self.channels}, Bits: {self.bits_per_sample}"
-            )
             return True
-        except Exception as ex:
-            print(f"[DEBUG Sender Audio] Native WASAPI loopback init failed: {ex}")
+        except Exception:
             return False
 
     def read_pcm16_chunk(self, volume: float = 1.0) -> Optional[bytes]:
-        """Captures available PCM frames converted to 16-bit stereo PCM with volume scaling."""
         if not self.initialized or not self.capture_client:
             return None
 

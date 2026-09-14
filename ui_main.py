@@ -1,8 +1,11 @@
+
+# ui_main.py
+
 """
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
 Features persistent state loading and debounced saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
 with vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
-toggleable Remote TV Viewer session controller, and Windows DWM capture exclusion.
+toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, and Windows DWM capture exclusion.
 """
 
 import ctypes
@@ -42,7 +45,6 @@ from ui_viewer import RemoteReceiverViewerWindow
 from utils import (
     SVG_CHEVRON_DOWN,
     SVG_CLOSE,
-    SVG_DISCONNECT,
     SVG_DISPLAY,
     SVG_LOGOUT,
     SVG_MAXIMIZE,
@@ -182,23 +184,19 @@ class FloatingSenderWindow(QWidget):
         self.current_opacity = 0.94
         self.was_streaming_before_viewing = False
 
-        # Pulsing Animation attributes for Collapsed Taskbar Click
         self.is_pulsing = False
         self.pulse_start_time = 0.0
 
-        # Debounced disk saver timer to prevent slider disk thrashing
         self._save_debounce_timer = QTimer(self)
         self._save_debounce_timer.setSingleShot(True)
         self._save_debounce_timer.setInterval(400)
         self._save_debounce_timer.timeout.connect(self._flush_history_save)
 
-        # Non-intrusive Topmost Enforcer Timer for Collapsed Mini Pill
         self.topmost_timer = QTimer(self)
         self.topmost_timer.setInterval(500)
         self.topmost_timer.timeout.connect(self._on_topmost_timer)
         self.topmost_timer.start()
 
-        # 3-Second Red Pulse Timer for taskbar clicks in mini mode
         self.pulse_timer = QTimer(self)
         self.pulse_timer.setInterval(40)
         self.pulse_timer.timeout.connect(self._on_pulse_step)
@@ -207,7 +205,6 @@ class FloatingSenderWindow(QWidget):
         self._setup_ui()
         self._populate_device_list()
 
-        # Start listening for auto-discovery beacon
         self.discovery_thread = DiscoveryListenerThread()
         self.discovery_thread.device_found.connect(self.on_device_discovered)
         self.discovery_thread.start()
@@ -242,18 +239,16 @@ class FloatingSenderWindow(QWidget):
                 ctypes.windll.user32.SetWindowLongW(
                     hwnd, GWL_STYLE, style | WS_MINIMIZEBOX | WS_SYSMENU
                 )
-            except Exception as e:
-                print(f"[DEBUG Sender Win32] Style init notice: {e}")
+            except Exception:
+                pass
             exclude_from_capture(self)
 
         self.enforce_always_on_top()
 
     def apply_opacity(self, opacity: float):
-        """Cross-platform opacity applicator supporting Wayland, X11, and Windows."""
         self.current_opacity = max(0.1, min(1.0, float(opacity)))
 
-        is_wayland = QApplication.platformName() == "wayland"
-        if not is_wayland:
+        if QApplication.platformName() != "wayland":
             try:
                 super().setWindowOpacity(self.current_opacity)
             except Exception:
@@ -276,10 +271,6 @@ class FloatingSenderWindow(QWidget):
                     )
 
                 HWND_TOPMOST = -1
-                SWP_NOMOVE = 0x0002
-                SWP_NOSIZE = 0x0001
-                SWP_NOACTIVATE = 0x0010
-                SWP_SHOWWINDOW = 0x0040
                 ctypes.windll.user32.SetWindowPos(
                     hwnd,
                     HWND_TOPMOST,
@@ -287,7 +278,7 @@ class FloatingSenderWindow(QWidget):
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    0x0002 | 0x0001 | 0x0010 | 0x0040,
                 )
             except Exception:
                 pass
@@ -365,7 +356,6 @@ class FloatingSenderWindow(QWidget):
 
         self.stack = QStackedWidget(self)
 
-        # View 1: Expanded Controller Card
         self.card = QFrame()
         self.card.setObjectName("card")
         self._update_card_style()
@@ -386,6 +376,14 @@ class FloatingSenderWindow(QWidget):
 
         self.title_lbl = QLabel("MrCoopersScreenShare")
         self.title_lbl.setStyleSheet("font-weight: bold; color: #00a2ed;")
+
+        # GUI FPS Badge (updates every second with near-zero CPU footprint)
+        self.fps_badge = QLabel("")
+        self.fps_badge.setVisible(False)
+        self.fps_badge.setStyleSheet(
+            "color: #00d084; font-weight: bold; font-size: 11px; padding: 1px 5px; "
+            "background: rgba(0, 208, 132, 0.15); border: 1px solid rgba(0, 208, 132, 0.35); border-radius: 4px;"
+        )
 
         self.collapse_btn = QPushButton()
         self.collapse_btn.setIcon(svg_to_icon(SVG_CHEVRON_DOWN, 12, "#8f9bb3"))
@@ -408,6 +406,7 @@ class FloatingSenderWindow(QWidget):
 
         h_layout.addWidget(self.status_dot)
         h_layout.addWidget(self.title_lbl)
+        h_layout.addWidget(self.fps_badge)
         h_layout.addStretch()
         h_layout.addWidget(self.collapse_btn)
         h_layout.addWidget(self.close_btn)
@@ -419,9 +418,6 @@ class FloatingSenderWindow(QWidget):
         self.device_combo = QComboBox()
         self.device_combo.setEditable(True)
         self.device_combo.setPlaceholderText("Select TV or Enter IP...")
-        self.device_combo.setToolTip(
-            "Select a TV by name or enter an IP. Right-click to assign friendly names."
-        )
         self.device_combo.lineEdit().returnPressed.connect(self.toggle_connect)
 
         self.connect_btn = QPushButton("Share")
@@ -431,7 +427,7 @@ class FloatingSenderWindow(QWidget):
         ip_row.addWidget(self.connect_btn)
         self.card_layout.addLayout(ip_row)
 
-        # Row 2: Live-Adjustable FPS & Ultra-Quality Preset Selector (with Persistence)
+        # Row 2: Live-Adjustable FPS & Ultra-Quality Preset Selector
         qual_row = QHBoxLayout()
         self.fps_combo = QComboBox()
         self.fps_combo.addItems(["60 FPS", "30 FPS", "120 FPS", "15 FPS"])
@@ -447,7 +443,6 @@ class FloatingSenderWindow(QWidget):
         else:
             self.fps_combo.setCurrentIndex(0)
         self.fps_combo.currentIndexChanged.connect(self.on_fps_changed)
-        self.fps_combo.setToolTip("Framerate can be modified live at any time without stopping.")
 
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(
@@ -487,15 +482,12 @@ class FloatingSenderWindow(QWidget):
         else:
             self.quality_combo.setCurrentIndex(0)
         self.quality_combo.currentIndexChanged.connect(self.on_quality_changed)
-        self.quality_combo.setToolTip(
-            "Ultra Crisp (60 FPS, 89%) renders text razor-sharp while sustaining full 60 FPS without network lag."
-        )
 
         qual_row.addWidget(self.fps_combo)
         qual_row.addWidget(self.quality_combo)
         self.card_layout.addLayout(qual_row)
 
-        # Row 3: Auto-connect & Touch Input toggles + Optional PIN input (with Persistence)
+        # Row 3: Auto-connect & Touch Input toggles + PIN input
         auto_row = QHBoxLayout()
         self.auto_connect_cb = QCheckBox("Auto-Connect")
         saved_auto = self.history_data.get("auto_connect", True)
@@ -506,9 +498,6 @@ class FloatingSenderWindow(QWidget):
         saved_touch = self.history_data.get("touch_input", True)
         self.touch_input_cb.setChecked(bool(saved_touch))
         self.input_enabled = bool(saved_touch)
-        self.touch_input_cb.setToolTip(
-            "When enabled, touching the TV screen controls this PC."
-        )
         self.touch_input_cb.toggled.connect(self.on_touch_input_toggled)
 
         self.pin_input = QLineEdit()
@@ -541,9 +530,6 @@ class FloatingSenderWindow(QWidget):
 
         self.host_mute_btn = QPushButton("Mute Host")
         self.host_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_MUTE, 14, "#ffffff"))
-        self.host_mute_btn.setToolTip(
-            "Mutes local PC speakers so audio only plays through the TV"
-        )
         self.host_mute_btn.clicked.connect(self.toggle_host_mute)
 
         btn_row.addWidget(self.pause_btn)
@@ -551,7 +537,7 @@ class FloatingSenderWindow(QWidget):
         btn_row.addWidget(self.host_mute_btn)
         self.card_layout.addLayout(btn_row)
 
-        # Row 5: TV Volume Slider (with Persistence)
+        # Row 5: TV Volume Slider
         tv_vol_row = QHBoxLayout()
         tv_vol_lbl_title = QLabel("TV Vol:")
         tv_vol_lbl_title.setFixedWidth(46)
@@ -572,7 +558,7 @@ class FloatingSenderWindow(QWidget):
         tv_vol_row.addWidget(self.tv_vol_val_lbl)
         self.card_layout.addLayout(tv_vol_row)
 
-        # Row 6: Opacity Slider (with Persistence)
+        # Row 6: Opacity Slider
         trans_row = QHBoxLayout()
         op_lbl_title = QLabel("Opacity:")
         op_lbl_title.setFixedWidth(46)
@@ -592,14 +578,11 @@ class FloatingSenderWindow(QWidget):
         trans_row.addWidget(self.op_val_lbl)
         self.card_layout.addLayout(trans_row)
 
-        # View 2: Collapsed Mini Pill Indicator (48x16 Hitbox, 30x5 Bar)
+        # View 2: Collapsed Mini Pill Indicator
         self.mini_container = QFrame()
         self.mini_container.setObjectName("mini_container")
         self.mini_container.setFixedSize(48, 16)
         self.mini_container.setCursor(Qt.PointingHandCursor)
-        self.mini_container.setToolTip(
-            "MrCoopersScreenShare (Ctrl+Click: Pause/Resume | Click: Expand | Drag: Move)"
-        )
 
         mini_layout = QVBoxLayout(self.mini_container)
         mini_layout.setContentsMargins(0, 0, 0, 0)
@@ -621,6 +604,14 @@ class FloatingSenderWindow(QWidget):
         if sys.platform == "win32":
             self.is_host_muted = HostAudioController.get_host_mute()
             self._update_host_mute_ui()
+
+    def on_fps_updated(self, fps: float):
+        """Updates the GUI FPS badge once a second."""
+        if self.stream_thread and self.stream_thread.isRunning() and not self.is_paused:
+            self.fps_badge.setText(f"{fps:.0f} FPS")
+            self.fps_badge.setVisible(True)
+        else:
+            self.fps_badge.setVisible(False)
 
     def _update_status_dot(self, color_hex: str):
         self.status_dot.setPixmap(svg_to_pixmap(SVG_STATUS_DOT, 14, 14, color_hex))
@@ -735,9 +726,7 @@ class FloatingSenderWindow(QWidget):
             self._populate_device_list()
 
     def ensure_control_channel(self, target_ip: str) -> bool:
-        """Safely ensures a dedicated control channel is running using clean main-thread screen metrics."""
         if not self.control_thread or not self.control_thread.isRunning():
-            print(f"[DEBUG Sender UI] Starting control thread for {target_ip}...")
             screen = self.screen() or QGuiApplication.primaryScreen()
             if screen:
                 geom = screen.geometry()
@@ -767,7 +756,6 @@ class FloatingSenderWindow(QWidget):
     def send_receiver_window_command(self, action: str):
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         if target_ip and self.ensure_control_channel(target_ip):
-            print(f"[DEBUG Sender UI] Sending window command '{action}' to {target_ip}")
             self.control_thread.send_command(
                 {"type": "window_control", "action": action}
             )
@@ -780,15 +768,12 @@ class FloatingSenderWindow(QWidget):
                 self.send_receiver_timer(args)
 
     def send_receiver_timer(self, args: str):
-        """Sends clean duration/argument string directly to receiver's linked timer."""
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         clean_args = args.strip().strip('"').strip("'")
         if target_ip and self.ensure_control_channel(target_ip):
-            print(f"[DEBUG Sender UI] Sending timer command '{clean_args}' to {target_ip}")
             self.control_thread.send_command({"type": "timer", "args": clean_args})
 
     def toggle_receiver_viewer(self):
-        """Toggles the remote TV viewing and interactive control session on/off."""
         if self.viewer_window and self.viewer_window.isVisible():
             self.close_receiver_viewer()
         else:
@@ -799,7 +784,6 @@ class FloatingSenderWindow(QWidget):
         if not target_ip:
             return
 
-        print(f"[DEBUG Sender UI] Opening TV Viewer window for {target_ip}...")
         self.ensure_control_channel(target_ip)
 
         if (
@@ -832,7 +816,6 @@ class FloatingSenderWindow(QWidget):
         self.viewer_window.show()
 
     def close_receiver_viewer(self):
-        """Explicitly shuts down the remote viewer window and reverts GUI state."""
         if self.viewer_window:
             try:
                 self.viewer_window.close()
@@ -874,7 +857,6 @@ class FloatingSenderWindow(QWidget):
         self.history_data["allow_audio_when_paused"] = self.allow_audio_when_paused
         self._schedule_history_save()
         self._update_audio_pause_state()
-        print(f"[DEBUG Sender UI] Audio when paused toggled: {self.allow_audio_when_paused}")
 
     def on_allow_audio_when_paused_toggled(self, checked: bool):
         self.allow_audio_when_paused = checked
@@ -1102,7 +1084,6 @@ class FloatingSenderWindow(QWidget):
             self.stream_thread.set_fps_limit(chosen_fps)
 
     def _get_quality_settings(self, index: Optional[int] = None) -> tuple[int, bool, bool]:
-        """Returns (target_quality, use_444, native_res) for current or given quality preset index."""
         if index is None:
             index = self.quality_combo.currentIndex()
         text = self.quality_combo.itemText(index).lower()
@@ -1213,6 +1194,7 @@ class FloatingSenderWindow(QWidget):
             native_resolution=native_res,
         )
         self.stream_thread.status_changed.connect(self.on_stream_status)
+        self.stream_thread.fps_updated.connect(self.on_fps_updated)
         self.stream_thread.start()
 
         self.audio_thread = AudioSenderThread(target_ip, volume=self.tv_volume)
@@ -1231,6 +1213,8 @@ class FloatingSenderWindow(QWidget):
 
         self.is_paused = False
         self._update_audio_pause_state()
+        self.fps_badge.setVisible(False)
+        self.fps_badge.setText("")
 
         if self.viewer_window:
             try:
@@ -1265,6 +1249,7 @@ class FloatingSenderWindow(QWidget):
                     "background-color: #f37021; color: white; font-weight: bold;"
                 )
                 self._update_status_color("#f37021")
+                self.fps_badge.setVisible(False)
             else:
                 self.is_paused = False
                 self.stream_thread.paused = False
@@ -1299,6 +1284,8 @@ class FloatingSenderWindow(QWidget):
             color = "#f37021" if self.is_paused else "#00d084"
         else:
             color = "#d83b01"
+            self.fps_badge.setVisible(False)
+            self.fps_badge.setText("")
         self._update_status_color(color)
 
         if active:
@@ -1317,13 +1304,3 @@ class FloatingSenderWindow(QWidget):
         self._update_status_dot(color_hex)
         if not self.is_pulsing:
             self._update_mini_bar_style()
-
-    def closeEvent(self, event):
-        self._flush_history_save()
-        self.stop_sharing()
-        if self.control_thread:
-            self.control_thread.stop()
-            self.control_thread = None
-        if self.discovery_thread:
-            self.discovery_thread.stop()
-        event.accept()
