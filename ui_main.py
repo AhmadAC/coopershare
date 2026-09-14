@@ -4,6 +4,7 @@
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
 Features persistent state loading and debounced saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
 with vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
+cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WirePlumber),
 toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, and Windows DWM capture exclusion.
 """
 
@@ -600,9 +601,9 @@ class FloatingSenderWindow(QWidget):
         self.main_layout.addWidget(self.stack)
         self.expand_window()
 
-        if sys.platform == "win32":
-            self.is_host_muted = HostAudioController.get_host_mute()
-            self._update_host_mute_ui()
+        # Query host physical mute state cross-platform (Windows & Linux PipeWire)
+        self.is_host_muted = HostAudioController.get_host_mute()
+        self._update_host_mute_ui()
 
     def on_fps_updated(self, fps: float):
         """Updates the GUI FPS badge once a second."""
@@ -971,10 +972,10 @@ class FloatingSenderWindow(QWidget):
         is_viewing = bool(self.viewer_window and self.viewer_window.isVisible())
 
         if is_viewing:
-            view_rec_act = QAction("Cancel View and Control TV Screen", self)
+            view_rec_act = QAction("Cancel View & Control TV Screen", self)
             view_rec_act.setIcon(svg_to_icon(SVG_CLOSE, 16, "#ff6b6b"))
         else:
-            view_rec_act = QAction("View and Control TV Screen", self)
+            view_rec_act = QAction("View & Control TV Screen", self)
             view_rec_act.setIcon(svg_to_icon(SVG_SCREEN, 16, "#00a2ed"))
 
         view_rec_act.triggered.connect(self.toggle_receiver_viewer)

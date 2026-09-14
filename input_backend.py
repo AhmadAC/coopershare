@@ -1,11 +1,10 @@
-
-#input_backend.py
+# input_backend.py
 
 """
 Cross-Platform Universal Input Injector.
 Supports:
-- Native Win32 API (Windows)
-- Direct Linux Kernel /dev/uinput virtual absolute pointer driver (Zero external dependencies on Wayland / X11)
+- Native Win32 API (Windows mouse and keyboard events)
+- Direct Linux Kernel /dev/uinput virtual absolute pointer & keyboard driver (Zero external dependencies on Wayland / X11)
 - python-evdev driver (if installed)
 - pynput fallback (X11 only)
 """
@@ -72,7 +71,7 @@ class UInputUserDev(Structure):
 
 
 class PurePythonLinuxUInput:
-    """Direct zero-dependency Linux /dev/uinput virtual hardware absolute pointer."""
+    """Direct zero-dependency Linux /dev/uinput virtual hardware absolute pointer & keyboard."""
 
     def __init__(self, max_abs: int = UINPUT_MAX_ABS):
         self.fd = -1
@@ -98,6 +97,13 @@ class PurePythonLinuxUInput:
         fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
         for btn in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA):
             fcntl.ioctl(self.fd, UI_SET_KEYBIT, btn)
+
+        # Register standard keyboard keycodes (1..248)
+        for key_code in range(1, 249):
+            try:
+                fcntl.ioctl(self.fd, UI_SET_KEYBIT, key_code)
+            except Exception:
+                pass
 
         fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_REL)
         fcntl.ioctl(self.fd, UI_SET_RELBIT, REL_WHEEL)
@@ -128,7 +134,6 @@ class PurePythonLinuxUInput:
         os.write(self.fd, bytes(udev))
         fcntl.ioctl(self.fd, UI_DEV_CREATE)
 
-        # Allow udev and KWin compositor time to bind the new virtual device node
         time.sleep(0.15)
 
     def write_event(self, ev_type: int, code: int, value: int):
@@ -188,8 +193,6 @@ class UniversalInputInjector:
         self.mouse = None
         self.ui = None
         self.native_uinput = None
-
-        self._btn_down = {"left": False, "right": False, "middle": False}
 
         if sys.platform == "win32":
             self.mode = "win32"
@@ -271,6 +274,14 @@ class UniversalInputInjector:
                     dy = event.get("dy", 0)
                     delta = 120 if dy > 0 else -120
                     ctypes.windll.user32.mouse_event(self.MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+                elif ev_type == "key_down":
+                    vk = event.get("key_code")
+                    if vk:
+                        ctypes.windll.user32.keybd_event(vk & 0xFF, 0, 0, 0)
+                elif ev_type == "key_up":
+                    vk = event.get("key_code")
+                    if vk:
+                        ctypes.windll.user32.keybd_event(vk & 0xFF, 0, 2, 0)
             except Exception:
                 pass
 
@@ -283,17 +294,13 @@ class UniversalInputInjector:
                 if ev_type in ("touch_down", "mouse_down"):
                     btn_type = event.get("button", "left")
                     btn_code = BTN_RIGHT if btn_type == "right" else (BTN_MIDDLE if btn_type == "middle" else BTN_LEFT)
-                    if not self._btn_down.get(btn_type, False):
-                        self._btn_down[btn_type] = True
-                        self.native_uinput.write_event(EV_KEY, btn_code, 1)
+                    self.native_uinput.write_event(EV_KEY, btn_code, 1)
                     self.native_uinput.syn()
 
                 elif ev_type in ("touch_up", "mouse_up"):
                     btn_type = event.get("button", "left")
                     btn_code = BTN_RIGHT if btn_type == "right" else (BTN_MIDDLE if btn_type == "middle" else BTN_LEFT)
-                    if self._btn_down.get(btn_type, False):
-                        self._btn_down[btn_type] = False
-                        self.native_uinput.write_event(EV_KEY, btn_code, 0)
+                    self.native_uinput.write_event(EV_KEY, btn_code, 0)
                     self.native_uinput.syn()
 
                 elif ev_type in ("touch_move", "mouse_move"):
@@ -315,17 +322,13 @@ class UniversalInputInjector:
                 if ev_type in ("touch_down", "mouse_down"):
                     btn_type = event.get("button", "left")
                     btn_code = e.BTN_RIGHT if btn_type == "right" else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
-                    if not self._btn_down.get(btn_type, False):
-                        self._btn_down[btn_type] = True
-                        self.ui.write(e.EV_KEY, btn_code, 1)
+                    self.ui.write(e.EV_KEY, btn_code, 1)
                     self.ui.syn()
 
                 elif ev_type in ("touch_up", "mouse_up"):
                     btn_type = event.get("button", "left")
                     btn_code = e.BTN_RIGHT if btn_type == "right" else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
-                    if self._btn_down.get(btn_type, False):
-                        self._btn_down[btn_type] = False
-                        self.ui.write(e.EV_KEY, btn_code, 0)
+                    self.ui.write(e.EV_KEY, btn_code, 0)
                     self.ui.syn()
 
                 elif ev_type in ("touch_move", "mouse_move"):
@@ -339,24 +342,27 @@ class UniversalInputInjector:
                 pass
 
         elif self.mode == "pynput" and self.mouse:
-            if px is not None and py is not None:
-                self.mouse.position = (px, py)
-            if ev_type in ("touch_down", "mouse_down"):
-                btn = (
-                    Button.right
-                    if event.get("button") == "right"
-                    else (Button.middle if event.get("button") == "middle" else Button.left)
-                )
-                self.mouse.press(btn)
-            elif ev_type in ("touch_up", "mouse_up"):
-                btn = (
-                    Button.right
-                    if event.get("button") == "right"
-                    else (Button.middle if event.get("button") == "middle" else Button.left)
-                )
-                self.mouse.release(btn)
-            elif ev_type == "scroll":
-                self.mouse.scroll(0, 1 if event.get("dy", 0) > 0 else -1)
+            try:
+                if px is not None and py is not None:
+                    self.mouse.position = (px, py)
+                if ev_type in ("touch_down", "mouse_down"):
+                    btn = (
+                        Button.right
+                        if event.get("button") == "right"
+                        else (Button.middle if event.get("button") == "middle" else Button.left)
+                    )
+                    self.mouse.press(btn)
+                elif ev_type in ("touch_up", "mouse_up"):
+                    btn = (
+                        Button.right
+                        if event.get("button") == "right"
+                        else (Button.middle if event.get("button") == "middle" else Button.left)
+                    )
+                    self.mouse.release(btn)
+                elif ev_type == "scroll":
+                    self.mouse.scroll(0, 1 if event.get("dy", 0) > 0 else -1)
+            except Exception:
+                pass
 
     def close(self):
         if self.native_uinput:
@@ -369,4 +375,3 @@ class UniversalInputInjector:
             except Exception:
                 pass
             self.ui = None
-

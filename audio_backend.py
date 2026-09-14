@@ -1,6 +1,7 @@
 # audio_backend.py
 """
 Native 64-bit Windows WASAPI Desktop Audio Loopback & Physical Speaker Mute Controller (ctypes COM).
+Cross-platform host speaker mute support for Linux (PipeWire / WirePlumber / PulseAudio / ALSA).
 Provides safe cross-platform fallbacks for non-Windows environments (Linux / macOS).
 """
 
@@ -20,6 +21,9 @@ from ctypes import (
     c_ushort,
     c_void_p,
 )
+import os
+import shutil
+import subprocess
 import sys
 from typing import Optional
 
@@ -88,14 +92,154 @@ def _release_com_ptr(ptr: c_void_p):
             pass
 
 
+def _get_clean_host_env() -> dict:
+    """Restores host LD_LIBRARY_PATH when running under AppImage to prevent library collisions."""
+    env = os.environ.copy()
+    if "APPIMAGE" in env:
+        orig_ld = env.get("LD_LIBRARY_PATH_ORIG")
+        if orig_ld is not None:
+            env["LD_LIBRARY_PATH"] = orig_ld
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
 class HostAudioController:
     """Controls physical host speaker mute without affecting loopback capture."""
 
     @staticmethod
     def set_host_mute(mute: bool) -> bool:
-        if sys.platform != "win32":
-            return False
+        if sys.platform == "win32":
+            return HostAudioController._windows_set_mute(mute)
+        elif sys.platform.startswith("linux"):
+            return HostAudioController._linux_set_mute(mute)
+        return False
 
+    @staticmethod
+    def get_host_mute() -> bool:
+        if sys.platform == "win32":
+            return HostAudioController._windows_get_mute()
+        elif sys.platform.startswith("linux"):
+            return HostAudioController._linux_get_mute()
+        return False
+
+    @classmethod
+    def _linux_set_mute(cls, mute: bool) -> bool:
+        env = _get_clean_host_env()
+        val_str = "1" if mute else "0"
+
+        # 1. WirePlumber CLI (wpctl) - Default on Fedora 44 (PipeWire)
+        wpctl = shutil.which("wpctl")
+        if wpctl:
+            for target in ("@DEFAULT_AUDIO_SINK@", "@DEFAULT_SINK@"):
+                try:
+                    res = subprocess.run(
+                        [wpctl, "set-mute", target, val_str],
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=1.2,
+                    )
+                    if res.returncode == 0:
+                        return True
+                except Exception:
+                    pass
+
+        # 2. PulseAudio / PipeWire-Pulse compatibility (pactl)
+        pactl = shutil.which("pactl")
+        if pactl:
+            for target in ("@DEFAULT_SINK@", "0"):
+                try:
+                    res = subprocess.run(
+                        [pactl, "set-sink-mute", target, val_str],
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=1.2,
+                    )
+                    if res.returncode == 0:
+                        return True
+                except Exception:
+                    pass
+
+        # 3. ALSA (amixer)
+        amixer = shutil.which("amixer")
+        if amixer:
+            action = "mute" if mute else "unmute"
+            for ctrl in ("Master", "Speaker", "Playback"):
+                try:
+                    res = subprocess.run(
+                        [amixer, "set", ctrl, action],
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=1.2,
+                    )
+                    if res.returncode == 0:
+                        return True
+                except Exception:
+                    pass
+
+        return False
+
+    @classmethod
+    def _linux_get_mute(cls) -> bool:
+        env = _get_clean_host_env()
+
+        # 1. WirePlumber CLI (wpctl)
+        wpctl = shutil.which("wpctl")
+        if wpctl:
+            for target in ("@DEFAULT_AUDIO_SINK@", "@DEFAULT_SINK@"):
+                try:
+                    res = subprocess.run(
+                        [wpctl, "get-volume", target],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=1.2,
+                    )
+                    if res.returncode == 0 and res.stdout:
+                        return "[MUTED]" in res.stdout.upper()
+                except Exception:
+                    pass
+
+        # 2. PulseAudio / PipeWire-Pulse compatibility (pactl)
+        pactl = shutil.which("pactl")
+        if pactl:
+            for target in ("@DEFAULT_SINK@", "0"):
+                try:
+                    res = subprocess.run(
+                        [pactl, "get-sink-mute", target],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=1.2,
+                    )
+                    if res.returncode == 0 and res.stdout:
+                        return "yes" in res.stdout.lower()
+                except Exception:
+                    pass
+
+        # 3. ALSA (amixer)
+        amixer = shutil.which("amixer")
+        if amixer:
+            try:
+                res = subprocess.run(
+                    [amixer, "get", "Master"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=1.2,
+                )
+                if res.returncode == 0 and res.stdout:
+                    return "[off]" in res.stdout.lower()
+            except Exception:
+                pass
+
+        return False
+
+    @classmethod
+    def _windows_set_mute(cls, mute: bool) -> bool:
         ole32 = ctypes.windll.ole32
         ole32.CoInitialize(None)
         p_enum = c_void_p()
@@ -143,11 +287,8 @@ class HostAudioController:
             _release_com_ptr(p_dev)
             _release_com_ptr(p_enum)
 
-    @staticmethod
-    def get_host_mute() -> bool:
-        if sys.platform != "win32":
-            return False
-
+    @classmethod
+    def _windows_get_mute(cls) -> bool:
         ole32 = ctypes.windll.ole32
         ole32.CoInitialize(None)
         p_enum = c_void_p()

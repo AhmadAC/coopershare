@@ -2,7 +2,8 @@
 
 """
 Interactive Remote Receiver Viewer Canvas & Control Window.
-Includes native capture exclusion on Windows to prevent feedback loop streaming.
+Captures and forwards left click, right click, middle click, mouse move, scroll,
+and keystrokes to the target receiver display. Includes native capture exclusion on Windows.
 """
 
 import sys
@@ -166,6 +167,10 @@ class RemoteReceiverCanvas(QWidget):
         )
         event.accept()
 
+    def contextMenuEvent(self, event):
+        # Allow right click to be processed and dispatched without showing a local menu
+        event.accept()
+
 
 class RemoteReceiverViewerWindow(QMainWindow):
     """Viewer window displaying the live stream with interactive mouse and keyboard control."""
@@ -204,4 +209,3 @@ class RemoteReceiverViewerWindow(QMainWindow):
             self.stream_thread.stop()
         self.viewer_closed.emit()
         event.accept()
-
