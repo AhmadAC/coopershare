@@ -5,16 +5,18 @@ Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remot
 Features persistent state loading and debounced saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
 with vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
 cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WirePlumber),
-toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, and Windows DWM capture exclusion.
+toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, Windows DWM capture exclusion,
+multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown, and offset context menu.
 """
 
 import ctypes
 import math
+import re
 import sys
 import time
 from typing import Optional
 
-from PySide6.QtCore import QByteArray, QEvent, QPoint, QSize, Qt, QTimer
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,7 +25,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -148,6 +149,119 @@ class TimerDialog(QDialog):
 
     def get_args(self) -> str:
         return self.timer_edit.text().strip().strip('"').strip("'")
+
+
+class EditTvDialog(QDialog):
+    """Dialog allowing users to set a friendly TV name and assign one or more IP addresses."""
+
+    def __init__(self, tv_name: str, ips: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure TV & Friendly Name")
+        self.setFixedWidth(440)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #1a1e29;
+                border: 1px solid #3d475f;
+                border-radius: 10px;
+            }
+            QLabel {
+                color: #ffffff;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 12px;
+            }
+            QLineEdit {
+                background: #262c3b;
+                border: 1px solid #3d475f;
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 7px 10px;
+                font-size: 13px;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 7px 18px;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton#cancel_btn {
+                background-color: #262c3b;
+                border: 1px solid #3d475f;
+            }
+            QPushButton#cancel_btn:hover {
+                background-color: #333c4d;
+            }
+            """
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(8)
+        tag_icon = QLabel()
+        tag_icon.setPixmap(svg_to_pixmap(SVG_TAG, 18, 18, "#00a2ed"))
+        title_lbl = QLabel("Manage TV Friendly Name & IPs")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 14px; color: #00a2ed;")
+        header_layout.addWidget(tag_icon)
+        header_layout.addWidget(title_lbl)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+
+        layout.addWidget(QLabel("TV Friendly Name:"))
+        self.name_edit = QLineEdit(tv_name)
+        self.name_edit.setPlaceholderText("e.g. Living Room TV, STEAM 408")
+        self.name_edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.name_edit)
+
+        layout.addWidget(QLabel("IP Address(es) (separate multiple with commas or spaces):"))
+        self.ips_edit = QLineEdit(", ".join(ips))
+        self.ips_edit.setPlaceholderText("e.g. 172.31.60.175, 192.168.90.221")
+        self.ips_edit.returnPressed.connect(self.accept)
+        layout.addWidget(self.ips_edit)
+
+        hint_lbl = QLabel("Tip: You can save multiple IPs (e.g. Wi-Fi & LAN) for the same TV.")
+        hint_lbl.setStyleSheet("color: #8f9bb3; font-size: 11px;")
+        layout.addWidget(hint_lbl)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("cancel_btn")
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self.save_btn = QPushButton("Save")
+        self.save_btn.clicked.connect(self.accept)
+
+        btn_layout.addWidget(self.cancel_btn)
+        btn_layout.addWidget(self.save_btn)
+        layout.addLayout(btn_layout)
+
+        if sys.platform == "win32":
+            exclude_from_capture(self)
+
+    def showEvent(self, event):
+        if sys.platform == "win32":
+            exclude_from_capture(self)
+        super().showEvent(event)
+
+    def get_data(self) -> tuple[str, list[str]]:
+        name = self.name_edit.text().strip()
+        raw_ips = self.ips_edit.text().strip()
+        tokens = re.split(r"[,;\s]+", raw_ips)
+        cleaned_ips = []
+        for t in tokens:
+            t_clean = t.strip()
+            if t_clean and t_clean not in cleaned_ips:
+                cleaned_ips.append(t_clean)
+        return name, cleaned_ips
 
 
 class FloatingSenderWindow(QWidget):
@@ -417,8 +531,15 @@ class FloatingSenderWindow(QWidget):
         ip_row = QHBoxLayout()
         self.device_combo = QComboBox()
         self.device_combo.setEditable(True)
+        self.device_combo.setFocusPolicy(Qt.StrongFocus)
         self.device_combo.setPlaceholderText("Select TV or Enter IP...")
+        self.device_combo.lineEdit().setFocusPolicy(Qt.StrongFocus)
         self.device_combo.lineEdit().returnPressed.connect(self.toggle_connect)
+        self.device_combo.currentIndexChanged.connect(self._on_device_index_changed)
+
+        # Install event filter to allow Up/Down arrow navigation from combobox or its lineEdit
+        self.device_combo.installEventFilter(self)
+        self.device_combo.lineEdit().installEventFilter(self)
 
         self.connect_btn = QPushButton("Share")
         self.connect_btn.clicked.connect(self.toggle_connect)
@@ -634,16 +755,26 @@ class FloatingSenderWindow(QWidget):
 
         if matched_index >= 0:
             self.device_combo.setCurrentIndex(matched_index)
+            self.device_combo.setEditText(self.device_combo.itemText(matched_index))
         elif last_ip:
             self.device_combo.setEditText(last_ip)
 
         self.device_combo.blockSignals(False)
 
+    def _on_device_index_changed(self, index: int):
+        if index >= 0:
+            target_ip = self.device_combo.itemData(index)
+            if target_ip:
+                self.history_data["last_ip"] = str(target_ip).strip()
+                self._schedule_history_save()
+
     def get_selected_target_ip(self) -> str:
         raw_text = self.device_combo.currentText().strip()
         data_val = self.device_combo.currentData()
-        if data_val:
-            return str(data_val).strip()
+        cur_idx = self.device_combo.currentIndex()
+        if data_val and str(data_val).strip():
+            if cur_idx >= 0 and self.device_combo.itemText(cur_idx) == raw_text:
+                return str(data_val).strip()
 
         if "(" in raw_text and ")" in raw_text:
             return raw_text.split("(")[-1].replace(")", "").strip()
@@ -693,28 +824,62 @@ class FloatingSenderWindow(QWidget):
         if sys.platform == "win32":
             exclude_from_capture(self)
 
-    def prompt_set_friendly_name(self):
+    def _get_tv_info_for_selection(self) -> tuple[str, list[str]]:
+        """Retrieves friendly name and all associated IP addresses for the current TV selection."""
         current_ip = self.get_selected_target_ip()
-        if not current_ip:
-            return
-
+        current_text = self.device_combo.currentText().strip()
         devices = self.history_data.get("devices", {})
-        existing_name = devices.get(current_ip, "")
 
-        new_name, ok = QInputDialog.getText(
-            self,
-            "Set Friendly TV Name",
-            f"Enter friendly name for display IP ({current_ip}):",
-            QLineEdit.Normal,
-            existing_name,
-        )
+        tv_name = ""
+        ips = []
 
-        if ok and new_name.strip():
-            devices[current_ip] = new_name.strip()
+        if current_ip and current_ip in devices:
+            tv_name = devices[current_ip]
+        elif "(" in current_text:
+            tv_name = current_text.split("(")[0].strip()
+
+        if tv_name:
+            for ip, name in devices.items():
+                if name == tv_name and ip not in ips:
+                    ips.append(ip)
+
+        if current_ip and current_ip not in ips:
+            ips.append(current_ip)
+
+        return tv_name, ips
+
+    def prompt_set_friendly_name(self):
+        tv_name, ips = self._get_tv_info_for_selection()
+        dlg = EditTvDialog(tv_name, ips, self)
+        if dlg.exec() == QDialog.Accepted:
+            new_name, new_ips = dlg.get_data()
+            if not new_ips:
+                return
+
+            devices = self.history_data.get("devices", {})
+
+            # Clean up old IPs that belonged to this TV name
+            if tv_name:
+                for old_ip in list(devices.keys()):
+                    if devices[old_ip] == tv_name and old_ip not in new_ips:
+                        del devices[old_ip]
+
+            # Save all IPs for this friendly TV name
+            effective_name = new_name if new_name else (tv_name if tv_name else new_ips[0])
+            for ip in new_ips:
+                devices[ip] = effective_name
+
             self.history_data["devices"] = devices
-            self.history_data["last_ip"] = current_ip
+            if new_ips:
+                self.history_data["last_ip"] = new_ips[0]
             self._schedule_history_save()
             self._populate_device_list()
+
+            # Select newly modified TV in dropdown
+            for i in range(self.device_combo.count()):
+                if self.device_combo.itemData(i) in new_ips:
+                    self.device_combo.setCurrentIndex(i)
+                    break
 
     def remove_selected_device(self):
         current_ip = self.get_selected_target_ip()
@@ -879,6 +1044,34 @@ class FloatingSenderWindow(QWidget):
     def is_input_enabled(self) -> bool:
         return self.input_enabled
 
+    def eventFilter(self, watched, event):
+        """Intercepts keyboard events on the device combobox/lineEdit for arrow key navigation."""
+        if hasattr(self, "device_combo") and (
+            watched == self.device_combo or watched == self.device_combo.lineEdit()
+        ):
+            if event.type() == QEvent.KeyPress:
+                key = event.key()
+                if key in (Qt.Key_Up, Qt.Key_Down):
+                    count = self.device_combo.count()
+                    if count > 0:
+                        view = self.device_combo.view()
+                        if view and view.isVisible():
+                            return False
+
+                        cur = self.device_combo.currentIndex()
+                        if cur < 0:
+                            next_idx = 0 if key == Qt.Key_Down else (count - 1)
+                        elif key == Qt.Key_Down:
+                            next_idx = (cur + 1) if cur < count - 1 else 0
+                        else:
+                            next_idx = (cur - 1) if cur > 0 else (count - 1)
+
+                        self.device_combo.setCurrentIndex(next_idx)
+                        self.device_combo.lineEdit().setText(self.device_combo.itemText(next_idx))
+                        self.device_combo.lineEdit().selectAll()
+                        return True
+        return super().eventFilter(watched, event)
+
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             if not self.is_mini_mode:
@@ -936,6 +1129,7 @@ class FloatingSenderWindow(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        menu.setWindowFlags(menu.windowFlags() | Qt.WindowStaysOnTopHint | Qt.Popup)
         menu.setStyleSheet(
             """
             QMenu {
@@ -962,10 +1156,6 @@ class FloatingSenderWindow(QWidget):
             }
             """
         )
-
-        if sys.platform == "win32":
-            menu.winId()
-            exclude_from_capture(menu)
 
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         has_target = bool(target_ip)
@@ -994,10 +1184,7 @@ class FloatingSenderWindow(QWidget):
 
         win_menu = menu.addMenu("TV Window Control")
         win_menu.setIcon(svg_to_icon(SVG_DISPLAY, 16, "#ffffff"))
-
-        if sys.platform == "win32":
-            win_menu.winId()
-            exclude_from_capture(win_menu)
+        win_menu.setWindowFlags(win_menu.windowFlags() | Qt.WindowStaysOnTopHint | Qt.Popup)
 
         max_act = QAction("Maximize / Fullscreen TV", self)
         max_act.setIcon(svg_to_icon(SVG_MAXIMIZE, 16, "#ffffff"))
@@ -1017,7 +1204,7 @@ class FloatingSenderWindow(QWidget):
 
         menu.addSeparator()
 
-        rename_act = QAction("Set Friendly Name for TV...", self)
+        rename_act = QAction("Set Friendly Name / TV IPs...", self)
         rename_act.setIcon(svg_to_icon(SVG_TAG, 16, "#ffffff"))
         rename_act.triggered.connect(self.prompt_set_friendly_name)
         menu.addAction(rename_act)
@@ -1071,7 +1258,55 @@ class FloatingSenderWindow(QWidget):
         quit_action.setIcon(svg_to_icon(SVG_LOGOUT, 16, "#ff6b6b"))
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
-        menu.exec(event.globalPos())
+
+        # Calculate position directly next to the GUI window (not behind or overlapping)
+        win_geom = self.frameGeometry()
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        screen_geom = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+
+        menu_hint = menu.sizeHint()
+        menu_w = max(240, menu_hint.width())
+        menu_h = menu_hint.height()
+
+        # Display immediately to the right of the GUI window
+        target_x = win_geom.right() + 6
+        if target_x + menu_w > screen_geom.right():
+            # If overflowing screen on the right, display to the left of the GUI window
+            target_x = win_geom.left() - menu_w - 6
+
+        if target_x < screen_geom.left():
+            target_x = screen_geom.left() + 4
+
+        # Align vertically with top of the window
+        target_y = win_geom.top()
+        if target_y + menu_h > screen_geom.bottom():
+            target_y = max(screen_geom.top() + 4, screen_geom.bottom() - menu_h - 6)
+        if target_y < screen_geom.top():
+            target_y = screen_geom.top() + 4
+
+        target_pos = QPoint(target_x, target_y)
+
+        # Pause topmost timer while menu is active so window does not jump in front of menu
+        self.topmost_timer.stop()
+
+        if sys.platform == "win32":
+            exclude_from_capture(menu)
+            exclude_from_capture(win_menu)
+            try:
+                ctypes.windll.user32.SetWindowPos(
+                    int(menu.winId()),
+                    -1,
+                    0, 0, 0, 0,
+                    0x0002 | 0x0001 | 0x0040 | 0x0010,
+                )
+            except Exception:
+                pass
+
+        try:
+            menu.exec(target_pos)
+        finally:
+            self.topmost_timer.start()
+            self.enforce_always_on_top()
 
     def on_fps_changed(self, index: int):
         fps_map = {0: 60, 1: 30, 2: 120, 3: 15}
