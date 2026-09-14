@@ -972,10 +972,10 @@ class FloatingSenderWindow(QWidget):
         is_viewing = bool(self.viewer_window and self.viewer_window.isVisible())
 
         if is_viewing:
-            view_rec_act = QAction("Cancel View & Control TV Screen", self)
+            view_rec_act = QAction("Cancel View and Control TV Screen", self)
             view_rec_act.setIcon(svg_to_icon(SVG_CLOSE, 16, "#ff6b6b"))
         else:
-            view_rec_act = QAction("View & Control TV Screen", self)
+            view_rec_act = QAction("View and Control TV Screen", self)
             view_rec_act.setIcon(svg_to_icon(SVG_SCREEN, 16, "#00a2ed"))
 
         view_rec_act.triggered.connect(self.toggle_receiver_viewer)
