@@ -1,4 +1,3 @@
-
 # threads.py
 
 """
@@ -223,10 +222,11 @@ class KWinScreenShot2Grabber:
 
             q_fd = QDBusUnixFileDescriptor(w_fd)
 
-            options = {
-                "include-cursor": include_cursor,
-                "native-resolution": native_resolution,
-            }
+            options = {}
+            if include_cursor:
+                options["include-cursor"] = True
+            if native_resolution:
+                options["native-resolution"] = True
 
             target_w = self.native_w if native_resolution else self.logical_w
             target_h = self.native_h if native_resolution else self.logical_h
@@ -460,7 +460,7 @@ class ScreenSenderThread(QThread):
         self.native_resolution = native_resolution
         self.running = True
         self.paused = False
-        self.send_cursorless_frame_once = False
+        self._pause_requested = False
 
         # 3-Stage Concurrent Pipeline Queues (Capture -> Encode -> Network Send)
         self.raw_queue = queue.Queue(maxsize=1)
@@ -479,8 +479,17 @@ class ScreenSenderThread(QThread):
         self.use_444_chroma = use_444
         self.native_resolution = native_resolution
 
+    def pause_stream(self):
+        """Signals the capture pipeline to hide cursor, capture a clean frame, send it, and pause."""
+        self._pause_requested = True
+
+    def resume_stream(self):
+        """Resumes streaming and restores mouse cursor capture."""
+        self._pause_requested = False
+        self.paused = False
+
     def trigger_cursorless_frame(self):
-        self.send_cursorless_frame_once = True
+        self.pause_stream()
 
     def _encoder_worker(self):
         """Stage 2: High-speed concurrent worker for parallel SIMD JPEG encoding."""
@@ -624,7 +633,46 @@ class ScreenSenderThread(QThread):
             mon_top = monitor.get("top", 0)
 
             while self.running and self.pipeline_running:
-                if self.paused and not self.send_cursorless_frame_once:
+                # Pre-pause execution: hide cursor, grab clean frame, send it, then pause
+                if self._pause_requested:
+                    use_native_res = bool(self.native_resolution and self.quality >= 95)
+                    clean_frame = None
+                    try:
+                        if use_kwin:
+                            clean_frame = kwin_grabber.grab(
+                                include_cursor=False,
+                                native_resolution=use_native_res,
+                            )
+                        elif use_spectacle and spectacle_grabber:
+                            clean_frame = spectacle_grabber.grab()
+                        elif not is_wayland:
+                            raw_f = sct.grab(monitor)
+                            img_f = np.array(raw_f)
+                            clean_frame = cv2.cvtColor(img_f, cv2.COLOR_BGRA2BGR)
+                    except Exception:
+                        clean_frame = None
+
+                    if clean_frame is not None:
+                        # Flush stale queued frames so cursorless frame is delivered immediately
+                        while not self.raw_queue.empty():
+                            try:
+                                self.raw_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        while not self.send_queue.empty():
+                            try:
+                                self.send_queue.get_nowait()
+                            except queue.Empty:
+                                break
+
+                        self.raw_queue.put((clean_frame, 0.0))
+
+                    self.paused = True
+                    self._pause_requested = False
+                    time.sleep(0.04)
+                    continue
+
+                if self.paused:
                     time.sleep(0.04)
                     continue
 
@@ -635,14 +683,13 @@ class ScreenSenderThread(QThread):
 
                     if use_kwin:
                         use_native_res = bool(self.native_resolution and self.quality >= 95)
-                        want_cursor = not (self.paused or self.send_cursorless_frame_once)
                         frame_raw = kwin_grabber.grab(
-                            include_cursor=want_cursor,
+                            include_cursor=True,
                             native_resolution=use_native_res,
                         )
                     elif use_spectacle and spectacle_grabber:
                         frame_raw = spectacle_grabber.grab()
-                        if frame_raw is not None and not (self.paused or self.send_cursorless_frame_once):
+                        if frame_raw is not None:
                             render_cursor_on_frame(
                                 frame_raw,
                                 monitor_left=mon_left,
@@ -653,7 +700,7 @@ class ScreenSenderThread(QThread):
                         raw_frame = sct.grab(monitor)
                         img = np.array(raw_frame)
                         frame_raw = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                        if not (self.paused or self.send_cursorless_frame_once):
+                        if frame_raw is not None:
                             render_cursor_on_frame(
                                 frame_raw,
                                 monitor_left=mon_left,
@@ -670,9 +717,6 @@ class ScreenSenderThread(QThread):
                         if is_wayland:
                             time.sleep(0.002)
                         continue
-
-                    if self.send_cursorless_frame_once:
-                        self.send_cursorless_frame_once = False
 
                     if self.raw_queue.full():
                         try:
@@ -1028,13 +1072,3 @@ class ReverseScreenReceiverThread(QThread):
     def stop(self):
         self.running = False
         self.wait(1000)
-
-    def closeEvent(self, event):
-        self._flush_history_save()
-        self.stop_sharing()
-        if self.control_thread:
-            self.control_thread.stop()
-            self.control_thread = None
-        if self.discovery_thread:
-            self.discovery_thread.stop()
-        event.accept()

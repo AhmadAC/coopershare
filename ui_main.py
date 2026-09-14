@@ -1,4 +1,3 @@
-
 # ui_main.py
 
 """
@@ -792,7 +791,7 @@ class FloatingSenderWindow(QWidget):
             and not self.stream_thread.paused
         ):
             self.was_streaming_before_viewing = True
-            self.stream_thread.paused = True
+            self.stream_thread.pause_stream()
         else:
             self.was_streaming_before_viewing = False
 
@@ -831,7 +830,7 @@ class FloatingSenderWindow(QWidget):
             )
 
         if self.was_streaming_before_viewing and self.stream_thread:
-            self.stream_thread.paused = False
+            self.stream_thread.resume_stream()
             self.is_paused = False
             self.pause_btn.setText("Pause")
             self.pause_btn.setIcon(svg_to_icon(SVG_PAUSE, 14, "#ffffff"))
@@ -972,10 +971,10 @@ class FloatingSenderWindow(QWidget):
         is_viewing = bool(self.viewer_window and self.viewer_window.isVisible())
 
         if is_viewing:
-            view_rec_act = QAction("Cancel View & Control TV Screen", self)
+            view_rec_act = QAction("Cancel View and Control TV Screen", self)
             view_rec_act.setIcon(svg_to_icon(SVG_CLOSE, 16, "#ff6b6b"))
         else:
-            view_rec_act = QAction("View & Control TV Screen", self)
+            view_rec_act = QAction("View and Control TV Screen", self)
             view_rec_act.setIcon(svg_to_icon(SVG_SCREEN, 16, "#00a2ed"))
 
         view_rec_act.triggered.connect(self.toggle_receiver_viewer)
@@ -1240,9 +1239,8 @@ class FloatingSenderWindow(QWidget):
     def toggle_pause(self):
         if self.stream_thread:
             if not self.is_paused:
-                self.stream_thread.trigger_cursorless_frame()
                 self.is_paused = True
-                self.stream_thread.paused = True
+                self.stream_thread.pause_stream()
                 self.pause_btn.setText("Resume")
                 self.pause_btn.setIcon(svg_to_icon(SVG_PLAY, 14, "#ffffff"))
                 self.pause_btn.setStyleSheet(
@@ -1252,7 +1250,7 @@ class FloatingSenderWindow(QWidget):
                 self.fps_badge.setVisible(False)
             else:
                 self.is_paused = False
-                self.stream_thread.paused = False
+                self.stream_thread.resume_stream()
                 self.pause_btn.setText("Pause")
                 self.pause_btn.setIcon(svg_to_icon(SVG_PAUSE, 14, "#ffffff"))
                 self.pause_btn.setStyleSheet(
