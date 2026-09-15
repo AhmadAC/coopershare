@@ -1,0 +1,112 @@
+name: Build MrCoopersScreenShare Executables
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  # =========================================================================
+  # Build Windows Onedir Packages (sender.exe & receiver.exe)
+  # =========================================================================
+  build-windows:
+    name: Build Windows 11 Onedir Packages
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14.6"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install PySide6 opencv-python-headless mss sounddevice numpy pynput pyinstaller
+
+      - name: Build sender (onedir) with PyInstaller
+        run: |
+          pyinstaller --noconsole --onedir `
+            --name "sender" `
+            --icon "icon.ico" `
+            --add-data "icon.ico;." `
+            --add-data "icon.png;." `
+            --hidden-import "sounddevice" `
+            --hidden-import "pynput" `
+            --hidden-import "pynput.keyboard._win32" `
+            --hidden-import "pynput.mouse._win32" `
+            --hidden-import "mss" `
+            --hidden-import "cv2" `
+            --hidden-import "PySide6.QtSvg" `
+            sender.py
+
+      - name: Build receiver (onedir) with PyInstaller
+        run: |
+          pyinstaller --noconsole --onedir `
+            --name "receiver" `
+            --icon "icon.ico" `
+            --add-data "icon.ico;." `
+            --add-data "icon.png;." `
+            --hidden-import "sounddevice" `
+            --hidden-import "pynput" `
+            --hidden-import "pynput.keyboard._win32" `
+            --hidden-import "pynput.mouse._win32" `
+            --hidden-import "mss" `
+            --hidden-import "cv2" `
+            --hidden-import "PySide6.QtSvg" `
+            receiver.py
+
+      - name: Bundle assets & create portable ZIP archives
+        run: |
+          Copy-Item "icon.ico" -Destination "dist\sender\icon.ico" -ErrorAction SilentlyContinue
+          Copy-Item "icon.png" -Destination "dist\sender\icon.png" -ErrorAction SilentlyContinue
+          Copy-Item "icon.ico" -Destination "dist\receiver\icon.ico" -ErrorAction SilentlyContinue
+          Copy-Item "icon.png" -Destination "dist\receiver\icon.png" -ErrorAction SilentlyContinue
+          
+          Compress-Archive -Path "dist\sender" -DestinationPath "dist\MrCoopersScreenShare-Sender-Windows.zip" -CompressionLevel Optimal
+          Compress-Archive -Path "dist\receiver" -DestinationPath "dist\MrCoopersScreenShare-Receiver-Windows.zip" -CompressionLevel Optimal
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-onedir-packages
+          path: |
+            dist/MrCoopersScreenShare-Sender-Windows.zip
+            dist/MrCoopersScreenShare-Receiver-Windows.zip
+          retention-days: 14
+          compression-level: 6
+
+  # =========================================================================
+  # Create GitHub Release (Runs on git tags like v1.0.0)
+  # =========================================================================
+  create-release:
+    name: Publish Release Assets
+    needs: [build-windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-onedir-packages
+          path: release-assets
+
+      - name: Create Release and Upload Zip Archives
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/MrCoopersScreenShare-Sender-Windows.zip
+            release-assets/MrCoopersScreenShare-Receiver-Windows.zip
+          draft: false
+          prerelease: false
+          compression-level: 6
