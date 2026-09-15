@@ -1,9 +1,13 @@
+#################### START OF FILE: ui_main.py ####################
+
 # ui_main.py
 
 """
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
 Features persistent state loading and debounced saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
-with vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
+with computer-specific dynamic color shades applied exclusively to the target computer dropdown box
+(Steam, CS, and distinct hashed shades for any other device/IP),
+vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
 cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WirePlumber),
 toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, Windows DWM capture exclusion,
 multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown,
@@ -68,6 +72,91 @@ from utils import (
     svg_to_icon,
     svg_to_pixmap,
 )
+
+# ---------------------------------------------------------------------------
+# Distinct Computer Color Shade Palettes (Exclusively for Target Dropdown)
+# ---------------------------------------------------------------------------
+DEVICE_COLOR_PALETTES = [
+    {  # 0: Steam - Cyan / Deep Oceanic Slate
+        "accent": "#00b4d8",
+        "bg": "#122338",
+        "border": "#1b4d75",
+    },
+    {  # 1: CS - Mint / Emerald Green
+        "accent": "#06d6a0",
+        "bg": "#102c23",
+        "border": "#195c47",
+    },
+    {  # 2: Violet / Electric Purple
+        "accent": "#b388ff",
+        "bg": "#2b1c3d",
+        "border": "#5c3385",
+    },
+    {  # 3: Amber / Golden Orange
+        "accent": "#ffb703",
+        "bg": "#382910",
+        "border": "#7a5314",
+    },
+    {  # 4: Coral / Rose Pink
+        "accent": "#ff5c8a",
+        "bg": "#381723",
+        "border": "#7d2946",
+    },
+    {  # 5: Indigo / Sapphire
+        "accent": "#7986cb",
+        "bg": "#1a1f3b",
+        "border": "#39437d",
+    },
+    {  # 6: Spring Lime Green
+        "accent": "#aeea00",
+        "bg": "#25330e",
+        "border": "#516e1a",
+    },
+    {  # 7: Sunset Tangerine
+        "accent": "#fb8500",
+        "bg": "#3b210f",
+        "border": "#7d3f15",
+    },
+    {  # 8: Ocean Turquoise
+        "accent": "#2ec4b6",
+        "bg": "#102e2c",
+        "border": "#1b5e5a",
+    },
+    {  # 9: Fuchsia Magenta
+        "accent": "#f72585",
+        "bg": "#361026",
+        "border": "#7a1a52",
+    },
+    {  # 10: Bright Sky Blue
+        "accent": "#48cae4",
+        "bg": "#112a36",
+        "border": "#1e5b75",
+    },
+    {  # 11: Crimson Red
+        "accent": "#e63946",
+        "bg": "#381419",
+        "border": "#7d222b",
+    },
+]
+
+
+def get_device_theme(device_identifier: str) -> dict:
+    """Returns a deterministic, unique color shade theme based on the computer name or IP."""
+    raw = str(device_identifier).strip().lower()
+    if not raw:
+        return DEVICE_COLOR_PALETTES[0]
+
+    # Explicit computer name keywords
+    if "steam" in raw:
+        return DEVICE_COLOR_PALETTES[0]
+    if "cs" in raw:
+        return DEVICE_COLOR_PALETTES[1]
+
+    # Deterministic hash to distribute any other computer name or IP across distinct shades
+    h = 0
+    for ch in raw:
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return DEVICE_COLOR_PALETTES[h % len(DEVICE_COLOR_PALETTES)]
 
 
 class TimerDialog(QDialog):
@@ -395,6 +484,9 @@ class FloatingSenderWindow(QWidget):
         self._setup_ui()
         self._populate_device_list()
 
+        initial_target = self.device_combo.currentText().strip() or self.get_selected_target_ip()
+        self._update_device_combo_style(initial_target)
+
         self.discovery_thread = DiscoveryListenerThread()
         self.discovery_thread.device_found.connect(self.on_device_discovered)
         self.discovery_thread.start()
@@ -537,7 +629,85 @@ class FloatingSenderWindow(QWidget):
                         self.apply_opacity(self.opacity_slider.value() / 100.0)
         super().changeEvent(event)
 
+    def _update_device_combo_style(self, device_text: Optional[str] = None):
+        """Applies distinct computer color shades strictly to the target dropdown box."""
+        if not hasattr(self, "device_combo"):
+            return
+        if device_text is None:
+            device_text = self.device_combo.currentText().strip() or self.get_selected_target_ip()
+
+        theme = get_device_theme(device_text)
+        accent = theme["accent"]
+        bg = theme["bg"]
+        border = theme["border"]
+
+        self.device_combo.setStyleSheet(
+            f"""
+            QComboBox {{
+                background-color: {bg};
+                border: 1.5px solid {border};
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 5px 8px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            QComboBox:hover, QComboBox:focus {{
+                border: 1.5px solid {accent};
+            }}
+            QComboBox QLineEdit {{
+                background: transparent;
+                border: none;
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 0px;
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 22px;
+                border-left-width: 0px;
+                border-top-right-radius: 6px;
+                border-bottom-right-radius: 6px;
+            }}
+            QComboBox::down-arrow {{
+                width: 0px;
+                height: 0px;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid {accent};
+                margin-right: 6px;
+            }}
+            QComboBox::down-arrow:hover {{
+                border-top: 5px solid #ffffff;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: #1a1e29;
+                color: #ffffff;
+                border: 1px solid #3d475f;
+                border-radius: 6px;
+                selection-background-color: #0078d4;
+                selection-color: #ffffff;
+                outline: none;
+                padding: 4px;
+            }}
+            QComboBox QAbstractItemView::item {{
+                min-height: 24px;
+                padding: 4px 8px;
+                border-radius: 4px;
+                color: #ffffff;
+            }}
+            QComboBox QAbstractItemView::item:selected,
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: #0078d4;
+                color: #ffffff;
+            }}
+            """
+        )
+
     def _update_card_style(self):
+        """Preserves the clean default application theme across all standard windows & widgets."""
         if not hasattr(self, "card"):
             return
         alpha = self.current_opacity if not self.is_mini_mode else 1.0
@@ -603,6 +773,7 @@ class FloatingSenderWindow(QWidget):
             QSlider::handle:horizontal {{ background: #00a2ed; width: 12px; margin: -4px 0; border-radius: 6px; }}
             """
         )
+        self._update_device_combo_style()
 
     def _setup_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -676,6 +847,7 @@ class FloatingSenderWindow(QWidget):
         self.device_combo.lineEdit().setFocusPolicy(Qt.StrongFocus)
         self.device_combo.lineEdit().returnPressed.connect(self.toggle_connect)
         self.device_combo.currentIndexChanged.connect(self._on_device_index_changed)
+        self.device_combo.editTextChanged.connect(self._on_device_text_changed)
 
         self.device_combo.installEventFilter(self)
         self.device_combo.lineEdit().installEventFilter(self)
@@ -885,7 +1057,10 @@ class FloatingSenderWindow(QWidget):
         idx = 0
         for ip, name in devices.items():
             label = f"{name} ({ip})" if name else ip
-            self.device_combo.addItem(label, ip)
+            dev_theme = get_device_theme(name or ip)
+            item_icon = svg_to_icon(SVG_SCREEN, 14, dev_theme["accent"])
+
+            self.device_combo.addItem(item_icon, label, ip)
             if ip == last_ip:
                 matched_index = idx
             idx += 1
@@ -901,9 +1076,15 @@ class FloatingSenderWindow(QWidget):
     def _on_device_index_changed(self, index: int):
         if index >= 0:
             target_ip = self.device_combo.itemData(index)
+            item_text = self.device_combo.itemText(index)
             if target_ip:
                 self.history_data["last_ip"] = str(target_ip).strip()
                 self._schedule_history_save()
+            self._update_device_combo_style(item_text or str(target_ip))
+
+    def _on_device_text_changed(self, text: str):
+        if text.strip():
+            self._update_device_combo_style(text.strip())
 
     def get_selected_target_ip(self) -> str:
         raw_text = self.device_combo.currentText().strip()
@@ -1014,6 +1195,8 @@ class FloatingSenderWindow(QWidget):
                     self.device_combo.setCurrentIndex(i)
                     break
 
+            self._update_device_combo_style(effective_name)
+
     def remove_selected_device(self):
         current_ip = self.get_selected_target_ip()
         devices = self.history_data.get("devices", {})
@@ -1022,6 +1205,7 @@ class FloatingSenderWindow(QWidget):
             self.history_data["devices"] = devices
             self._schedule_history_save()
             self._populate_device_list()
+            self._update_device_combo_style(self.device_combo.currentText().strip())
 
     def ensure_control_channel(self, target_ip: str) -> bool:
         if not self.control_thread or not self.control_thread.isRunning():
@@ -1514,6 +1698,7 @@ class FloatingSenderWindow(QWidget):
 
         if not self.device_combo.currentText().strip():
             self.device_combo.setEditText(ip)
+            self._update_device_combo_style(ip)
 
         if (
             self.auto_connect_cb.isChecked()
