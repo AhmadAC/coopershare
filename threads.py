@@ -6,7 +6,7 @@ Features:
 - Windows DXGI Desktop Duplication hardware capture (sub-1ms VRAM reading)
 - High-speed persistent DIB Section GDI fallback grabber
 - Parallel dual-threaded SIMD JPEG encoders bypassing the CPU core bottleneck to achieve 60 FPS
-- Network-adaptive resolution & bitrate controller for steady 60 FPS across Wi-Fi & LAN
+- Automatic bandwidth management keeping frames under 55 KB for ultra-fast Wi-Fi transmission
 - Live verbose performance telemetry every second
 - Linux KWin ScreenShot2 kernel pipe capture & MSS fallback
 """
@@ -492,13 +492,14 @@ class ScreenSenderThread(QThread):
 
             t_enc_start = time.perf_counter()
 
+            # Dynamic Bandwidth Budgeting: clamp JPEG quality based on real network send time
             eff_quality = self.quality
-            if self._last_net_duration > 35.0:
-                eff_quality = max(38, self.quality - 32)
-            elif self._last_net_duration > 22.0:
-                eff_quality = max(48, self.quality - 22)
+            if self._last_net_duration > 50.0:
+                eff_quality = min(eff_quality, 45)
+            elif self._last_net_duration > 25.0:
+                eff_quality = min(eff_quality, 55)
             elif self._last_net_duration > 15.0:
-                eff_quality = max(58, self.quality - 12)
+                eff_quality = min(eff_quality, 65)
 
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), eff_quality]
 
@@ -512,27 +513,19 @@ class ScreenSenderThread(QThread):
             else:
                 frame_bgr = frame_raw
 
-            # Bandwidth Optimization: Scale frame down to fit Wi-Fi constraints when targeting 60 FPS under Balanced
+            # Bandwidth Optimization: Scale frame down to maintain low network latency
             h, w = frame_bgr.shape[:2]
-            if (
-                self.fps_limit >= 60
-                and not self.native_resolution
-                and (self.quality <= 78 or self._last_net_duration > 20.0)
-            ):
-                if w > 1280:
+            if not self.native_resolution:
+                if self._last_net_duration > 35.0:
+                    if w > 960:
+                        scale = 960.0 / w
+                        frame_bgr = cv2.resize(
+                            frame_bgr, (960, int(round(h * scale))), interpolation=cv2.INTER_AREA
+                        )
+                elif w > 1280:
                     scale = 1280.0 / w
-                    target_w = 1280
-                    target_h = int(round(h * scale))
                     frame_bgr = cv2.resize(
-                        frame_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA
-                    )
-            elif self._last_net_duration > 40.0 and not self.native_resolution:
-                if w > 960:
-                    scale = 960.0 / w
-                    target_w = 960
-                    target_h = int(round(h * scale))
-                    frame_bgr = cv2.resize(
-                        frame_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA
+                        frame_bgr, (1280, int(round(h * scale))), interpolation=cv2.INTER_AREA
                     )
 
             success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
@@ -557,6 +550,7 @@ class ScreenSenderThread(QThread):
         last_report_time = time.perf_counter()
 
         while self.pipeline_running:
+            # Drop older frames if network fell behind so latency stays sub-frame
             while self.send_queue.qsize() > 1:
                 try:
                     self.send_queue.get_nowait()
@@ -846,6 +840,7 @@ class ScreenSenderThread(QThread):
                         time.sleep(0.001)
                         continue
 
+                    # Discard stale frame in queue to avoid lag buildup
                     if self.raw_queue.full():
                         try:
                             self.raw_queue.get_nowait()
