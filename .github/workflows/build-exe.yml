@@ -79,13 +79,20 @@ jobs:
           Compress-Archive -Path "dist\sender" -DestinationPath "dist\MrCoopersScreenShare-Sender-Windows.zip" -CompressionLevel Optimal
           Compress-Archive -Path "dist\receiver" -DestinationPath "dist\MrCoopersScreenShare-Receiver-Windows.zip" -CompressionLevel Optimal
 
-      - name: Upload Windows Artifacts
+      # Separate Upload 1: Sender ZIP
+      - name: Upload Sender Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-onedir-packages
-          path: |
-            dist/MrCoopersScreenShare-Sender-Windows.zip
-            dist/MrCoopersScreenShare-Receiver-Windows.zip
+          name: MrCoopersScreenShare-Sender-Windows
+          path: dist/MrCoopersScreenShare-Sender-Windows.zip
+          retention-days: 14
+
+      # Separate Upload 2: Receiver ZIP
+      - name: Upload Receiver Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MrCoopersScreenShare-Receiver-Windows
+          path: dist/MrCoopersScreenShare-Receiver-Windows.zip
           retention-days: 14
 
   create-release:
@@ -97,11 +104,13 @@ jobs:
       contents: write
 
     steps:
+      # Downloads all artifacts and merges them into `release-assets/` directly
       - name: Download Windows Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: windows-onedir-packages
+          pattern: 'MrCoopersScreenShare-*'
           path: release-assets
+          merge-multiple: true
 
       - name: Create Release and Upload Zip Archives
         uses: softprops/action-gh-release@v2
