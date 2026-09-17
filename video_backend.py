@@ -4,7 +4,7 @@
 Hardware Mouse Cursor Coordinate Extractor, Anti-Aliased Overlay Renderer,
 and Zero-Dependency Windows DirectX 11 / DXGI Desktop Duplication Hardware Grabber.
 Supports Windows Win32 API, Wayland / X11 Device Pixel Ratio (DPR) fractional scaling,
-and high-speed GPU framebuffer capture on Windows 10 & 11.
+and high-speed GPU framebuffer capture on Windows 10 & 11 with full verbose diagnostics.
 """
 
 import ctypes
@@ -23,6 +23,7 @@ from ctypes import (
     c_wchar,
 )
 import sys
+import time
 from typing import Optional
 
 import cv2
@@ -154,6 +155,7 @@ class WindowsDXGIGrabber:
         self.mon_left = 0
         self.mon_top = 0
         self.last_frame: Optional[np.ndarray] = None
+        self.first_frame_logged = False
 
         self.p_device = c_void_p()
         self.p_context = c_void_p()
@@ -161,7 +163,15 @@ class WindowsDXGIGrabber:
         self.p_staging_tex = c_void_p()
 
         if sys.platform == "win32":
+            print(f"[DXGI-Init] Initializing DirectX 11 Desktop Duplication (Output {output_index})...", flush=True)
             self.available = self._initialize()
+            if self.available:
+                print(
+                    f"[DXGI-Init] SUCCESS: Hardware GPU Desktop Duplication ACTIVE ({self.width}x{self.height} at {self.mon_left},{self.mon_top})",
+                    flush=True,
+                )
+            else:
+                print("[DXGI-Init] WARNING: DXGI hardware capture unavailable. Falling back to MSS GDI.", flush=True)
 
     def _initialize(self) -> bool:
         self._cleanup()
@@ -187,6 +197,7 @@ class WindowsDXGIGrabber:
             )
 
             if hr != 0 or not self.p_device.value:
+                print(f"[DXGI-Init] Hardware device creation failed (HRESULT 0x{hr & 0xFFFFFFFF:08X}), trying WARP...", flush=True)
                 hr = ctypes.windll.d3d11.D3D11CreateDevice(
                     None,
                     2,  # D3D_DRIVER_TYPE_WARP
@@ -200,6 +211,7 @@ class WindowsDXGIGrabber:
                     byref(self.p_context),
                 )
                 if hr != 0 or not self.p_device.value:
+                    print(f"[DXGI-Init] D3D11 WARP creation failed: HRESULT 0x{hr & 0xFFFFFFFF:08X}", flush=True)
                     return False
 
             dev_vtbl = ctypes.cast(
@@ -211,6 +223,7 @@ class WindowsDXGIGrabber:
 
             hr = dev_qi(self.p_device, byref(IID_IDXGIDevice), byref(p_dxgi_dev))
             if hr != 0 or not p_dxgi_dev.value:
+                print(f"[DXGI-Init] QueryInterface IDXGIDevice failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
                 return False
 
             dxgi_vtbl = ctypes.cast(
@@ -221,6 +234,7 @@ class WindowsDXGIGrabber:
             )
             hr = get_adapter(p_dxgi_dev, byref(p_adapter))
             if hr != 0 or not p_adapter.value:
+                print(f"[DXGI-Init] GetAdapter failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
                 return False
 
             adapter_vtbl = ctypes.cast(
@@ -235,6 +249,7 @@ class WindowsDXGIGrabber:
                 if self.output_index != 0:
                     hr = enum_outputs(p_adapter, 0, byref(p_output))
                 if hr != 0 or not p_output.value:
+                    print(f"[DXGI-Init] EnumOutputs failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
                     return False
 
             out_vtbl = ctypes.cast(
@@ -264,20 +279,21 @@ class WindowsDXGIGrabber:
             )(out_vtbl[0])
             hr = out_qi(p_output, byref(IID_IDXGIOutput1), byref(p_output1))
             if hr != 0 or not p_output1.value:
+                print(f"[DXGI-Init] QueryInterface IDXGIOutput1 failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
                 return False
 
             out1_vtbl = ctypes.cast(
                 p_output1, POINTER(POINTER(c_void_p))
             ).contents
+
+            # IDXGIOutput1::DuplicateOutput is index 19 (IUnknown=3, IDXGIObject=4, IDXGIDeviceSubObject=1, IDXGIOutput=10, IDXGIOutput1=1)
             dup_output = WINFUNCTYPE(
                 HRESULT, c_void_p, c_void_p, POINTER(c_void_p)
-            )(out11_vtbl if (out11_vtbl := out1_vtbl) else out1_vtbl[22])
-            dup_output = WINFUNCTYPE(
-                HRESULT, c_void_p, c_void_p, POINTER(c_void_p)
-            )(out1_vtbl[22])
+            )(out1_vtbl[19])
 
             hr = dup_output(p_output1, self.p_device, byref(self.p_duplication))
             if hr != 0 or not self.p_duplication.value:
+                print(f"[DXGI-Init] DuplicateOutput call failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
                 return False
 
             tex_desc = D3D11_TEXTURE2D_DESC(
@@ -305,8 +321,13 @@ class WindowsDXGIGrabber:
             hr = create_tex(
                 self.p_device, byref(tex_desc), None, byref(self.p_staging_tex)
             )
-            return hr == 0 and bool(self.p_staging_tex.value)
-        except Exception:
+            if hr != 0 or not self.p_staging_tex.value:
+                print(f"[DXGI-Init] CreateTexture2D staging texture failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
+                return False
+
+            return True
+        except Exception as ex:
+            print(f"[DXGI-Init] Exception during init: {ex}", flush=True)
             return False
         finally:
             _release_com_ptr(p_output1)
@@ -386,9 +407,7 @@ class WindowsDXGIGrabber:
                 c_uint,
                 POINTER(D3D11_MAPPED_SUBRESOURCE),
             )(ctx_vtbl[14])
-            unmap_func = WINFUNCTYPE(None, c_void_p, c_void_p, c_uint)(
-                ctx_vtbl[15]
-            )
+            unmap_func = WINFUNCTYPE(None, c_void_p, c_uint)(ctx_vtbl[15])
 
             mapped = D3D11_MAPPED_SUBRESOURCE()
             hr = map_func(self.p_context, self.p_staging_tex, 0, 1, 0, byref(mapped))
@@ -413,13 +432,17 @@ class WindowsDXGIGrabber:
                     (self.height, self.width, 4)
                 ).copy()
 
-            unmap_func(self.p_context, self.p_staging_tex, 0)
+            unmap_func(self.p_context, 0)
             release_frame_func(self.p_duplication)
+
+            if not self.first_frame_logged:
+                print(f"[DXGI-Perf] First hardware GPU frame captured successfully ({self.width}x{self.height})", flush=True)
+                self.first_frame_logged = True
 
             self.last_frame = frame_bgra
             return frame_bgra
 
-        except Exception:
+        except Exception as ex:
             _release_com_ptr(p_desktop_tex)
             _release_com_ptr(p_resource)
             return self.last_frame

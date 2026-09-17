@@ -12,6 +12,7 @@ cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WireP
 toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, Windows DWM capture exclusion,
 multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown,
 and z-order guarded topmost dropdown popups that always render in front of the GUI on Windows 11.
+Includes full verbose terminal diagnostics.
 """
 
 import ctypes
@@ -413,7 +414,7 @@ class TopmostComboBox(QComboBox):
                         0,
                         0,
                         0,
-                        0x0001 | 0x0002 | 0x0040,  # SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
+                        0x0001 | 0x0002 | 0x0040,
                     )
                     ctypes.windll.user32.BringWindowToTop(hwnd)
                     exclude_from_capture(hwnd)
@@ -490,6 +491,7 @@ class FloatingSenderWindow(QWidget):
         self.discovery_thread = DiscoveryListenerThread()
         self.discovery_thread.device_found.connect(self.on_device_discovered)
         self.discovery_thread.start()
+        print("[Sender-Main] UDP discovery listener active on port 9991.", flush=True)
 
     def _schedule_history_save(self):
         self._save_debounce_timer.start()
@@ -1695,6 +1697,7 @@ class FloatingSenderWindow(QWidget):
     def on_device_discovered(self, ip: str, pin_required: bool):
         self.discovered_ip = ip
         self.pin_required = pin_required
+        print(f"[Discovery] Detected beacon from TV at {ip} (PIN required: {pin_required})", flush=True)
 
         if not self.device_combo.currentText().strip():
             self.device_combo.setEditText(ip)
@@ -1705,6 +1708,7 @@ class FloatingSenderWindow(QWidget):
             and (not self.stream_thread or not self.stream_thread.isRunning())
         ):
             if not pin_required or len(self.pin_input.text().strip()) == 4:
+                print(f"[Discovery] Auto-connecting to {ip}...", flush=True)
                 self.start_sharing()
 
     def on_pin_text_changed(self, text: str):
@@ -1727,6 +1731,7 @@ class FloatingSenderWindow(QWidget):
     def start_sharing(self):
         target_ip = self.get_selected_target_ip() or self.discovered_ip
         if not target_ip:
+            print("[Sender-Main] Cannot start: No target IP specified.", flush=True)
             return
 
         fps_map = {0: 60, 1: 30, 2: 120, 3: 15}
@@ -1735,6 +1740,7 @@ class FloatingSenderWindow(QWidget):
 
         target_quality, use_444, native_res = self._get_quality_settings()
 
+        print(f"\n[Sender-Main] Launching screen share session to {target_ip} ({chosen_fps} FPS, Q={target_quality})...", flush=True)
         self.connect_btn.setText("Stop")
         self.connect_btn.setStyleSheet("background-color: #d83b01;")
         self.pause_btn.setEnabled(True)
@@ -1759,6 +1765,7 @@ class FloatingSenderWindow(QWidget):
         self.ensure_control_channel(target_ip)
 
     def stop_sharing(self):
+        print("\n[Sender-Main] Stopping screen share session...", flush=True)
         if self.stream_thread:
             self.stream_thread.stop()
             self.stream_thread = None
@@ -1791,6 +1798,7 @@ class FloatingSenderWindow(QWidget):
         self.stream_mute_btn.setEnabled(False)
 
         self._update_status_color("#8f9bb3")
+        print("[Sender-Main] Session stopped.", flush=True)
 
     def toggle_pause(self):
         if self.stream_thread:
@@ -1804,6 +1812,7 @@ class FloatingSenderWindow(QWidget):
                 )
                 self._update_status_color("#f37021")
                 self.fps_badge.setVisible(False)
+                print("[Sender-Main] Stream paused.", flush=True)
             else:
                 self.is_paused = False
                 self.stream_thread.resume_stream()
@@ -1813,6 +1822,7 @@ class FloatingSenderWindow(QWidget):
                     "background-color: #0078d4; color: white; font-weight: bold;"
                 )
                 self._update_status_color("#00d084")
+                print("[Sender-Main] Stream resumed.", flush=True)
             self._update_audio_pause_state()
 
     def toggle_stream_mute(self):
@@ -1826,12 +1836,14 @@ class FloatingSenderWindow(QWidget):
                 self.stream_mute_btn.setStyleSheet(
                     "background-color: #d83b01; color: white; font-weight: bold;"
                 )
+                print("[Sender-Main] TV Audio stream muted.", flush=True)
             else:
                 self.stream_mute_btn.setText("TV Audio")
                 self.stream_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_ON, 14, "#ffffff"))
                 self.stream_mute_btn.setStyleSheet(
                     "background-color: #0078d4; color: white; font-weight: bold;"
                 )
+                print("[Sender-Main] TV Audio stream unmuted.", flush=True)
 
     def on_stream_status(self, text: str, active: bool):
         if active:

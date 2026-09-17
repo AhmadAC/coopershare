@@ -1,6 +1,8 @@
+#################### START OF FILE: sender.py ####################
+
 """
 MrCoopersScreenShare - Sender (PC Presenter & Remote Controller)
-Main executable launcher and bootstrap script.
+Main executable launcher and bootstrap script with startup telemetry and high-resolution timer support.
 """
 
 import ctypes
@@ -15,6 +17,19 @@ if sys.platform.startswith("linux"):
     os.environ["XMODIFIERS"] = "@im=ibus"
     if "QT_QPA_PLATFORM" not in os.environ:
         os.environ["QT_QPA_PLATFORM"] = "wayland;xcb"
+
+# Enable Windows 1ms high-precision scheduling for the entire process lifetime
+if sys.platform == "win32":
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
+print("=" * 70, flush=True)
+print(f"[Sender-Bootstrap] MrCoopersScreenShare Sender Starting...", flush=True)
+print(f"[Sender-Bootstrap] Python: {sys.version.split()[0]} ({sys.executable})", flush=True)
+print(f"[Sender-Bootstrap] Platform: {sys.platform}", flush=True)
+print("=" * 70, flush=True)
 
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
@@ -38,7 +53,7 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP") != "
         except SystemExit:
             raise
         except Exception as _ex:
-            print(f"[BOOTSTRAP ERROR] Failed to run external sender.py: {_ex}")
+            print(f"[BOOTSTRAP ERROR] Failed to run external sender.py: {_ex}", flush=True)
 
 from ui_main import FloatingSenderWindow
 from utils import (
@@ -71,4 +86,14 @@ if __name__ == "__main__":
     win = FloatingSenderWindow()
     win.show()
     win.move(80, 80)
-    sys.exit(app.exec())
+    print("[Sender-Bootstrap] GUI initialized and ready. Waiting for connection...", flush=True)
+
+    exit_code = app.exec()
+
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.winmm.timeEndPeriod(1)
+        except Exception:
+            pass
+
+    sys.exit(exit_code)
