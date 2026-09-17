@@ -2,10 +2,10 @@ name: Build MrCoopersScreenShare Executables
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "realbad", "master" ]
     tags: [ "v*" ]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [ "realbad", "master" ]
   workflow_dispatch:
 
 jobs:
