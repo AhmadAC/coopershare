@@ -1,18 +1,15 @@
-#################### START OF FILE: ui_main.py ####################
-
 # ui_main.py
 
 """
 Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
-Features persistent state loading and debounced saving to history.json (Quality preset, FPS, Volume, Opacity, PIN, etc.),
-with computer-specific dynamic color shades applied exclusively to the target computer dropdown box
-(Steam, CS, and distinct hashed shades for any other device/IP),
+Features persistent state loading and debounced saving to history.json,
+industry-standard real-time streaming presets (ABR frame budgeting for 60 FPS),
+with computer-specific dynamic color shades applied exclusively to the target computer dropdown box,
 vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
 cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WirePlumber),
 toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, Windows DWM capture exclusion,
 multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown,
 and z-order guarded topmost dropdown popups that always render in front of the GUI on Windows 11.
-Includes full verbose terminal diagnostics.
 """
 
 import ctypes
@@ -74,9 +71,6 @@ from utils import (
     svg_to_pixmap,
 )
 
-# ---------------------------------------------------------------------------
-# Distinct Computer Color Shade Palettes (Exclusively for Target Dropdown)
-# ---------------------------------------------------------------------------
 DEVICE_COLOR_PALETTES = [
     {  # 0: Steam - Cyan / Deep Oceanic Slate
         "accent": "#00b4d8",
@@ -147,13 +141,11 @@ def get_device_theme(device_identifier: str) -> dict:
     if not raw:
         return DEVICE_COLOR_PALETTES[0]
 
-    # Explicit computer name keywords
     if "steam" in raw:
         return DEVICE_COLOR_PALETTES[0]
     if "cs" in raw:
         return DEVICE_COLOR_PALETTES[1]
 
-    # Deterministic hash to distribute any other computer name or IP across distinct shades
     h = 0
     for ch in raw:
         h = (h * 31 + ord(ch)) & 0xFFFFFFFF
@@ -243,8 +235,6 @@ class TimerDialog(QDialog):
 
 
 class EditTvDialog(QDialog):
-    """Dialog allowing users to set a friendly TV name and assign one or more IP addresses."""
-
     def __init__(self, tv_name: str, ips: list[str], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configure TV & Friendly Name")
@@ -632,7 +622,6 @@ class FloatingSenderWindow(QWidget):
         super().changeEvent(event)
 
     def _update_device_combo_style(self, device_text: Optional[str] = None):
-        """Applies distinct computer color shades strictly to the target dropdown box."""
         if not hasattr(self, "device_combo"):
             return
         if device_text is None:
@@ -709,7 +698,6 @@ class FloatingSenderWindow(QWidget):
         )
 
     def _update_card_style(self):
-        """Preserves the clean default application theme across all standard windows & widgets."""
         if not hasattr(self, "card"):
             return
         alpha = self.current_opacity if not self.is_mini_mode else 1.0
@@ -861,10 +849,10 @@ class FloatingSenderWindow(QWidget):
         ip_row.addWidget(self.connect_btn)
         self.card_layout.addLayout(ip_row)
 
-        # Row 2: Live-Adjustable FPS & Ultra-Quality Preset Selector
+        # Row 2: Real-time Low-Latency Streaming Presets (Industry Standard)
         qual_row = QHBoxLayout()
         self.fps_combo = TopmostComboBox()
-        self.fps_combo.addItems(["60 FPS", "30 FPS", "120 FPS", "15 FPS"])
+        self.fps_combo.addItems(["60 FPS (Ultra Smooth)", "30 FPS (Standard)", "120 FPS", "15 FPS"])
         saved_fps = self.history_data.get("fps_preset", "")
         if saved_fps:
             matched_f = -1
@@ -881,12 +869,11 @@ class FloatingSenderWindow(QWidget):
         self.quality_combo = TopmostComboBox()
         self.quality_combo.addItems(
             [
-                "Ultra Crisp (60 FPS, 89%)",
-                "Pixel-Perfect 1:1 (95% 4:4:4)",
-                "Maximum Detail (98% 4:4:4)",
-                "High Quality (82%)",
-                "Balanced (72%)",
-                "Studio 4:4:4 (88%)",
+                "Ultra Smooth (60 FPS Fast)",
+                "Balanced HD (72%)",
+                "High Quality HD (82%)",
+                "Studio Crisp (88% 4:4:4)",
+                "Pixel-Perfect 1:1 (95%)",
             ]
         )
         saved_quality = self.history_data.get("quality_preset", "")
@@ -894,13 +881,7 @@ class FloatingSenderWindow(QWidget):
             matched_q = -1
             for i in range(self.quality_combo.count()):
                 txt = self.quality_combo.itemText(i)
-                if "98%" in str(saved_quality) and "98%" in txt:
-                    matched_q = i
-                    break
-                elif "pixel-perfect" in str(saved_quality).lower() and "pixel-perfect" in txt.lower():
-                    matched_q = i
-                    break
-                elif "ultra" in str(saved_quality).lower() and "ultra" in txt.lower():
+                if "95%" in str(saved_quality) and "95%" in txt:
                     matched_q = i
                     break
                 elif "studio" in str(saved_quality).lower() and "studio" in txt.lower():
@@ -910,6 +891,9 @@ class FloatingSenderWindow(QWidget):
                     matched_q = i
                     break
                 elif "balanced" in str(saved_quality).lower() and "balanced" in txt.lower():
+                    matched_q = i
+                    break
+                elif "ultra" in str(saved_quality).lower() and "ultra" in txt.lower():
                     matched_q = i
                     break
             self.quality_combo.setCurrentIndex(matched_q if matched_q != -1 else 0)
@@ -1643,20 +1627,16 @@ class FloatingSenderWindow(QWidget):
         if index is None:
             index = self.quality_combo.currentIndex()
         text = self.quality_combo.itemText(index).lower()
-        if "98%" in text:
-            return 98, True, True
-        elif "pixel-perfect" in text or "95%" in text:
+        if "pixel-perfect" in text or "95%" in text:
             return 95, True, True
-        elif "ultra" in text or "89%" in text or "92%" in text:
-            return 89, False, False
+        elif "studio" in text or "4:4:4" in text:
+            return 88, True, True
         elif "high" in text or "82%" in text:
             return 82, False, False
         elif "balanced" in text or "72%" in text:
             return 72, False, False
-        elif "studio" in text or "4:4:4" in text:
-            return 88, True, True
         else:
-            return 89, False, False
+            return 68, False, False
 
     def on_quality_changed(self, index: int):
         target_quality, use_444, native_res = self._get_quality_settings(index)

@@ -4,10 +4,10 @@
         "172.31.60.175": "STEAM 408",
         "192.168.90.221": "317 CS"
     },
-    "quality_preset": "Studio 4:4:4 (88%)",
+    "quality_preset": "Balanced HD (72%)",
     "touch_input": false,
     "tv_volume": 10,
     "allow_audio_when_paused": false,
     "opacity": 93,
-    "fps_preset": "30 FPS"
+    "fps_preset": "30 FPS (Standard)"
 }
