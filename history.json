@@ -9,5 +9,5 @@
     "tv_volume": 10,
     "allow_audio_when_paused": false,
     "opacity": 93,
-    "fps_preset": "60 FPS"
+    "fps_preset": "30 FPS"
 }

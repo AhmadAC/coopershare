@@ -429,7 +429,7 @@ class ScreenSenderThread(QThread):
         self,
         target_ip: str,
         pin: str = "",
-        quality: int = 80,
+        quality: int = 70,
         fps_limit: int = 60,
         use_444_chroma: bool = False,
         native_resolution: bool = False,
@@ -484,7 +484,7 @@ class ScreenSenderThread(QThread):
     def _encoder_worker(self, worker_id: int):
         while self.pipeline_running:
             try:
-                item = self.raw_queue.get(timeout=0.02)
+                item = self.raw_queue.get(timeout=0.015)
             except queue.Empty:
                 continue
 
@@ -494,11 +494,11 @@ class ScreenSenderThread(QThread):
             # Dynamic Bandwidth Budgeting: automatically clamp quality based on real network send time
             eff_quality = self.quality
             if self._last_net_duration > 35.0:
-                eff_quality = min(eff_quality, 50)
-            elif self._last_net_duration > 20.0:
-                eff_quality = min(eff_quality, 65)
-            elif self._last_net_duration > 10.0:
-                eff_quality = min(eff_quality, 75)
+                eff_quality = min(eff_quality, 45)
+            elif self._last_net_duration > 18.0:
+                eff_quality = min(eff_quality, 58)
+            elif self._last_net_duration > 8.0:
+                eff_quality = min(eff_quality, 68)
 
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), eff_quality]
 
@@ -512,18 +512,17 @@ class ScreenSenderThread(QThread):
             else:
                 frame_bgr = frame_raw
 
-            # Bandwidth Optimization: Scale frame down slightly when network latency rises
             h, w = frame_bgr.shape[:2]
             if not self.native_resolution:
-                if self._last_net_duration > 30.0 and w > 1280:
-                    scale = 1280.0 / w
-                    frame_bgr = cv2.resize(
-                        frame_bgr, (1280, int(round(h * scale))), interpolation=cv2.INTER_LINEAR
-                    )
-                elif self._last_net_duration > 50.0 and w > 960:
+                if self._last_net_duration > 40.0 and w > 960:
                     scale = 960.0 / w
                     frame_bgr = cv2.resize(
                         frame_bgr, (960, int(round(h * scale))), interpolation=cv2.INTER_LINEAR
+                    )
+                elif (self._last_net_duration > 15.0 or self.quality < 85) and w > 1280:
+                    scale = 1280.0 / w
+                    frame_bgr = cv2.resize(
+                        frame_bgr, (1280, int(round(h * scale))), interpolation=cv2.INTER_LINEAR
                     )
 
             success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
@@ -548,7 +547,6 @@ class ScreenSenderThread(QThread):
         last_report_time = time.perf_counter()
 
         while self.pipeline_running:
-            # Drop older frames if network fell behind so latency stays sub-frame
             while self.send_queue.qsize() > 1:
                 try:
                     self.send_queue.get_nowait()
@@ -556,7 +554,7 @@ class ScreenSenderThread(QThread):
                     break
 
             try:
-                data, t_cap_ms, t_enc_ms = self.send_queue.get(timeout=0.02)
+                data, t_cap_ms, t_enc_ms = self.send_queue.get(timeout=0.015)
             except queue.Empty:
                 continue
 
@@ -722,6 +720,86 @@ class ScreenSenderThread(QThread):
             self.next_send_id = 0
             self.encoded_stash.clear()
 
+            # Dedicated Double-Buffered Capture Worker
+            capture_queue = queue.Queue(maxsize=1)
+            capture_running = [True]
+
+            def capture_loop():
+                while self.running and self.pipeline_running and capture_running[0]:
+                    if self.paused:
+                        time.sleep(0.03)
+                        continue
+
+                    t_c_start = time.perf_counter()
+                    f_raw = None
+                    try:
+                        if use_dxgi and dxgi_grabber:
+                            f_raw = dxgi_grabber.grab()
+                            if f_raw is not None:
+                                render_cursor_on_frame(
+                                    f_raw,
+                                    monitor_left=dxgi_grabber.mon_left,
+                                    monitor_top=dxgi_grabber.mon_top,
+                                    scale_factor=screen_dpr,
+                                )
+                        elif use_kwin:
+                            use_native_res = bool(self.native_resolution and self.quality >= 95)
+                            f_raw = kwin_grabber.grab(
+                                include_cursor=True,
+                                native_resolution=use_native_res,
+                            )
+                        elif use_spectacle and spectacle_grabber:
+                            f_raw = spectacle_grabber.grab()
+                            if f_raw is not None:
+                                render_cursor_on_frame(
+                                    f_raw,
+                                    monitor_left=mon_left,
+                                    monitor_top=mon_top,
+                                    scale_factor=screen_dpr,
+                                )
+                        elif use_fast_gdi and fast_gdi_grabber:
+                            f_raw = fast_gdi_grabber.grab()
+                            if f_raw is not None:
+                                render_cursor_on_frame(
+                                    f_raw,
+                                    monitor_left=mon_left,
+                                    monitor_top=mon_top,
+                                    scale_factor=screen_dpr,
+                                )
+                        else:
+                            raw_frame = sct.grab(monitor)
+                            raw_4ch = np.frombuffer(raw_frame.raw, dtype=np.uint8).reshape((mon_h, mon_w, 4))
+                            f_raw = cv2.cvtColor(raw_4ch, cv2.COLOR_BGRA2BGR)
+                            if f_raw is not None:
+                                render_cursor_on_frame(
+                                    f_raw,
+                                    monitor_left=mon_left,
+                                    monitor_top=mon_top,
+                                    scale_factor=screen_dpr,
+                                )
+                    except Exception:
+                        pass
+
+                    t_c_end = time.perf_counter()
+                    c_ms = (t_c_end - t_c_start) * 1000.0
+
+                    if f_raw is not None:
+                        if capture_queue.full():
+                            try:
+                                capture_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                        capture_queue.put_nowait((f_raw, c_ms))
+
+                    t_target = 1.0 / max(1, self.fps_limit)
+                    elapsed = time.perf_counter() - t_c_start
+                    to_sleep = t_target - elapsed
+                    if to_sleep > 0.002:
+                        time.sleep(to_sleep - 0.001)
+
+            cap_worker = threading.Thread(target=capture_loop, name="CaptureWorker", daemon=True)
+            cap_worker.start()
+
             enc_worker_1 = threading.Thread(
                 target=self._encoder_worker, args=(1,), name="EncoderWorker-1", daemon=True
             )
@@ -784,92 +862,32 @@ class ScreenSenderThread(QThread):
                 t_frame_start = time.perf_counter()
 
                 try:
-                    t_cap_start = time.perf_counter()
-
-                    if use_dxgi and dxgi_grabber:
-                        frame_raw = dxgi_grabber.grab()
-                        if frame_raw is not None:
-                            render_cursor_on_frame(
-                                frame_raw,
-                                monitor_left=dxgi_grabber.mon_left,
-                                monitor_top=dxgi_grabber.mon_top,
-                                scale_factor=screen_dpr,
-                            )
-                    elif use_kwin:
-                        use_native_res = bool(self.native_resolution and self.quality >= 95)
-                        frame_raw = kwin_grabber.grab(
-                            include_cursor=True,
-                            native_resolution=use_native_res,
-                        )
-                    elif use_spectacle and spectacle_grabber:
-                        frame_raw = spectacle_grabber.grab()
-                        if frame_raw is not None:
-                            render_cursor_on_frame(
-                                frame_raw,
-                                monitor_left=mon_left,
-                                monitor_top=mon_top,
-                                scale_factor=screen_dpr,
-                            )
-                    elif use_fast_gdi and fast_gdi_grabber:
-                        frame_raw = fast_gdi_grabber.grab()
-                        if frame_raw is not None:
-                            render_cursor_on_frame(
-                                frame_raw,
-                                monitor_left=mon_left,
-                                monitor_top=mon_top,
-                                scale_factor=screen_dpr,
-                            )
-                    else:
-                        raw_frame = sct.grab(monitor)
-                        raw_4ch = np.frombuffer(raw_frame.raw, dtype=np.uint8).reshape((mon_h, mon_w, 4))
-                        frame_raw = cv2.cvtColor(raw_4ch, cv2.COLOR_BGRA2BGR)
-                        if frame_raw is not None:
-                            render_cursor_on_frame(
-                                frame_raw,
-                                monitor_left=mon_left,
-                                monitor_top=mon_top,
-                                scale_factor=screen_dpr,
-                            )
-
-                    t_cap_end = time.perf_counter()
-                    cap_ms = (t_cap_end - t_cap_start) * 1000.0
-
-                    if frame_raw is None:
-                        time.sleep(0.001)
-                        continue
-
-                    # Discard stale frame in queue to avoid lag buildup
-                    if self.raw_queue.full():
-                        try:
-                            self.raw_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-
-                    self.raw_queue.put_nowait((frame_counter, frame_raw, cap_ms))
-                    frame_counter += 1
-
-                except (socket.error, BrokenPipeError, ConnectionResetError):
-                    break
-                except subprocess.TimeoutExpired:
-                    time.sleep(0.001)
+                    frame_raw, cap_ms = capture_queue.get(timeout=0.04)
+                except queue.Empty:
                     continue
-                except Exception:
-                    time.sleep(0.001)
-                    continue
+
+                if self.raw_queue.full():
+                    try:
+                        self.raw_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+
+                self.raw_queue.put_nowait((frame_counter, frame_raw, cap_ms))
+                frame_counter += 1
 
                 frame_elapsed = time.perf_counter() - t_frame_start
                 target_frame_time = 1.0 / max(1, self.fps_limit)
                 sleep_sec = target_frame_time - frame_elapsed
 
                 if sleep_sec > 0.002:
-                    time.sleep(sleep_sec - 0.0015)
-                while time.perf_counter() - t_frame_start < target_frame_time:
-                    pass
+                    time.sleep(sleep_sec - 0.001)
 
+        capture_running[0] = False
         self.pipeline_running = False
-        enc_worker_1.join(timeout=0.4)
-        enc_worker_2.join(timeout=0.4)
-        net_worker.join(timeout=0.4)
+        cap_worker.join(timeout=0.3)
+        enc_worker_1.join(timeout=0.3)
+        enc_worker_2.join(timeout=0.3)
+        net_worker.join(timeout=0.3)
 
         if dxgi_grabber:
             dxgi_grabber.close()
