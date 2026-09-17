@@ -1,5 +1,3 @@
-#################### START OF FILE: threads.py ####################
-
 # threads.py
 
 """
@@ -8,6 +6,7 @@ Features:
 - Windows DXGI Desktop Duplication hardware capture (sub-1ms VRAM reading)
 - High-speed persistent DIB Section GDI fallback grabber
 - Parallel dual-threaded SIMD JPEG encoders bypassing the CPU core bottleneck to achieve 60 FPS
+- Dynamic adaptive bitrate and dropped-frame eviction to guarantee zero network lag
 - Live verbose performance telemetry every second
 - Linux KWin ScreenShot2 kernel pipe capture & MSS fallback
 """
@@ -312,7 +311,7 @@ class KWinScreenShot2Grabber:
                 return None
 
             arr = np.frombuffer(raw_mv, dtype=np.uint8, count=total_expected_bytes).reshape((height, width, 4))
-            return arr
+            return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
 
         except Exception:
             if w_fd != -1:
@@ -446,12 +445,11 @@ class ScreenSenderThread(QThread):
         self.paused = False
         self._pause_requested = False
 
-        # Multithreaded Pipeline Queues
-        self.raw_queue = queue.Queue(maxsize=3)
+        self.raw_queue = queue.Queue(maxsize=2)
         self.encoded_stash = {}
         self.encoded_lock = threading.Lock()
         self.next_send_id = 0
-        self.send_queue = queue.Queue(maxsize=3)
+        self.send_queue = queue.Queue(maxsize=2)
         self.pipeline_running = False
 
         self._stats_lock = threading.Lock()
@@ -484,19 +482,23 @@ class ScreenSenderThread(QThread):
         self.pause_stream()
 
     def _encoder_worker(self, worker_id: int):
-        """Encodes frames in parallel across cores to bypass single-core CPU limitations."""
         while self.pipeline_running:
             try:
-                item = self.raw_queue.get(timeout=0.04)
+                item = self.raw_queue.get(timeout=0.03)
             except queue.Empty:
                 continue
 
             frame_id, frame_raw, t_cap_ms = item
 
             t_enc_start = time.perf_counter()
+
             eff_quality = self.quality
-            if self._last_net_duration > 22.0:
-                eff_quality = max(70, self.quality - 4)
+            if self._last_net_duration > 35.0:
+                eff_quality = max(45, self.quality - 24)
+            elif self._last_net_duration > 22.0:
+                eff_quality = max(55, self.quality - 14)
+            elif self._last_net_duration > 16.0:
+                eff_quality = max(65, self.quality - 6)
 
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), eff_quality]
 
@@ -505,15 +507,12 @@ class ScreenSenderThread(QThread):
                 sampling_444_val = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x00010001)
                 encode_params.extend([int(sampling_factor_id), int(sampling_444_val)])
 
-            try:
-                success, enc_img = cv2.imencode(".jpg", frame_raw, encode_params)
-            except Exception:
-                if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
-                    frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
-                else:
-                    frame_bgr = frame_raw
-                success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
+            if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
+                frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
+            else:
+                frame_bgr = frame_raw
 
+            success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
             t_enc_ms = (time.perf_counter() - t_enc_start) * 1000.0
 
             if success and enc_img is not None and self.pipeline_running:
@@ -535,8 +534,14 @@ class ScreenSenderThread(QThread):
         last_report_time = time.perf_counter()
 
         while self.pipeline_running:
+            while self.send_queue.qsize() > 1:
+                try:
+                    self.send_queue.get_nowait()
+                except queue.Empty:
+                    break
+
             try:
-                data, t_cap_ms, t_enc_ms = self.send_queue.get(timeout=0.04)
+                data, t_cap_ms, t_enc_ms = self.send_queue.get(timeout=0.03)
             except queue.Empty:
                 continue
 
@@ -599,7 +604,7 @@ class ScreenSenderThread(QThread):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
             except Exception:
                 pass
 
@@ -736,9 +741,10 @@ class ScreenSenderThread(QThread):
                             clean_frame = fast_gdi_grabber.grab()
                         else:
                             raw_f = sct.grab(monitor)
-                            clean_frame = np.frombuffer(
-                                raw_f.raw, dtype=np.uint8
-                            ).reshape((mon_h, mon_w, 4))
+                            clean_frame = cv2.cvtColor(
+                                np.frombuffer(raw_f.raw, dtype=np.uint8).reshape((mon_h, mon_w, 4)),
+                                cv2.COLOR_BGRA2BGR,
+                            )
                     except Exception:
                         clean_frame = None
 
@@ -800,9 +806,8 @@ class ScreenSenderThread(QThread):
                             )
                     else:
                         raw_frame = sct.grab(monitor)
-                        frame_raw = np.frombuffer(
-                            raw_frame.raw, dtype=np.uint8
-                        ).reshape((mon_h, mon_w, 4))
+                        raw_4ch = np.frombuffer(raw_frame.raw, dtype=np.uint8).reshape((mon_h, mon_w, 4))
+                        frame_raw = cv2.cvtColor(raw_4ch, cv2.COLOR_BGRA2BGR)
                         if frame_raw is not None:
                             render_cursor_on_frame(
                                 frame_raw,
@@ -870,7 +875,7 @@ class ScreenSenderThread(QThread):
             except Exception:
                 pass
 
-        print(f"[Sender] Stream session finished.", flush=True)
+        print("[Sender] Stream session finished.", flush=True)
         self.status_changed.emit("Disconnected", False)
 
     def stop(self):
@@ -1188,3 +1193,4 @@ class ReverseScreenReceiverThread(QThread):
     def stop(self):
         self.running = False
         self.wait(1000)
+

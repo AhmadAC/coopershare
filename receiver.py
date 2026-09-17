@@ -1,4 +1,4 @@
-#################### START OF FILE: receiver.py ####################
+# receiver.py
 
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
@@ -428,7 +428,7 @@ DISCOVERY_PORT = 9991
 REVERSE_VIDEO_PORT = 9992
 DEFAULT_SAMPLE_RATE = 48000
 CHANNELS = 2
-SOCKET_BUFFER_SIZE = 4 * 1024 * 1024
+SOCKET_BUFFER_SIZE = 8 * 1024 * 1024
 
 
 def get_local_ip() -> str:
@@ -1108,10 +1108,15 @@ class VideoServerThread(QThread):
 
     def _handle_client(self, conn: socket.socket, client_ip: str):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_SIZE)
+        except Exception:
+            pass
+
         conn.settimeout(1.0)
         header_buf = bytearray(4)
         header_mv = memoryview(header_buf)
-        frame_buf = bytearray(2 * 1024 * 1024)
+        frame_buf = bytearray(4 * 1024 * 1024)
 
         while self.running:
             try:
@@ -1199,6 +1204,10 @@ class ReverseVideoServerThread(QThread):
 
     def _stream_to_viewer(self, conn: socket.socket):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_SIZE)
+        except Exception:
+            pass
         conn.settimeout(None)
 
         with create_mss_instance() as sct:
@@ -1569,8 +1578,9 @@ class TouchDisplayCanvas(QWidget):
         painter.fillRect(self.rect(), Qt.black)
 
         if self.current_frame and not self.current_frame.isNull():
-            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             target_rect = self._get_video_rect()
+            if target_rect.size() != self.current_frame.size():
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             painter.drawImage(target_rect, self.current_frame)
 
     def mousePressEvent(self, event):

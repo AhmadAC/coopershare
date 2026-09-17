@@ -12,7 +12,23 @@ Features:
 """
 
 import ctypes
-from ctypes import Structure, c_char, c_int, c_long, c_short, c_ubyte, c_uint, c_uint16, c_uint32, c_ulong, sizeof, union
+from ctypes import (
+    Structure,
+    Union,
+    byref,
+    c_char,
+    c_int,
+    c_long,
+    c_short,
+    c_ubyte,
+    c_uint,
+    c_uint16,
+    c_uint32,
+    c_ulong,
+    c_ushort,
+    c_void_p,
+    sizeof,
+)
 import os
 import struct
 import sys
@@ -182,7 +198,7 @@ class MOUSEINPUT(Structure):
         ("mouseData", c_ulong),
         ("dwFlags", c_ulong),
         ("time", c_ulong),
-        ("dwExtraInfo", ctypes.c_void_p),
+        ("dwExtraInfo", c_void_p),
     ]
 
 
@@ -192,7 +208,7 @@ class KEYBDINPUT(Structure):
         ("wScan", c_ushort),
         ("dwFlags", c_ulong),
         ("time", c_ulong),
-        ("dwExtraInfo", ctypes.c_void_p),
+        ("dwExtraInfo", c_void_p),
     ]
 
 
@@ -204,7 +220,7 @@ class HARDWAREINPUT(Structure):
     ]
 
 
-class _INPUT_UNION(ctypes.Union):
+class _INPUT_UNION(Union):
     _fields_ = [
         ("mi", MOUSEINPUT),
         ("ki", KEYBDINPUT),
@@ -346,7 +362,7 @@ class UniversalInputInjector:
                 elif ev_type == "scroll":
                     dy = event.get("dy", 0)
                     inp.u.mi.dwFlags = MOUSEEVENTF_WHEEL
-                    inp.u.mi.mouseData = 120 if dy > 0 else 0xFFFFFF88  # -120 signed
+                    inp.u.mi.mouseData = 120 if dy > 0 else 0xFFFFFF88
                     ctypes.windll.user32.SendInput(1, byref(inp), sizeof(INPUT))
 
                 elif ev_type in ("key_down", "key_up"):
