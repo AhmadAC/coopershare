@@ -1,5 +1,3 @@
-#################### START OF FILE: ui_viewer.py ####################
-
 # ui_viewer.py
 
 """
@@ -52,10 +50,10 @@ class RemoteReceiverCanvas(QWidget):
         r = self._get_video_rect()
         if r.width() <= 0 or r.height() <= 0:
             return None
-        nx = (pos.x() - r.x()) / r.width()
-        ny = (pos.y() - r.y()) / r.height()
-        nx = max(0.0, min(1.0, nx))
-        ny = max(0.0, min(1.0, ny))
+        raw_nx = (pos.x() - r.x()) / float(r.width())
+        raw_ny = (pos.y() - r.y()) / float(r.height())
+        nx = max(0.0, min(1.0, raw_nx))
+        ny = max(0.0, min(1.0, raw_ny))
         return (nx, ny)
 
     def paintEvent(self, event):

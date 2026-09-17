@@ -1,5 +1,3 @@
-#################### START OF FILE: threads.py ####################
-
 # threads.py
 
 """
@@ -542,8 +540,8 @@ class ScreenSenderThread(QThread):
             h, w = frame_raw.shape[:2]
             channels = frame_raw.shape[2] if frame_raw.ndim == 3 else 1
 
-            # When H.264 is disabled (MJPEG fallback), strictly scale 1440p/4K frames to prevent network buffer saturation
-            if not self.use_h264 or self._h264_init_attempted:
+            # When falling back to Turbo-JPEG, resize 1440p+ to avoid saturating network
+            if (not self.use_h264 or self._h264_init_attempted) and not self.native_resolution:
                 max_bound = 1280
                 if w > max_bound or h > max_bound:
                     scale = max_bound / float(max(w, h))
@@ -872,6 +870,8 @@ class ScreenSenderThread(QThread):
                                 monitor_left=dxgi_grabber.mon_left,
                                 monitor_top=dxgi_grabber.mon_top,
                                 scale_factor=screen_dpr,
+                                orig_screen_w=mon_w,
+                                orig_screen_h=mon_h,
                             )
 
                     if f_raw is None and use_fast_gdi and fast_gdi_grabber:
@@ -883,6 +883,8 @@ class ScreenSenderThread(QThread):
                                 monitor_left=mon_left,
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
+                                orig_screen_w=mon_w,
+                                orig_screen_h=mon_h,
                             )
                     elif f_raw is None and use_kwin and kwin_grabber:
                         use_native_res = bool(self.native_resolution and self.quality >= 95)
@@ -901,6 +903,8 @@ class ScreenSenderThread(QThread):
                                 monitor_left=mon_left,
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
+                                orig_screen_w=mon_w,
+                                orig_screen_h=mon_h,
                             )
                     elif f_raw is None and sct:
                         sct_frame = sct.grab(monitor)
@@ -912,6 +916,8 @@ class ScreenSenderThread(QThread):
                                 monitor_left=mon_left,
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
+                                orig_screen_w=mon_w,
+                                orig_screen_h=mon_h,
                             )
                 except Exception:
                     f_raw = None

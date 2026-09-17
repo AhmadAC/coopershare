@@ -1,5 +1,3 @@
-#################### START OF FILE: receiver.py ####################
-
 # receiver.py
 
 """
@@ -509,7 +507,7 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
     cy = gy - monitor_top
 
     h, w = bgr_image.shape[:2]
-    if 0 <= cx < w and 0 <= cy < h:
+    if -32 <= cx < (w + 32) and -32 <= cy < (h + 32):
         pts = np.array(
             [
                 [cx, cy],
@@ -661,8 +659,10 @@ class UniversalInputInjector:
         ny = event.get("y")
 
         if nx is not None and ny is not None:
-            px = self.mon_left + int(np.clip(nx, 0.0, 1.0) * (self.screen_w - 1))
-            py = self.mon_top + int(np.clip(ny, 0.0, 1.0) * (self.screen_h - 1))
+            clamped_nx = max(0.0, min(1.0, float(nx)))
+            clamped_ny = max(0.0, min(1.0, float(ny)))
+            px = self.mon_left + int(round(clamped_nx * (self.screen_w - 1)))
+            py = self.mon_top + int(round(clamped_ny * (self.screen_h - 1)))
         else:
             px, py = None, None
 
@@ -1592,11 +1592,14 @@ class TouchDisplayCanvas(QWidget):
 
     def _normalize_pos(self, pos: QPointF) -> Optional[tuple[float, float]]:
         r = self._get_video_rect()
-        if r.width() == 0 or r.height() == 0:
+        if r.width() <= 0 or r.height() <= 0:
             return None
-        nx = (pos.x() - r.x()) / r.width()
-        ny = (pos.y() - r.y()) / r.height()
-        return (nx, ny) if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0 else None
+        # Clamp coordinates to ensure edge dragging/releases work at 0.0 and 1.0 boundaries
+        raw_nx = (pos.x() - r.x()) / float(r.width())
+        raw_ny = (pos.y() - r.y()) / float(r.height())
+        nx = max(0.0, min(1.0, raw_nx))
+        ny = max(0.0, min(1.0, raw_ny))
+        return (nx, ny)
 
     def event(self, event: QEvent) -> bool:
         if event.type() in (

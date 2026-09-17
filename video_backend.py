@@ -1,5 +1,3 @@
-#################### START OF FILE: video_backend.py ####################
-
 # video_backend.py
 
 """
@@ -475,8 +473,7 @@ class WindowsDXGIGrabber:
             )(dup_vtbl[8])
             release_frame_func = WINFUNCTYPE(HRESULT, c_void_p)(dup_vtbl[14])
 
-            # Use 250ms on first frame to guarantee desktop grab, 5ms on continuous streaming
-            timeout_ms = 250 if self.last_frame is None else 5
+            timeout_ms = 250 if self.last_frame is None else 6
             hr = acquire_func(self.p_duplication, timeout_ms, byref(frame_info), byref(p_resource))
             hr_uint = hr & 0xFFFFFFFF
 
@@ -503,17 +500,19 @@ class WindowsDXGIGrabber:
                 return self.last_frame
 
             ctx_vtbl = ctypes.cast(self.p_context, POINTER(POINTER(c_void_p))).contents
-            copy_resource = WINFUNCTYPE(None, c_void_p, c_void_p, c_void_p)(ctx_vtbl[30])
+            # Index 52 is ID3D11DeviceContext::CopyResource
+            copy_resource = WINFUNCTYPE(None, c_void_p, c_void_p, c_void_p)(ctx_vtbl[52])
             copy_resource(self.p_context, self.p_staging_tex, p_desktop_tex)
 
             _release_com_ptr(p_desktop_tex)
             _release_com_ptr(p_resource)
             release_frame_func(self.p_duplication)
 
+            # Index 14 is ID3D11DeviceContext::Map, Index 15 is Unmap
             map_func = WINFUNCTYPE(
                 HRESULT, c_void_p, c_void_p, c_uint, c_uint, c_uint, POINTER(D3D11_MAPPED_SUBRESOURCE)
-            )(ctx_vtbl[13])
-            unmap_func = WINFUNCTYPE(None, c_void_p, c_void_p, c_uint)(ctx_vtbl[14])
+            )(ctx_vtbl[14])
+            unmap_func = WINFUNCTYPE(None, c_void_p, c_void_p, c_uint)(ctx_vtbl[15])
 
             mapped = D3D11_MAPPED_SUBRESOURCE()
             hr = map_func(self.p_context, self.p_staging_tex, 0, 1, 0, byref(mapped))
@@ -535,7 +534,7 @@ class WindowsDXGIGrabber:
             unmap_func(self.p_context, self.p_staging_tex, 0)
 
             if not self.first_frame_logged:
-                print(f"[DXGI-Perf] First hardware GPU frame captured successfully ({self.width}x{self.height})", flush=True)
+                print(f"[DXGI-Perf] Hardware GPU frame captured successfully ({self.width}x{self.height})", flush=True)
                 self.first_frame_logged = True
 
             self.last_frame = frame_bgra
@@ -578,23 +577,15 @@ class BITMAPINFOHEADER(Structure):
 
 
 class WindowsFastGDIGrabber:
-    """Persistent Device Context & DIB Section Grabber with hardware-assisted scaling."""
+    """Persistent Device Context & DIB Section Grabber fallback with hardware-assisted blitting."""
 
     def __init__(self, mon_left: int = 0, mon_top: int = 0, width: int = 1920, height: int = 1080):
         self.mon_left = mon_left
         self.mon_top = mon_top
         self.src_w = max(1, width)
         self.src_h = max(1, height)
-
-        max_bound = 1280
-        if self.src_w > max_bound or self.src_h > max_bound:
-            scale = max_bound / float(max(self.src_w, self.src_h))
-            self.dst_w = (int(round(self.src_w * scale)) // 2) * 2
-            self.dst_h = (int(round(self.src_h * scale)) // 2) * 2
-        else:
-            self.dst_w = (self.src_w // 2) * 2
-            self.dst_h = (self.src_h // 2) * 2
-
+        self.dst_w = (self.src_w // 2) * 2
+        self.dst_h = (self.src_h // 2) * 2
         self.width = self.dst_w
         self.height = self.dst_h
 
@@ -620,7 +611,6 @@ class WindowsFastGDIGrabber:
             if not self.mem_dc:
                 return False
 
-            # COLORONCOLOR (3) runs in sub-millisecond hardware time without CPU halftone recalculation
             COLORONCOLOR = 3
             gdi32.SetStretchBltMode(self.mem_dc, COLORONCOLOR)
 
@@ -650,25 +640,9 @@ class WindowsFastGDIGrabber:
             gdi32 = ctypes.windll.gdi32
             SRCCOPY = 0x00CC0020
 
-            if self.src_w == self.dst_w and self.src_h == self.dst_h:
-                success = gdi32.BitBlt(
-                    self.mem_dc, 0, 0, self.dst_w, self.dst_h, self.src_dc, self.mon_left, self.mon_top, SRCCOPY
-                )
-            else:
-                success = gdi32.StretchBlt(
-                    self.mem_dc,
-                    0,
-                    0,
-                    self.dst_w,
-                    self.dst_h,
-                    self.src_dc,
-                    self.mon_left,
-                    self.mon_top,
-                    self.src_w,
-                    self.src_h,
-                    SRCCOPY,
-                )
-
+            success = gdi32.BitBlt(
+                self.mem_dc, 0, 0, self.dst_w, self.dst_h, self.src_dc, self.mon_left, self.mon_top, SRCCOPY
+            )
             if not success:
                 return None
 
@@ -716,26 +690,39 @@ def render_cursor_on_frame(
     monitor_left: int = 0,
     monitor_top: int = 0,
     scale_factor: float = 1.0,
+    orig_screen_w: int = 0,
+    orig_screen_h: int = 0,
 ):
+    """
+    Overlays the mouse cursor on the frame with edge persistence and proportional scaling.
+    Even when the cursor touches the far border or the frame is resized, the cursor remains drawn.
+    """
     gx, gy = get_system_cursor_position()
-
-    if scale_factor <= 0.0 or scale_factor == 1.0:
-        screen = QGuiApplication.primaryScreen()
-        if screen:
-            scale_factor = float(screen.devicePixelRatio())
-        else:
-            scale_factor = 1.0
-
-    if sys.platform == "win32":
-        cx = int(round(gx - monitor_left))
-        cy = int(round(gy - monitor_top))
-    else:
-        cx = int(round((gx - monitor_left) * scale_factor))
-        cy = int(round((gy - monitor_top) * scale_factor))
-
     h, w = bgr_image.shape[:2]
-    if 0 <= cx < w and 0 <= cy < h:
-        size_mult = max(1.0, scale_factor)
+
+    if orig_screen_w > 0 and orig_screen_h > 0:
+        scale_x = w / float(orig_screen_w)
+        scale_y = h / float(orig_screen_h)
+        cx = int(round((gx - monitor_left) * scale_x))
+        cy = int(round((gy - monitor_top) * scale_y))
+    else:
+        if scale_factor <= 0.0 or scale_factor == 1.0:
+            screen = QGuiApplication.primaryScreen()
+            scale_factor = float(screen.devicePixelRatio()) if screen else 1.0
+
+        if sys.platform == "win32":
+            cx = int(round(gx - monitor_left))
+            cy = int(round(gy - monitor_top))
+        else:
+            cx = int(round((gx - monitor_left) * scale_factor))
+            cy = int(round((gy - monitor_top) * scale_factor))
+
+    # Allow cursor to be rendered even when positioned directly on or partially past screen boundaries
+    if -32 <= cx < (w + 32) and -32 <= cy < (h + 32):
+        size_mult = max(1.0, scale_factor if sys.platform != "win32" else 1.0)
+        if orig_screen_w > 0 and w != orig_screen_w:
+            size_mult *= (w / float(orig_screen_w))
+
         base_pts = np.array(
             [
                 [0, 0],

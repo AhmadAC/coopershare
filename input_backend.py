@@ -1,5 +1,3 @@
-#################### START OF FILE: input_backend.py ####################
-
 # input_backend.py
 
 """
@@ -318,10 +316,12 @@ class UniversalInputInjector:
         ny = event.get("y")
 
         if nx is not None and ny is not None:
-            px = self.mon_left + int(np.clip(nx, 0.0, 1.0) * (self.screen_w - 1))
-            py = self.mon_top + int(np.clip(ny, 0.0, 1.0) * (self.screen_h - 1))
-            abs_x = int(np.clip(nx, 0.0, 1.0) * UINPUT_MAX_ABS)
-            abs_y = int(np.clip(ny, 0.0, 1.0) * UINPUT_MAX_ABS)
+            clamped_nx = max(0.0, min(1.0, float(nx)))
+            clamped_ny = max(0.0, min(1.0, float(ny)))
+            px = self.mon_left + int(round(clamped_nx * (self.screen_w - 1)))
+            py = self.mon_top + int(round(clamped_ny * (self.screen_h - 1)))
+            abs_x = int(round(clamped_nx * UINPUT_MAX_ABS))
+            abs_y = int(round(clamped_ny * UINPUT_MAX_ABS))
         else:
             px, py, abs_x, abs_y = None, None, None, None
 
