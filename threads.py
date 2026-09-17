@@ -1,8 +1,11 @@
+#################### START OF FILE: threads.py ####################
+
 # threads.py
 
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
-Supports native Windows WASAPI loopback, KDE Plasma 6 KWin D-Bus ScreenShot2 kernel pipe capture,
+Supports zero-dependency Windows DXGI Desktop Duplication hardware capture (60-120 FPS),
+native Windows WASAPI loopback, KDE Plasma 6 KWin D-Bus ScreenShot2 kernel pipe capture,
 pipelined asynchronous streaming, KDE Spectacle fallback, and MSS hardware capture.
 """
 
@@ -11,6 +14,7 @@ try:
 except (ImportError, ModuleNotFoundError):
     fcntl = None
 
+import ctypes
 import json
 import os
 import queue
@@ -46,7 +50,7 @@ from config import (
 )
 from input_backend import UniversalInputInjector
 from utils import create_mss_instance, ensure_kde_desktop_entry, recv_exact
-from video_backend import render_cursor_on_frame
+from video_backend import WindowsDXGIGrabber, render_cursor_on_frame
 
 if AUDIO_AVAILABLE:
     import sounddevice as sd
@@ -376,35 +380,6 @@ class SpectacleGrabber:
                 pass
 
 
-def probe_grim(grim_bin: str) -> tuple[bool, list[str]]:
-    """Probes grim for supported formats."""
-    try:
-        r = subprocess.run(
-            [grim_bin, "-t", "jpeg", "-q", "75", "-"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=0.8,
-        )
-        if r.returncode == 0 and len(r.stdout) > 100:
-            return True, ["-t", "jpeg"]
-    except Exception:
-        pass
-
-    try:
-        r = subprocess.run(
-            [grim_bin, "-t", "ppm", "-"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=0.8,
-        )
-        if r.returncode == 0 and len(r.stdout) > 100:
-            return True, ["-t", "ppm"]
-    except Exception:
-        pass
-
-    return False, []
-
-
 class DiscoveryListenerThread(QThread):
     device_found = Signal(str, bool)
 
@@ -472,9 +447,9 @@ class ScreenSenderThread(QThread):
         self.paused = False
         self._pause_requested = False
 
-        # 3-Stage Concurrent Pipeline Queues (Capture -> Encode -> Network Send)
-        self.raw_queue = queue.Queue(maxsize=1)
-        self.send_queue = queue.Queue(maxsize=1)
+        # 3-Stage Double-Buffered Pipeline Queues (Capture -> Encode -> Network Send)
+        self.raw_queue = queue.Queue(maxsize=2)
+        self.send_queue = queue.Queue(maxsize=2)
         self.pipeline_running = False
 
         self._stats_lock = threading.Lock()
@@ -502,14 +477,14 @@ class ScreenSenderThread(QThread):
         self.pause_stream()
 
     def _encoder_worker(self):
-        """Stage 2: High-speed concurrent worker for parallel SIMD JPEG encoding."""
+        """Stage 2: High-speed concurrent worker for parallel SIMD JPEG encoding directly from BGRA."""
         while self.pipeline_running:
             try:
                 item = self.raw_queue.get(timeout=0.04)
             except queue.Empty:
                 continue
 
-            frame_raw, t_cap_ms = item
+            frame_raw, _ = item
 
             eff_quality = self.quality
             if self._last_net_duration > 22.0:
@@ -574,6 +549,12 @@ class ScreenSenderThread(QThread):
                 last_report_time = now
 
     def run(self):
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.winmm.timeBeginPeriod(1)
+            except Exception:
+                pass
+
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -609,6 +590,11 @@ class ScreenSenderThread(QThread):
             self.status_changed.emit(f"Streaming ({self.fps_limit} FPS)", True)
         except Exception as e:
             self.status_changed.emit(f"Connect Error: {e}", False)
+            if sys.platform == "win32":
+                try:
+                    ctypes.windll.winmm.timeEndPeriod(1)
+                except Exception:
+                    pass
             return
 
         is_wayland = sys.platform.startswith("linux") and (
@@ -623,6 +609,15 @@ class ScreenSenderThread(QThread):
         if is_wayland and not use_kwin:
             spectacle_grabber = SpectacleGrabber()
             use_spectacle = spectacle_grabber.available
+
+        dxgi_grabber = None
+        use_dxgi = False
+        if sys.platform == "win32":
+            try:
+                dxgi_grabber = WindowsDXGIGrabber(output_index=0)
+                use_dxgi = dxgi_grabber.available
+            except Exception:
+                use_dxgi = False
 
         self.pipeline_running = True
         enc_worker = threading.Thread(
@@ -641,29 +636,32 @@ class ScreenSenderThread(QThread):
             monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             mon_left = monitor.get("left", 0)
             mon_top = monitor.get("top", 0)
+            mon_w = monitor.get("width", 1920)
+            mon_h = monitor.get("height", 1080)
 
             while self.running and self.pipeline_running:
-                # Pre-pause execution: hide cursor, grab clean frame, send it, then pause
                 if self._pause_requested:
                     use_native_res = bool(self.native_resolution and self.quality >= 95)
                     clean_frame = None
                     try:
-                        if use_kwin:
+                        if use_dxgi and dxgi_grabber:
+                            clean_frame = dxgi_grabber.grab()
+                        elif use_kwin:
                             clean_frame = kwin_grabber.grab(
                                 include_cursor=False,
                                 native_resolution=use_native_res,
                             )
                         elif use_spectacle and spectacle_grabber:
                             clean_frame = spectacle_grabber.grab()
-                        elif not is_wayland:
+                        else:
                             raw_f = sct.grab(monitor)
-                            img_f = np.array(raw_f)
-                            clean_frame = cv2.cvtColor(img_f, cv2.COLOR_BGRA2BGR)
+                            clean_frame = np.frombuffer(
+                                raw_f.raw, dtype=np.uint8
+                            ).reshape((mon_h, mon_w, 4))
                     except Exception:
                         clean_frame = None
 
                     if clean_frame is not None:
-                        # Flush stale queued frames so cursorless frame is delivered immediately
                         while not self.raw_queue.empty():
                             try:
                                 self.raw_queue.get_nowait()
@@ -691,7 +689,16 @@ class ScreenSenderThread(QThread):
                 try:
                     t_cap_start = time.perf_counter()
 
-                    if use_kwin:
+                    if use_dxgi and dxgi_grabber:
+                        frame_raw = dxgi_grabber.grab()
+                        if frame_raw is not None:
+                            render_cursor_on_frame(
+                                frame_raw,
+                                monitor_left=dxgi_grabber.mon_left,
+                                monitor_top=dxgi_grabber.mon_top,
+                                scale_factor=screen_dpr,
+                            )
+                    elif use_kwin:
                         use_native_res = bool(self.native_resolution and self.quality >= 95)
                         frame_raw = kwin_grabber.grab(
                             include_cursor=True,
@@ -706,10 +713,12 @@ class ScreenSenderThread(QThread):
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
                             )
-                    elif not is_wayland:
+                    else:
+                        # Zero-copy buffer creation directly into 4-channel BGRA array
                         raw_frame = sct.grab(monitor)
-                        img = np.array(raw_frame)
-                        frame_raw = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                        frame_raw = np.frombuffer(
+                            raw_frame.raw, dtype=np.uint8
+                        ).reshape((mon_h, mon_w, 4))
                         if frame_raw is not None:
                             render_cursor_on_frame(
                                 frame_raw,
@@ -717,15 +726,12 @@ class ScreenSenderThread(QThread):
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
                             )
-                    else:
-                        frame_raw = None
 
                     t_cap_end = time.perf_counter()
                     cap_ms = (t_cap_end - t_cap_start) * 1000.0
 
                     if frame_raw is None:
-                        if is_wayland:
-                            time.sleep(0.002)
+                        time.sleep(0.001)
                         continue
 
                     if self.raw_queue.full():
@@ -739,22 +745,27 @@ class ScreenSenderThread(QThread):
                 except (socket.error, BrokenPipeError, ConnectionResetError):
                     break
                 except subprocess.TimeoutExpired:
-                    time.sleep(0.002)
+                    time.sleep(0.001)
                     continue
                 except Exception:
-                    time.sleep(0.002)
+                    time.sleep(0.001)
                     continue
 
                 frame_elapsed = time.perf_counter() - t_frame_start
                 target_frame_time = 1.0 / max(1, self.fps_limit)
                 sleep_sec = target_frame_time - frame_elapsed
-                if sleep_sec > 0.001:
-                    time.sleep(sleep_sec)
+
+                if sleep_sec > 0.002:
+                    time.sleep(sleep_sec - 0.0015)
+                while time.perf_counter() - t_frame_start < target_frame_time:
+                    pass
 
         self.pipeline_running = False
         enc_worker.join(timeout=0.4)
         net_worker.join(timeout=0.4)
 
+        if dxgi_grabber:
+            dxgi_grabber.close()
         if kwin_grabber:
             kwin_grabber.cleanup()
         if spectacle_grabber:
@@ -764,6 +775,12 @@ class ScreenSenderThread(QThread):
             sock.close()
         except Exception:
             pass
+
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
 
         self.status_changed.emit("Disconnected", False)
 

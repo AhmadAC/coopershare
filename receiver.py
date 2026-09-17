@@ -1,3 +1,5 @@
+#################### START OF FILE: receiver.py ####################
+
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
 Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSON History Memory,
@@ -8,6 +10,7 @@ Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSO
           Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput),
           UDP Discovery Beacon, 4-Digit PIN Authentication,
           Vector SVG Icons replacing emojis,
+          Zero-Copy High-FPS Hardware Frame Receiving & Direct QImage Surface Rendering,
           Hardware Multi-Touch QTouchEvent Processing,
           Native Win32 Taskbar & Window Icon Binding (WM_SETICON & Shell PE Resource Extraction).
 """
@@ -34,9 +37,13 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
-# ---------------------------------------------------------------------------
-# Storage Directory Resolution (Handles AppImage, Frozen Onedir, & Fallbacks)
-# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
+
 def get_storage_directory() -> str:
     appimage = os.environ.get("APPIMAGE")
     if appimage:
@@ -61,9 +68,6 @@ APP_DIR = get_storage_directory()
 LOG_FILE_PATH = os.path.join(APP_DIR, "mrcoopers_receiver.log")
 CONFIG_FILE_PATH = os.path.join(APP_DIR, "receiver_config.json")
 
-# ---------------------------------------------------------------------------
-# Onedir Dynamic Script Loader
-# ---------------------------------------------------------------------------
 if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP_REC") != "1":
     _app_dir = os.path.dirname(os.path.abspath(sys.executable))
     _external_script = os.path.join(_app_dir, "receiver.py")
@@ -141,10 +145,8 @@ if not logger.handlers:
 
 
 def find_icon_file() -> Optional[str]:
-    """Resolves path to icon.ico or icon.png across PyInstaller bundles, executable dirs, and storage."""
     candidates = []
 
-    # 1. PyInstaller extracted temporary directory (_MEIPASS)
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         candidates.extend([
@@ -152,7 +154,6 @@ def find_icon_file() -> Optional[str]:
             os.path.join(meipass, "icon.png"),
         ])
 
-    # 2. Directory containing the executable and PyInstaller 6+ _internal folder
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
         candidates.extend([
@@ -162,13 +163,11 @@ def find_icon_file() -> Optional[str]:
             os.path.join(exe_dir, "_internal", "icon.png"),
         ])
 
-    # 3. Application directory (APP_DIR)
     candidates.extend([
         os.path.join(APP_DIR, "icon.ico"),
         os.path.join(APP_DIR, "icon.png"),
     ])
 
-    # 4. Source script directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates.extend([
         os.path.join(script_dir, "icon.ico"),
@@ -182,14 +181,12 @@ def find_icon_file() -> Optional[str]:
 
 
 def create_application_icon() -> QIcon:
-    """Generates the crisp multi-resolution application icon or loads existing .ico/.png/PE executable."""
     icon_path = find_icon_file()
     if icon_path:
         icon = QIcon(icon_path)
         if not icon.isNull():
             return icon
 
-    # If running as a frozen Windows PE executable, extract embedded icon via Windows Shell
     if sys.platform == "win32" and getattr(sys, "frozen", False):
         try:
             provider = QFileIconProvider()
@@ -199,7 +196,6 @@ def create_application_icon() -> QIcon:
         except Exception:
             pass
 
-    # Programmatic multi-resolution icon generation (16, 24, 32, 48, 64, 128, 256)
     icon = QIcon()
     for size in (16, 24, 32, 48, 64, 128, 256):
         pix = QPixmap(size, size)
@@ -256,7 +252,6 @@ def create_application_icon() -> QIcon:
         painter.end()
         icon.addPixmap(pix)
 
-    # Persist generated assets to APP_DIR so native Win32 APIs can reference them
     try:
         ico_dest = os.path.join(APP_DIR, "icon.ico")
         png_dest = os.path.join(APP_DIR, "icon.png")
@@ -273,7 +268,6 @@ def create_application_icon() -> QIcon:
 
 
 def apply_win32_window_icon(hwnd: int):
-    """Binds native Win32 window and class icons (WM_SETICON / GCLP_HICON) for taskbar and Alt-Tab."""
     if sys.platform != "win32" or not hwnd:
         return
 
@@ -289,22 +283,20 @@ def apply_win32_window_icon(hwnd: int):
     h_icon_big = None
     h_icon_small = None
 
-    # 1. Attempt loading directly from resolved .ico file
     ico_path = find_icon_file()
     if ico_path and ico_path.lower().endswith(".ico") and os.path.isfile(ico_path):
         try:
             h_icon_big = ctypes.windll.user32.LoadImageW(
                 None, ico_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
             )
-            cx_sm = ctypes.windll.user32.GetSystemMetrics(49)  # SM_CXSMICON
-            cy_sm = ctypes.windll.user32.GetSystemMetrics(50)  # SM_CYSMICON
+            cx_sm = ctypes.windll.user32.GetSystemMetrics(49)
+            cy_sm = ctypes.windll.user32.GetSystemMetrics(50)
             h_icon_small = ctypes.windll.user32.LoadImageW(
                 None, ico_path, IMAGE_ICON, cx_sm, cy_sm, LR_LOADFROMFILE
             )
         except Exception:
             pass
 
-    # 2. If running frozen executable, extract PE icon resource directly
     if (not h_icon_big or not h_icon_small) and getattr(sys, "frozen", False):
         try:
             h_inst = ctypes.windll.kernel32.GetModuleHandleW(None)
@@ -317,7 +309,6 @@ def apply_win32_window_icon(hwnd: int):
         except Exception:
             pass
 
-    # 3. Bind Win32 message and class pointers
     if h_icon_big:
         try:
             ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, h_icon_big)
@@ -363,7 +354,6 @@ def svg_to_icon(svg_str: str, size: int = 16, color: Optional[str] = "#ffffff") 
     return QIcon(pix)
 
 
-# Clean Vector SVGs for Receiver
 REC_SVG_ROCKET = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="M12 15l-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/></svg>"""
 REC_SVG_TIMER = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>"""
 REC_SVG_INFO = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>"""
@@ -400,7 +390,6 @@ def save_receiver_config(config: dict):
         logger.error(f"Failed to save receiver_config.json: {e}")
 
 
-# Optional Sound Support
 try:
     import sounddevice as sd
 
@@ -409,7 +398,6 @@ except Exception as e:
     AUDIO_AVAILABLE = False
     logger.warning(f"sounddevice audio unavailable: {e}")
 
-# Universal Input Injection (evdev / pynput)
 USE_EVDEV = False
 if sys.platform.startswith("linux"):
     try:
@@ -440,7 +428,7 @@ DISCOVERY_PORT = 9991
 REVERSE_VIDEO_PORT = 9992
 DEFAULT_SAMPLE_RATE = 48000
 CHANNELS = 2
-SOCKET_BUFFER_SIZE = 2 * 1024 * 1024
+SOCKET_BUFFER_SIZE = 4 * 1024 * 1024
 
 
 def get_local_ip() -> str:
@@ -457,30 +445,33 @@ def get_local_ip() -> str:
         s.close()
 
 
-def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
-    buf = bytearray()
-    while len(buf) < count:
+def recv_exact_into(sock: socket.socket, buffer: memoryview, count: int) -> bool:
+    offset = 0
+    while offset < count:
         try:
-            chunk = sock.recv(count - len(buf))
-            if not chunk:
-                return None
-            buf.extend(chunk)
+            n = sock.recv_into(buffer[offset:], count - offset)
+            if n == 0:
+                return False
+            offset += n
         except (socket.timeout, BlockingIOError):
             continue
         except Exception:
-            return None
-    return bytes(buf)
+            return False
+    return True
+
+
+def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
+    buf = bytearray(count)
+    mv = memoryview(buf)
+    if recv_exact_into(sock, mv, count):
+        return bytes(buf)
+    return None
 
 
 def create_mss_instance():
     if hasattr(mss, "MSS"):
         return mss.MSS()
     return mss.mss()
-
-
-# ---------------------------------------------------------------------------
-# Mouse Cursor Overlay
-# ---------------------------------------------------------------------------
 
 
 class POINT(Structure):
@@ -504,7 +495,7 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
     cx = gx - monitor_left
     cy = gy - monitor_top
 
-    h, w, _ = bgr_image.shape
+    h, w = bgr_image.shape[:2]
     if 0 <= cx < w and 0 <= cy < h:
         pts = np.array(
             [
@@ -518,14 +509,14 @@ def render_cursor_on_frame(bgr_image: np.ndarray, monitor_left: int, monitor_top
             ],
             np.int32,
         )
-        cv2.polylines(bgr_image, [pts], isClosed=True, color=(0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
-        cv2.fillPoly(bgr_image, [pts], color=(255, 255, 255), lineType=cv2.LINE_AA)
-        cv2.polylines(bgr_image, [pts], isClosed=True, color=(20, 20, 20), thickness=1, lineType=cv2.LINE_AA)
+        is_4ch = bgr_image.ndim == 3 and bgr_image.shape[2] == 4
+        col_black = (0, 0, 0, 255) if is_4ch else (0, 0, 0)
+        col_white = (255, 255, 255, 255) if is_4ch else (255, 255, 255)
+        col_dark = (20, 20, 20, 255) if is_4ch else (20, 20, 20)
 
-
-# ---------------------------------------------------------------------------
-# Universal Input Injector (Direct Win32 API + evdev Wayland / pynput Fallback)
-# ---------------------------------------------------------------------------
+        cv2.polylines(bgr_image, [pts], isClosed=True, color=col_black, thickness=2, lineType=cv2.LINE_AA)
+        cv2.fillPoly(bgr_image, [pts], color=col_white, lineType=cv2.LINE_AA)
+        cv2.polylines(bgr_image, [pts], isClosed=True, color=col_dark, thickness=1, lineType=cv2.LINE_AA)
 
 
 class UniversalInputInjector:
@@ -757,7 +748,6 @@ class UniversalInputInjector:
             except Exception as ex:
                 logger.error(f"evdev input injection exception: {ex}")
 
-        # Linux / pynput Fallback
         if self.mouse:
             if px is not None and py is not None:
                 self.mouse.position = (px, py)
@@ -797,11 +787,6 @@ class UniversalInputInjector:
                 self.ui.close()
             except Exception:
                 pass
-
-
-# ---------------------------------------------------------------------------
-# Receiver Local Dialogs (With JSON History Memory)
-# ---------------------------------------------------------------------------
 
 
 class LocalRunScriptDialog(QDialog):
@@ -1006,13 +991,7 @@ class LocalTimerDialog(QDialog):
         layout.addLayout(btn_layout)
 
     def get_args(self) -> str:
-        val = self.timer_edit.text().strip().strip('"').strip("'")
-        return val
-
-
-# ---------------------------------------------------------------------------
-# Server & Communication Threads
-# ---------------------------------------------------------------------------
+        return self.timer_edit.text().strip().strip('"').strip("'")
 
 
 class DiscoveryBeaconThread(QThread):
@@ -1129,54 +1108,35 @@ class VideoServerThread(QThread):
 
     def _handle_client(self, conn: socket.socket, client_ip: str):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        conn.settimeout(0.5)
-        payload_size = struct.calcsize(">L")
-        data = bytearray()
+        conn.settimeout(1.0)
+        header_buf = bytearray(4)
+        header_mv = memoryview(header_buf)
+        frame_buf = bytearray(2 * 1024 * 1024)
 
         while self.running:
             try:
-                while len(data) < payload_size:
-                    if not self.running:
-                        break
-                    try:
-                        packet = conn.recv(131072)
-                        if not packet:
-                            raise ConnectionResetError
-                        data.extend(packet)
-                    except socket.timeout:
-                        continue
-
-                if not self.running:
+                if not recv_exact_into(conn, header_mv, 4):
                     break
 
-                msg_size = struct.unpack(">L", data[:payload_size])[0]
-                data = data[payload_size:]
-
-                while len(data) < msg_size:
-                    if not self.running:
-                        break
-                    try:
-                        packet = conn.recv(min(msg_size - len(data), 131072))
-                        if not packet:
-                            raise ConnectionResetError
-                        data.extend(packet)
-                    except socket.timeout:
-                        continue
-
-                if not self.running:
+                msg_size = struct.unpack(">L", header_buf)[0]
+                if msg_size <= 0 or msg_size > 32 * 1024 * 1024:
                     break
 
-                frame_data = data[:msg_size]
-                data = data[msg_size:]
+                if len(frame_buf) < msg_size:
+                    frame_buf = bytearray(msg_size + 131072)
 
-                np_arr = np.frombuffer(frame_data, np.uint8)
+                frame_mv = memoryview(frame_buf)[:msg_size]
+                if not recv_exact_into(conn, frame_mv, msg_size):
+                    break
+
+                np_arr = np.frombuffer(frame_mv, dtype=np.uint8)
                 img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if img is not None:
                     h, w, ch = img.shape
                     qimg = QImage(img.data, w, h, ch * w, QImage.Format_BGR888).copy()
                     self.frame_received.emit(qimg)
 
-            except ConnectionResetError:
+            except (ConnectionResetError, BrokenPipeError):
                 break
             except Exception as ex:
                 logger.error(f"Video client processing error from {client_ip}: {ex}")
@@ -1490,11 +1450,6 @@ class ControlServerThread(QThread):
         self.wait(1000)
 
 
-# ---------------------------------------------------------------------------
-# Canvas & Standby Widgets (Solid Edge Cleared & Zero White Margin Flicker)
-# ---------------------------------------------------------------------------
-
-
 class StandbyContainer(QWidget):
     """Standby Screen Container ensuring all right-click events trigger the context menu."""
 
@@ -1534,15 +1489,14 @@ class StandbyContainer(QWidget):
 
 class TouchDisplayCanvas(QWidget):
     """
-    High-DPI Canvas with full hardware support for Windows 11 multi-touch events
-    (QTouchEvent) and traditional mouse/trackpad events.
-    Guarantees solid edge bounds to eliminate white flickering at any resolution.
+    High-DPI Canvas with direct zero-copy QImage rendering, avoiding QPixmap CPU conversion bottlenecks.
+    Supports hardware multi-touch and mouse events with solid boundaries.
     """
 
     def __init__(self, control_server: Optional[ControlServerThread] = None, parent=None):
         super().__init__(parent)
         self.control_server = control_server
-        self.current_frame: Optional[QPixmap] = None
+        self.current_frame: Optional[QImage] = None
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WA_NoSystemBackground, True)
@@ -1551,19 +1505,19 @@ class TouchDisplayCanvas(QWidget):
         self.setStyleSheet("background-color: #000000;")
 
     def update_frame(self, qimage: QImage):
-        self.current_frame = QPixmap.fromImage(qimage)
+        self.current_frame = qimage
         self.update()
 
     def _get_video_rect(self) -> QRect:
         if not self.current_frame or self.current_frame.isNull():
             return self.rect()
-        pix_size = self.current_frame.size()
-        pix_size.scale(self.size(), Qt.KeepAspectRatio)
+        img_size = self.current_frame.size()
+        img_size.scale(self.size(), Qt.KeepAspectRatio)
         return QRect(
-            (self.width() - pix_size.width()) // 2,
-            (self.height() - pix_size.height()) // 2,
-            pix_size.width(),
-            pix_size.height(),
+            (self.width() - img_size.width()) // 2,
+            (self.height() - img_size.height()) // 2,
+            img_size.width(),
+            img_size.height(),
         )
 
     def _normalize_pos(self, pos: QPointF) -> Optional[tuple[float, float]]:
@@ -1617,7 +1571,7 @@ class TouchDisplayCanvas(QWidget):
         if self.current_frame and not self.current_frame.isNull():
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             target_rect = self._get_video_rect()
-            painter.drawPixmap(target_rect, self.current_frame)
+            painter.drawImage(target_rect, self.current_frame)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
@@ -1676,7 +1630,6 @@ class ReceiverMainWindow(QMainWindow):
         self.setWindowTitle("MrCoopersScreenShare - Receiver")
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
 
-        # Force black palette and opaque settings to eliminate DWM flash
         palette = self.palette()
         palette.setColor(QPalette.Window, Qt.black)
         palette.setColor(QPalette.Base, Qt.black)
@@ -1701,7 +1654,6 @@ class ReceiverMainWindow(QMainWindow):
             mon_l, mon_t = mon["left"], mon["top"]
         self.input_injector = UniversalInputInjector(mon_l, mon_t, scr_w, scr_h)
 
-        # Initialize network servers with safe callbacks
         self.control_thread = ControlServerThread()
         self.audio_thread = AudioServerThread()
         self.video_thread = VideoServerThread(self.get_pin, self.is_pin_required)
@@ -1736,12 +1688,10 @@ class ReceiverMainWindow(QMainWindow):
             try:
                 hwnd = int(self.winId())
 
-                # Set class background to pure black to eliminate white resize/erase flash
                 GCLP_HBRBACKGROUND = -10
                 black_brush = ctypes.windll.gdi32.CreateSolidBrush(0x00000000)
                 ctypes.windll.user32.SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, black_brush)
 
-                # Strip Windows title bars & standard borders while preserving WS_SYSMENU and WS_MINIMIZEBOX for taskbar icon
                 GWL_STYLE = -16
                 WS_CAPTION = 0x00C00000
                 WS_THICKFRAME = 0x00040000
@@ -1752,7 +1702,6 @@ class ReceiverMainWindow(QMainWindow):
                 if new_style != style:
                     ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
 
-                # Disable Windows 11 rounded corners and border outline
                 DWMWA_WINDOW_CORNER_PREFERENCE = 33
                 DWMWCP_DONOTROUND = c_int(1)
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -1771,12 +1720,10 @@ class ReceiverMainWindow(QMainWindow):
                     sizeof(color_none),
                 )
 
-                # Commit window frame style changes immediately
                 ctypes.windll.user32.SetWindowPos(
-                    hwnd, 0, 0, 0, 0, 0, 0x0020 | 0x0002 | 0x0001 | 0x0004
+                    hwnd, 0, 0, 0, 0, 0, 0x0020 | 0x0002 | 0x0001 | 0x0040
                 )
 
-                # Explicitly bind native Win32 window icon to ensure taskbar representation
                 apply_win32_window_icon(hwnd)
             except Exception as e:
                 logger.debug(f"Frameless enforcement notice: {e}")
@@ -2142,6 +2089,11 @@ class ReceiverMainWindow(QMainWindow):
         self.audio_thread.stop()
         self.control_thread.stop()
         self.input_injector.close()
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
         event.accept()
 
 
@@ -2156,7 +2108,6 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
 
-    # Force application-wide black background for any transient unpainted frames
     app_palette = app.palette()
     app_palette.setColor(QPalette.Window, Qt.black)
     app_palette.setColor(QPalette.Base, Qt.black)

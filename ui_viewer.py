@@ -1,16 +1,20 @@
+#################### START OF FILE: ui_viewer.py ####################
+
 # ui_viewer.py
 
 """
 Interactive Remote Receiver Viewer Canvas & Control Window.
 Captures and forwards left click, right click, middle click, mouse move, scroll,
-and keystrokes to the target receiver display. Includes native capture exclusion on Windows.
+and keystrokes to the target receiver display.
+Uses zero-copy direct QImage surface painting to achieve fluid 60 FPS remote screen viewing.
+Includes native capture exclusion on Windows.
 """
 
 import sys
 from typing import Optional
 
 from PySide6.QtCore import QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QMouseEvent, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QKeyEvent, QMouseEvent, QPainter
 from PySide6.QtWidgets import QMainWindow, QWidget
 
 from threads import ReverseScreenReceiverThread
@@ -23,25 +27,25 @@ class RemoteReceiverCanvas(QWidget):
     def __init__(self, send_command_func, parent=None):
         super().__init__(parent)
         self.send_command_func = send_command_func
-        self.current_frame: Optional[QPixmap] = None
+        self.current_frame: Optional[QImage] = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setStyleSheet("background-color: #0d111a;")
 
     def update_frame(self, qimage: QImage):
-        self.current_frame = QPixmap.fromImage(qimage)
+        self.current_frame = qimage
         self.update()
 
     def _get_video_rect(self) -> QRect:
         if not self.current_frame or self.current_frame.isNull():
             return self.rect()
-        pix_size = self.current_frame.size()
-        pix_size.scale(self.size(), Qt.KeepAspectRatio)
+        img_size = self.current_frame.size()
+        img_size.scale(self.size(), Qt.KeepAspectRatio)
         return QRect(
-            (self.width() - pix_size.width()) // 2,
-            (self.height() - pix_size.height()) // 2,
-            pix_size.width(),
-            pix_size.height(),
+            (self.width() - img_size.width()) // 2,
+            (self.height() - img_size.height()) // 2,
+            img_size.width(),
+            img_size.height(),
         )
 
     def _normalize_pos(self, pos: QPointF) -> Optional[tuple[float, float]]:
@@ -56,12 +60,12 @@ class RemoteReceiverCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.fillRect(self.rect(), QColor("#0d111a"))
 
         if self.current_frame and not self.current_frame.isNull():
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             target_rect = self._get_video_rect()
-            painter.drawPixmap(target_rect, self.current_frame)
+            painter.drawImage(target_rect, self.current_frame)
         else:
             painter.setPen(QColor("#8f9bb3"))
             painter.setFont(QFont("Segoe UI", 14))
@@ -170,7 +174,6 @@ class RemoteReceiverCanvas(QWidget):
         event.accept()
 
     def contextMenuEvent(self, event):
-        # Allow right click to be processed and dispatched without showing a local menu
         event.accept()
 
 
