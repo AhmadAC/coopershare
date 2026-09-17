@@ -6,7 +6,7 @@ Features:
 - Windows DXGI Desktop Duplication hardware capture (sub-1ms VRAM reading)
 - High-speed persistent DIB Section GDI fallback grabber
 - Parallel dual-threaded SIMD JPEG encoders bypassing the CPU core bottleneck to achieve 60 FPS
-- Dynamic adaptive bitrate and dropped-frame eviction to guarantee zero network lag
+- Network-adaptive resolution & bitrate controller for steady 60 FPS across Wi-Fi & LAN
 - Live verbose performance telemetry every second
 - Linux KWin ScreenShot2 kernel pipe capture & MSS fallback
 """
@@ -494,11 +494,11 @@ class ScreenSenderThread(QThread):
 
             eff_quality = self.quality
             if self._last_net_duration > 35.0:
-                eff_quality = max(45, self.quality - 24)
+                eff_quality = max(38, self.quality - 32)
             elif self._last_net_duration > 22.0:
-                eff_quality = max(55, self.quality - 14)
-            elif self._last_net_duration > 16.0:
-                eff_quality = max(65, self.quality - 6)
+                eff_quality = max(48, self.quality - 22)
+            elif self._last_net_duration > 15.0:
+                eff_quality = max(58, self.quality - 12)
 
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), eff_quality]
 
@@ -511,6 +511,29 @@ class ScreenSenderThread(QThread):
                 frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
             else:
                 frame_bgr = frame_raw
+
+            # Bandwidth Optimization: Scale frame down to fit Wi-Fi constraints when targeting 60 FPS under Balanced
+            h, w = frame_bgr.shape[:2]
+            if (
+                self.fps_limit >= 60
+                and not self.native_resolution
+                and (self.quality <= 78 or self._last_net_duration > 20.0)
+            ):
+                if w > 1280:
+                    scale = 1280.0 / w
+                    target_w = 1280
+                    target_h = int(round(h * scale))
+                    frame_bgr = cv2.resize(
+                        frame_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA
+                    )
+            elif self._last_net_duration > 40.0 and not self.native_resolution:
+                if w > 960:
+                    scale = 960.0 / w
+                    target_w = 960
+                    target_h = int(round(h * scale))
+                    frame_bgr = cv2.resize(
+                        frame_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA
+                    )
 
             success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
             t_enc_ms = (time.perf_counter() - t_enc_start) * 1000.0
@@ -1193,4 +1216,3 @@ class ReverseScreenReceiverThread(QThread):
     def stop(self):
         self.running = False
         self.wait(1000)
-

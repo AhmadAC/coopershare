@@ -11,6 +11,7 @@ from ctypes import (
     POINTER,
     Structure,
     byref,
+    c_char,
     c_int,
     c_int64,
     c_long,
@@ -32,29 +33,22 @@ from PySide6.QtGui import QCursor, QGuiApplication
 
 WINFUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 
-
-class GUID(Structure):
-    _fields_ = [
-        ("Data1", c_ulong),
-        ("Data2", c_ushort),
-        ("Data3", c_ushort),
-        ("Data4", c_ubyte * 8),
-    ]
-
-
-def parse_guid(guid_str: str) -> GUID:
-    """Uses native Windows ole32 API to ensure 100% byte-accurate binary GUID parsing."""
-    g = GUID()
-    if sys.platform == "win32":
-        ctypes.windll.ole32.IIDFromString(str(guid_str), byref(g))
-    return g
-
-
-IID_IDXGIFactory1 = parse_guid("{770AAE78-F26F-4DBA-A829-253C83D1B387}")
-IID_IDXGIDevice = parse_guid("{54EC77FA-1377-44E6-8C32-88FD5F44C84C}")
-IID_IDXGIOutput1 = parse_guid("{00CDDEA8-939B-4B83-A34D-705932F576C0}")
-IID_ID3D11Texture2D = parse_guid("{6F15AAF2-D208-4E89-9AB4-489535D34F9C}")
-IID_IDXGIResource = parse_guid("{035F3AB4-482E-4E50-B41F-8A7F8BD8960B}")
+# Byte-exact 16-byte GUID binary constants (immune to ctypes struct padding/endianness bugs)
+IID_IDXGIFactory1 = (c_ubyte * 16).from_buffer_copy(
+    b"\x78\xae\x0a\x77\x6f\xf2\xba\x4d\xa8\x29\x25\x3c\x83\xd1\xb3\x87"
+)
+IID_IDXGIDevice = (c_ubyte * 16).from_buffer_copy(
+    b"\xfa\x77\xec\x54\x77\x13\xe6\x44\x8c\x32\x88\xfd\x5f\x44\xc8\x4c"
+)
+IID_IDXGIOutput1 = (c_ubyte * 16).from_buffer_copy(
+    b"\xa8\xde\xcd\x00\x9b\x93\x83\x4b\xa3\x4d\x70\x59\x32\xf5\x76\xc0"
+)
+IID_ID3D11Texture2D = (c_ubyte * 16).from_buffer_copy(
+    b"\xf2\xaa\x15\x6f\x08\xd2\x89\x4e\x9a\xb4\x48\x95\x35\xd3\x4f\x9c"
+)
+IID_IDXGIResource = (c_ubyte * 16).from_buffer_copy(
+    b"\xb4\x3a\x5f\x03\x2e\x48\x50\x4e\xb4\x1f\x8a\x7f\x8b\xd8\x96\x0b"
+)
 
 
 def _release_com_ptr(ptr: c_void_p):
@@ -192,111 +186,21 @@ class WindowsDXGIGrabber:
     def _initialize(self) -> bool:
         self._cleanup()
 
-        p_factory = c_void_p()
+        p_output1 = c_void_p()
+        p_dxgi_dev = c_void_p()
         p_adapter = c_void_p()
         p_output = c_void_p()
-        p_output1 = c_void_p()
 
         try:
-            hr = ctypes.windll.dxgi.CreateDXGIFactory1(
-                byref(IID_IDXGIFactory1), byref(p_factory)
-            )
-            if hr != 0 or not p_factory.value:
-                print(f"[DXGI-Init] CreateDXGIFactory1 failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
-                return False
-
-            factory_vtbl = ctypes.cast(
-                p_factory, POINTER(POINTER(c_void_p))
-            ).contents
-            enum_adapters1 = WINFUNCTYPE(c_long, c_void_p, c_uint, POINTER(c_void_p))(
-                factory_vtbl[12]
-            )
-
-            matched_adapter = None
-            matched_output = None
-            matched_desc = None
-
-            cur_mon_idx = 0
-            adapter_idx = 0
-
-            while True:
-                curr_adapter_p = c_void_p()
-                hr = enum_adapters1(p_factory, adapter_idx, byref(curr_adapter_p))
-                if hr != 0 or not curr_adapter_p.value:
-                    break
-
-                adapter_vtbl = ctypes.cast(
-                    curr_adapter_p, POINTER(POINTER(c_void_p))
-                ).contents
-                get_desc1 = WINFUNCTYPE(c_long, c_void_p, POINTER(DXGI_ADAPTER_DESC1))(
-                    adapter_vtbl[10]
-                )
-                a_desc = DXGI_ADAPTER_DESC1()
-                get_desc1(curr_adapter_p, byref(a_desc))
-
-                enum_outputs = WINFUNCTYPE(c_long, c_void_p, c_uint, POINTER(c_void_p))(
-                    adapter_vtbl[7]
-                )
-
-                output_idx = 0
-                while True:
-                    curr_out_p = c_void_p()
-                    hr = enum_outputs(curr_adapter_p, output_idx, byref(curr_out_p))
-                    if hr != 0 or not curr_out_p.value:
-                        break
-
-                    out_vtbl = ctypes.cast(
-                        curr_out_p, POINTER(POINTER(c_void_p))
-                    ).contents
-                    get_out_desc = WINFUNCTYPE(c_long, c_void_p, POINTER(DXGI_OUTPUT_DESC))(
-                        out_vtbl[7]
-                    )
-                    o_desc = DXGI_OUTPUT_DESC()
-                    hr_desc = get_out_desc(curr_out_p, byref(o_desc))
-
-                    if hr_desc == 0 and o_desc.AttachedToDesktop:
-                        w = int(o_desc.DesktopCoordinates.right - o_desc.DesktopCoordinates.left)
-                        h = int(o_desc.DesktopCoordinates.bottom - o_desc.DesktopCoordinates.top)
-                        print(
-                            f"[DXGI-Init] Found Monitor {cur_mon_idx}: '{o_desc.DeviceName}' on GPU '{a_desc.Description}' ({w}x{h})",
-                            flush=True,
-                        )
-
-                        if cur_mon_idx == self.target_monitor_index:
-                            matched_adapter = curr_adapter_p
-                            matched_output = curr_out_p
-                            matched_desc = o_desc
-                            break
-
-                        cur_mon_idx += 1
-
-                    _release_com_ptr(curr_out_p)
-                    output_idx += 1
-
-                if matched_adapter:
-                    break
-
-                _release_com_ptr(curr_adapter_p)
-                adapter_idx += 1
-
-            if not matched_adapter or not matched_output:
-                print("[DXGI-Init] No attached desktop output matched target monitor index.", flush=True)
-                return False
-
-            p_adapter = matched_adapter
-            p_output = matched_output
-            self.mon_left = int(matched_desc.DesktopCoordinates.left)
-            self.mon_top = int(matched_desc.DesktopCoordinates.top)
-            self.width = int(matched_desc.DesktopCoordinates.right - matched_desc.DesktopCoordinates.left)
-            self.height = int(matched_desc.DesktopCoordinates.bottom - matched_desc.DesktopCoordinates.top)
-
-            # Create D3D11 device first so driver extensions are fully activated
+            # Step 1: Create Direct3D 11 Device on active GPU
             feature_level = c_uint(0)
             D3D11_SDK_VERSION = 7
             D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20
+            D3D_DRIVER_TYPE_HARDWARE = 1
+
             hr = ctypes.windll.d3d11.D3D11CreateDevice(
-                p_adapter,
-                0,
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
                 None,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 None,
@@ -308,8 +212,8 @@ class WindowsDXGIGrabber:
             )
             if hr != 0 or not self.p_device.value:
                 hr = ctypes.windll.d3d11.D3D11CreateDevice(
-                    p_adapter,
-                    0,
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
                     None,
                     0,
                     None,
@@ -320,49 +224,70 @@ class WindowsDXGIGrabber:
                     byref(self.p_context),
                 )
                 if hr != 0 or not self.p_device.value:
-                    print(f"[DXGI-Init] D3D11CreateDevice for adapter failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
+                    print(f"[DXGI-Init] D3D11CreateDevice failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
                     return False
 
-            # Query IDXGIOutput1 using native parsed GUID
-            out_vtbl = ctypes.cast(p_output, POINTER(POINTER(c_void_p))).contents
-            out_qi = WINFUNCTYPE(c_long, c_void_p, POINTER(GUID), POINTER(c_void_p))(out_vtbl[0])
-            hr = out_qi(p_output, byref(IID_IDXGIOutput1), byref(p_output1))
-            if hr != 0 or not p_output1.value:
-                # If standalone output lacks DXGI 1.2 on this driver, query via D3D11 device adapter
-                p_dxgi_dev = c_void_p()
-                dev_vtbl_tmp = ctypes.cast(self.p_device, POINTER(POINTER(c_void_p))).contents
-                dev_qi = WINFUNCTYPE(c_long, c_void_p, POINTER(GUID), POINTER(c_void_p))(dev_vtbl_tmp[0])
-                hr_dev = dev_qi(self.p_device, byref(IID_IDXGIDevice), byref(p_dxgi_dev))
-                if hr_dev == 0 and p_dxgi_dev.value:
-                    dxgi_dev_vtbl = ctypes.cast(p_dxgi_dev, POINTER(POINTER(c_void_p))).contents
-                    get_adapter_func = WINFUNCTYPE(c_long, c_void_p, POINTER(c_void_p))(dxgi_dev_vtbl[7])
-                    p_dev_adapter = c_void_p()
-                    hr_ad = get_adapter_func(p_dxgi_dev, byref(p_dev_adapter))
-                    if hr_ad == 0 and p_dev_adapter.value:
-                        dev_ad_vtbl = ctypes.cast(p_dev_adapter, POINTER(POINTER(c_void_p))).contents
-                        dev_enum_out = WINFUNCTYPE(c_long, c_void_p, c_uint, POINTER(c_void_p))(dev_ad_vtbl[7])
-                        p_dev_out = c_void_p()
-                        hr_o = dev_enum_out(p_dev_adapter, output_idx, byref(p_dev_out))
-                        if hr_o == 0 and p_dev_out.value:
-                            d_out_vtbl = ctypes.cast(p_dev_out, POINTER(POINTER(c_void_p))).contents
-                            d_out_qi = WINFUNCTYPE(c_long, c_void_p, POINTER(GUID), POINTER(c_void_p))(d_out_vtbl[0])
-                            hr = d_out_qi(p_dev_out, byref(IID_IDXGIOutput1), byref(p_output1))
-                            _release_com_ptr(p_dev_out)
-                        _release_com_ptr(p_dev_adapter)
-                    _release_com_ptr(p_dxgi_dev)
+            # Step 2: Query D3D11 Device for IDXGIDevice
+            dev_vtbl = ctypes.cast(self.p_device, POINTER(POINTER(c_void_p))).contents
+            dev_qi = WINFUNCTYPE(c_long, c_void_p, c_void_p, POINTER(c_void_p))(dev_vtbl[0])
+            hr = dev_qi(self.p_device, byref(IID_IDXGIDevice), byref(p_dxgi_dev))
+            if hr != 0 or not p_dxgi_dev.value:
+                print(f"[DXGI-Init] IDXGIDevice QueryInterface failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
+                return False
 
+            # Step 3: Get IDXGIAdapter from IDXGIDevice (Method 7)
+            dxgi_dev_vtbl = ctypes.cast(p_dxgi_dev, POINTER(POINTER(c_void_p))).contents
+            get_adapter_func = WINFUNCTYPE(c_long, c_void_p, POINTER(c_void_p))(dxgi_dev_vtbl[7])
+            hr = get_adapter_func(p_dxgi_dev, byref(p_adapter))
+            if hr != 0 or not p_adapter.value:
+                print(f"[DXGI-Init] GetAdapter failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
+                return False
+
+            # Step 4: Enumerate attached outputs on active adapter
+            adapter_vtbl = ctypes.cast(p_adapter, POINTER(POINTER(c_void_p))).contents
+            get_desc1 = WINFUNCTYPE(c_long, c_void_p, POINTER(DXGI_ADAPTER_DESC1))(adapter_vtbl[10])
+            a_desc = DXGI_ADAPTER_DESC1()
+            get_desc1(p_adapter, byref(a_desc))
+
+            enum_outputs = WINFUNCTYPE(c_long, c_void_p, c_uint, POINTER(c_void_p))(adapter_vtbl[7])
+            hr = enum_outputs(p_adapter, self.target_monitor_index, byref(p_output))
+            if hr != 0 or not p_output.value:
+                hr = enum_outputs(p_adapter, 0, byref(p_output))
+                if hr != 0 or not p_output.value:
+                    print(f"[DXGI-Init] EnumOutputs failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
+                    return False
+
+            out_vtbl = ctypes.cast(p_output, POINTER(POINTER(c_void_p))).contents
+            get_out_desc = WINFUNCTYPE(c_long, c_void_p, POINTER(DXGI_OUTPUT_DESC))(out_vtbl[7])
+            o_desc = DXGI_OUTPUT_DESC()
+            get_out_desc(p_output, byref(o_desc))
+
+            self.mon_left = int(o_desc.DesktopCoordinates.left)
+            self.mon_top = int(o_desc.DesktopCoordinates.top)
+            self.width = int(o_desc.DesktopCoordinates.right - o_desc.DesktopCoordinates.left)
+            self.height = int(o_desc.DesktopCoordinates.bottom - o_desc.DesktopCoordinates.top)
+
+            print(
+                f"[DXGI-Init] Output Monitor: '{o_desc.DeviceName}' on GPU '{a_desc.Description}' ({self.width}x{self.height})",
+                flush=True,
+            )
+
+            # Step 5: Query IDXGIOutput1 (Method 0)
+            out_qi = WINFUNCTYPE(c_long, c_void_p, c_void_p, POINTER(c_void_p))(out_vtbl[0])
+            hr = out_qi(p_output, byref(IID_IDXGIOutput1), byref(p_output1))
             if hr != 0 or not p_output1.value:
                 print(f"[DXGI-Init] IDXGIOutput1 QueryInterface failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
                 return False
 
+            # Step 6: DuplicateOutput (Method 20 of IDXGIOutput1)
             out1_vtbl = ctypes.cast(p_output1, POINTER(POINTER(c_void_p))).contents
-            # DuplicateOutput is method 20 of IDXGIOutput1
             dup_output = WINFUNCTYPE(c_long, c_void_p, c_void_p, POINTER(c_void_p))(out1_vtbl[20])
             hr = dup_output(p_output1, self.p_device, byref(self.p_duplication))
             if hr != 0 or not self.p_duplication.value:
                 print(f"[DXGI-Init] DuplicateOutput failed: 0x{hr & 0xFFFFFFFF:08X}", flush=True)
                 return False
 
+            # Step 7: Create D3D11 CPU-readable staging texture
             tex_desc = D3D11_TEXTURE2D_DESC(
                 self.width,
                 self.height,
@@ -377,7 +302,6 @@ class WindowsDXGIGrabber:
                 0,
             )
 
-            dev_vtbl = ctypes.cast(self.p_device, POINTER(POINTER(c_void_p))).contents
             create_tex = WINFUNCTYPE(
                 c_long, c_void_p, POINTER(D3D11_TEXTURE2D_DESC), c_void_p, POINTER(c_void_p)
             )(dev_vtbl[5])
@@ -396,7 +320,7 @@ class WindowsDXGIGrabber:
             _release_com_ptr(p_output1)
             _release_com_ptr(p_output)
             _release_com_ptr(p_adapter)
-            _release_com_ptr(p_factory)
+            _release_com_ptr(p_dxgi_dev)
 
     def grab(self) -> Optional[np.ndarray]:
         if not self.available or not self.p_duplication.value:
@@ -427,7 +351,7 @@ class WindowsDXGIGrabber:
                 return self.last_frame
 
             res_vtbl = ctypes.cast(p_resource, POINTER(POINTER(c_void_p))).contents
-            res_qi = WINFUNCTYPE(c_long, c_void_p, POINTER(GUID), POINTER(c_void_p))(res_vtbl[0])
+            res_qi = WINFUNCTYPE(c_long, c_void_p, c_void_p, POINTER(c_void_p))(res_vtbl[0])
 
             hr = res_qi(p_resource, byref(IID_ID3D11Texture2D), byref(p_desktop_tex))
             if hr != 0 or not p_desktop_tex.value:
