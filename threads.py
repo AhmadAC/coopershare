@@ -7,12 +7,10 @@ Background network worker threads for video, audio, input, reverse video, and be
 Features:
 - True H.264 Real-Time Low-Latency Video Streaming (libx264 / zero-latency I/P-frame encoding)
 - Direct zero-copy BGRA memory ingestion into libavcodec (0.0ms color conversion)
+- Dual-tier capture failover: DXGI Hardware GPU Duplication with instant FastGDI backup
+- Steady frame pacing guarantee (caches last frame on static scenes so stream never starves)
+- Dynamic adaptive MJPEG compression when H.264 is unavailable to eliminate network stalls
 - Ultra-low payload size (0.5 KB - 8 KB per P-frame at 60 FPS)
-- High-performance adaptive congestion backpressure with automatic network stall protection
-- Direct single-hop capture-to-encoder pipeline eliminating redundant sleep delays
-- Fractions timebase compatibility for PyAV libavcodec integration
-- Seamless fallback to Turbo-JPEG engine if PyAV is not installed or unsupported by receiver
-- High-rate zero-copy display grabber
 - Linux KWin ScreenShot2 kernel pipe capture & MSS fallback
 """
 
@@ -458,8 +456,8 @@ class ScreenSenderThread(QThread):
         self.paused = False
         self._pause_requested = False
 
-        self.raw_queue = queue.Queue(maxsize=1)
-        self.send_queue = queue.Queue(maxsize=1)
+        self.raw_queue = queue.Queue(maxsize=2)
+        self.send_queue = queue.Queue(maxsize=2)
         self.pipeline_running = False
 
         self._stats_lock = threading.Lock()
@@ -544,14 +542,15 @@ class ScreenSenderThread(QThread):
             h, w = frame_raw.shape[:2]
             channels = frame_raw.shape[2] if frame_raw.ndim == 3 else 1
 
-            # Downscale high-resolution frames when not pixel-perfect to protect network bandwidth
-            max_dim = 1280
-            if not self.native_resolution and (w > max_dim or h > max_dim):
-                scale = max_dim / float(max(w, h))
-                target_w = int(round(w * scale))
-                target_h = int(round(h * scale))
-                frame_raw = cv2.resize(frame_raw, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-                h, w = frame_raw.shape[:2]
+            # When H.264 is disabled (MJPEG fallback), strictly scale 1440p/4K frames to prevent network buffer saturation
+            if not self.use_h264 or self._h264_init_attempted:
+                max_bound = 1280
+                if w > max_bound or h > max_bound:
+                    scale = max_bound / float(max(w, h))
+                    tw = (int(round(w * scale)) // 2) * 2
+                    th = (int(round(h * scale)) // 2) * 2
+                    frame_raw = cv2.resize(frame_raw, (tw, th), interpolation=cv2.INTER_LINEAR)
+                    h, w = frame_raw.shape[:2]
 
             w_aligned = (w // 2) * 2
             h_aligned = (h // 2) * 2
@@ -598,9 +597,9 @@ class ScreenSenderThread(QThread):
                     frame_bgr = frame_raw
 
                 eff_quality = self.quality
-                if self._last_net_duration > 25.0:
+                if self._last_net_duration > 20.0:
                     eff_quality = min(eff_quality, 50)
-                elif self._last_net_duration > 15.0:
+                elif self._last_net_duration > 10.0:
                     eff_quality = min(eff_quality, 65)
 
                 encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), eff_quality]
@@ -624,7 +623,7 @@ class ScreenSenderThread(QThread):
             except Exception:
                 pass
 
-    def _network_sender_worker(self, sock: socket.socket, backend_name: str):
+    def _network_sender_worker(self, sock: socket.socket, get_backend_name_func):
         last_report_time = time.perf_counter()
 
         while self.pipeline_running:
@@ -682,7 +681,7 @@ class ScreenSenderThread(QThread):
                 print(
                     f"[Sender-Perf] Target: {self.fps_limit} FPS | Actual: {measured_fps:4.1f} FPS | "
                     f"Cap: {avg_cap:4.1f}ms | Enc: {avg_enc:4.1f}ms | Net: {avg_net:4.1f}ms | "
-                    f"Frame: {avg_kb:5.1f}KB | Codec: {codec_label} | Backend: {backend_name}",
+                    f"Frame: {avg_kb:5.1f}KB | Codec: {codec_label} | Backend: {get_backend_name_func()}",
                     flush=True,
                 )
                 last_report_time = now
@@ -781,27 +780,29 @@ class ScreenSenderThread(QThread):
                     print(f"[Sender] Windows DXGI exception: {ex}", flush=True)
                     use_dxgi = False
 
-                if not use_dxgi:
-                    try:
-                        fast_gdi_grabber = WindowsFastGDIGrabber(
-                            mon_left=mon_left, mon_top=mon_top, width=mon_w, height=mon_h
-                        )
-                        use_fast_gdi = fast_gdi_grabber.initialized
-                    except Exception:
-                        use_fast_gdi = False
+                try:
+                    fast_gdi_grabber = WindowsFastGDIGrabber(
+                        mon_left=mon_left, mon_top=mon_top, width=mon_w, height=mon_h
+                    )
+                    use_fast_gdi = fast_gdi_grabber.initialized
+                except Exception:
+                    use_fast_gdi = False
 
+            active_backend = "MSS (Direct)"
             if use_dxgi:
-                backend_name = "DXGI (GPU)"
+                active_backend = "DXGI (GPU)"
             elif use_kwin:
-                backend_name = "KWin (D-Bus)"
+                active_backend = "KWin (D-Bus)"
             elif use_spectacle:
-                backend_name = "Spectacle"
+                active_backend = "Spectacle"
             elif use_fast_gdi:
-                backend_name = "FastGDI (DIB)"
-            else:
-                backend_name = "MSS (Direct)"
+                active_backend = "FastGDI (DIB)"
 
-            print(f"[Sender] Active Capture Engine: {backend_name}", flush=True)
+            def get_backend_name():
+                nonlocal active_backend
+                return active_backend
+
+            print(f"[Sender] Active Capture Engine: {active_backend}", flush=True)
 
             self.pipeline_running = True
 
@@ -809,13 +810,14 @@ class ScreenSenderThread(QThread):
                 target=self._encoder_worker, name="H264EncoderWorker", daemon=True
             )
             net_worker = threading.Thread(
-                target=self._network_sender_worker, args=(sock, backend_name), name="NetSenderWorker", daemon=True
+                target=self._network_sender_worker, args=(sock, get_backend_name), name="NetSenderWorker", daemon=True
             )
 
             enc_worker.start()
             net_worker.start()
 
             frame_counter = 0
+            last_cached_frame = None
 
             while self.running and self.pipeline_running:
                 if self._pause_requested:
@@ -824,16 +826,16 @@ class ScreenSenderThread(QThread):
                     try:
                         if use_dxgi and dxgi_grabber:
                             clean_frame = dxgi_grabber.grab()
-                        elif use_kwin:
+                        if clean_frame is None and use_fast_gdi and fast_gdi_grabber:
+                            clean_frame = fast_gdi_grabber.grab()
+                        elif clean_frame is None and use_kwin and kwin_grabber:
                             clean_frame = kwin_grabber.grab(
                                 include_cursor=False,
                                 native_resolution=use_native_res,
                             )
-                        elif use_spectacle and spectacle_grabber:
+                        elif clean_frame is None and use_spectacle and spectacle_grabber:
                             clean_frame = spectacle_grabber.grab()
-                        elif use_fast_gdi and fast_gdi_grabber:
-                            clean_frame = fast_gdi_grabber.grab()
-                        else:
+                        elif clean_frame is None:
                             sct_f = sct.grab(monitor)
                             clean_frame = np.frombuffer(sct_f.raw, dtype=np.uint8).reshape((sct_f.height, sct_f.width, 4))
                     except Exception:
@@ -864,40 +866,47 @@ class ScreenSenderThread(QThread):
                     if use_dxgi and dxgi_grabber:
                         f_raw = dxgi_grabber.grab()
                         if f_raw is not None:
+                            active_backend = "DXGI (GPU)"
                             render_cursor_on_frame(
                                 f_raw,
                                 monitor_left=dxgi_grabber.mon_left,
                                 monitor_top=dxgi_grabber.mon_top,
                                 scale_factor=screen_dpr,
                             )
-                    elif use_kwin:
+
+                    if f_raw is None and use_fast_gdi and fast_gdi_grabber:
+                        f_raw = fast_gdi_grabber.grab()
+                        if f_raw is not None:
+                            active_backend = "FastGDI (DIB)"
+                            render_cursor_on_frame(
+                                f_raw,
+                                monitor_left=mon_left,
+                                monitor_top=mon_top,
+                                scale_factor=screen_dpr,
+                            )
+                    elif f_raw is None and use_kwin and kwin_grabber:
                         use_native_res = bool(self.native_resolution and self.quality >= 95)
                         f_raw = kwin_grabber.grab(
                             include_cursor=True,
                             native_resolution=use_native_res,
                         )
-                    elif use_spectacle and spectacle_grabber:
+                        if f_raw is not None:
+                            active_backend = "KWin (D-Bus)"
+                    elif f_raw is None and use_spectacle and spectacle_grabber:
                         f_raw = spectacle_grabber.grab()
                         if f_raw is not None:
+                            active_backend = "Spectacle"
                             render_cursor_on_frame(
                                 f_raw,
                                 monitor_left=mon_left,
                                 monitor_top=mon_top,
                                 scale_factor=screen_dpr,
                             )
-                    elif use_fast_gdi and fast_gdi_grabber:
-                        f_raw = fast_gdi_grabber.grab()
-                        if f_raw is not None:
-                            render_cursor_on_frame(
-                                f_raw,
-                                monitor_left=mon_left,
-                                monitor_top=mon_top,
-                                scale_factor=screen_dpr,
-                            )
-                    else:
+                    elif f_raw is None and sct:
                         sct_frame = sct.grab(monitor)
-                        f_raw = np.frombuffer(sct_frame.raw, dtype=np.uint8).reshape((sct_frame.height, sct_frame.width, 4))
+                        f_raw = np.frombuffer(sct_frame.raw, dtype=np.uint8).reshape((sct_frame.height, sct_frame.width, 4)).copy()
                         if f_raw is not None:
+                            active_backend = "MSS (Direct)"
                             render_cursor_on_frame(
                                 f_raw,
                                 monitor_left=mon_left,
@@ -906,6 +915,12 @@ class ScreenSenderThread(QThread):
                             )
                 except Exception:
                     f_raw = None
+
+                # Keep last frame cached so identical static screens maintain the target frame rate
+                if f_raw is not None:
+                    last_cached_frame = f_raw
+                elif last_cached_frame is not None:
+                    f_raw = last_cached_frame
 
                 t_frame_end = time.perf_counter()
                 cap_ms = (t_frame_end - t_frame_start) * 1000.0

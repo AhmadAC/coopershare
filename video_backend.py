@@ -65,7 +65,6 @@ IID_IDXGIAdapter = make_guid(0x2411E7E1, 0x12AC, 0x4CCF, 0xBD, 0x14, 0x97, 0x98,
 IID_IDXGIAdapter1 = make_guid(0x29038F61, 0x3839, 0x4626, 0x91, 0xFD, 0x08, 0x68, 0x79, 0x01, 0x1A, 0x05)
 IID_IDXGIDevice = make_guid(0x54EC77FA, 0x1377, 0x44E6, 0x8C, 0x32, 0x88, 0xFD, 0x5F, 0x44, 0xC8, 0x4C)
 IID_IDXGIOutput = make_guid(0xAE02EEDB, 0xC735, 0x4690, 0x8D, 0x52, 0x5A, 0x8D, 0xC2, 0x02, 0x13, 0xAA)
-# Official WinSDK UUID: {00cddea8-939b-4b83-a340-a685226666cc}
 IID_IDXGIOutput1 = make_guid(0x00CDDEA8, 0x939B, 0x4B83, 0xA3, 0x40, 0xA6, 0x85, 0x22, 0x66, 0x66, 0xCC)
 IID_ID3D11Texture2D = make_guid(0x6F15AAF2, 0xD208, 0x4E89, 0x9A, 0xB4, 0x48, 0x95, 0x35, 0xD3, 0x4F, 0x9C)
 IID_IDXGIResource = make_guid(0x035F3AB4, 0x482E, 0x4E50, 0xB4, 0x1F, 0x8A, 0x7F, 0x8B, 0xD8, 0x96, 0x0B)
@@ -476,17 +475,22 @@ class WindowsDXGIGrabber:
             )(dup_vtbl[8])
             release_frame_func = WINFUNCTYPE(HRESULT, c_void_p)(dup_vtbl[14])
 
-            hr = acquire_func(self.p_duplication, 4, byref(frame_info), byref(p_resource))
+            # Use 250ms on first frame to guarantee desktop grab, 5ms on continuous streaming
+            timeout_ms = 250 if self.last_frame is None else 5
+            hr = acquire_func(self.p_duplication, timeout_ms, byref(frame_info), byref(p_resource))
+            hr_uint = hr & 0xFFFFFFFF
 
-            DXGI_ERROR_WAIT_TIMEOUT = -2005270521
-            DXGI_ERROR_ACCESS_LOST = -2005270522
+            DXGI_ERROR_WAIT_TIMEOUT = 0x887A0027
+            DXGI_ERROR_ACCESS_LOST = 0x887A0026
 
-            if hr == DXGI_ERROR_WAIT_TIMEOUT:
+            if hr_uint == DXGI_ERROR_WAIT_TIMEOUT:
                 return self.last_frame
 
-            if hr == DXGI_ERROR_ACCESS_LOST or hr != 0 or not p_resource.value:
-                if hr == DXGI_ERROR_ACCESS_LOST:
-                    self.available = self._initialize()
+            if hr_uint == DXGI_ERROR_ACCESS_LOST:
+                self.available = self._initialize()
+                return self.last_frame
+
+            if hr != 0 or not p_resource.value:
                 return self.last_frame
 
             res_vtbl = ctypes.cast(p_resource, POINTER(POINTER(c_void_p))).contents
@@ -524,9 +528,9 @@ class WindowsDXGIGrabber:
 
             expected_line = self.width * 4
             if pitch == expected_line:
-                frame_bgra = raw_arr.reshape((self.height, self.width, 4))
+                frame_bgra = raw_arr.reshape((self.height, self.width, 4)).copy()
             else:
-                frame_bgra = raw_arr[:, :expected_line].reshape((self.height, self.width, 4))
+                frame_bgra = raw_arr[:, :expected_line].reshape((self.height, self.width, 4)).copy()
 
             unmap_func(self.p_context, self.p_staging_tex, 0)
 
@@ -582,7 +586,6 @@ class WindowsFastGDIGrabber:
         self.src_w = max(1, width)
         self.src_h = max(1, height)
 
-        # Scale high-resolution screens in driver memory to avoid massive PCIe bus transfer stalls
         max_bound = 1280
         if self.src_w > max_bound or self.src_h > max_bound:
             scale = max_bound / float(max(self.src_w, self.src_h))
@@ -671,7 +674,7 @@ class WindowsFastGDIGrabber:
 
             buf_size = self.dst_w * self.dst_h * 4
             c_buf = (c_ubyte * buf_size).from_address(self.p_bits.value)
-            raw_4ch = np.frombuffer(c_buf, dtype=np.uint8).reshape((self.dst_h, self.dst_w, 4))
+            raw_4ch = np.frombuffer(c_buf, dtype=np.uint8).reshape((self.dst_h, self.dst_w, 4)).copy()
             return raw_4ch
         except Exception:
             return None

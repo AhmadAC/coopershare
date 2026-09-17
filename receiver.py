@@ -82,7 +82,7 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP_REC") 
         except SystemExit:
             raise
         except Exception as _ex:
-            print(f"[BOOTSTRAP ERROR] Failed to run external receiver.py: {_ex}")
+            print(f"[BOOTSTRAP ERROR] Failed to run external receiver.py: {_ex}", flush=True)
 
 import cv2
 import mss
@@ -131,9 +131,18 @@ from PySide6.QtWidgets import (
 try:
     import av
     H264_RECEIVER_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):
+except Exception as _av_err:
     av = None
     H264_RECEIVER_AVAILABLE = False
+
+print("=" * 70, flush=True)
+print("[Receiver-Bootstrap] MrCoopersScreenShare Receiver Starting...", flush=True)
+print(f"[Receiver-Bootstrap] Python: {sys.version.split()[0]} ({sys.executable})", flush=True)
+print(f"[Receiver-Bootstrap] Platform: {sys.platform}", flush=True)
+print(f"[Receiver-Bootstrap] PyAV H.264 Hardware/Stream Decoder: {H264_RECEIVER_AVAILABLE}", flush=True)
+if not H264_RECEIVER_AVAILABLE:
+    print("[Receiver-Bootstrap] NOTICE: PyAV is not installed. To enable zero-latency H.264 streaming, run: pip install av", flush=True)
+print("=" * 70, flush=True)
 
 logger = logging.getLogger("Receiver")
 logger.setLevel(logging.DEBUG)

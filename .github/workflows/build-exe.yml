@@ -2,10 +2,10 @@ name: Build MrCoopersScreenShare Executables
 
 on:
   push:
-    branches: [ "realbad", "master" ]
+    branches: [ "main", "master" ]
     tags: [ "v*" ]
   pull_request:
-    branches: [ "realbad", "master" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
@@ -35,6 +35,7 @@ jobs:
             --icon "icon.ico" `
             --add-data "icon.ico;." `
             --add-data "icon.png;." `
+            --add-data "sender.py;." `
             --hidden-import "sounddevice" `
             --hidden-import "pynput" `
             --hidden-import "pynput.keyboard._win32" `
@@ -52,6 +53,7 @@ jobs:
             --icon "icon.ico" `
             --add-data "icon.ico;." `
             --add-data "icon.png;." `
+            --add-data "receiver.py;." `
             --hidden-import "sounddevice" `
             --hidden-import "pynput" `
             --hidden-import "pynput.keyboard._win32" `
@@ -64,11 +66,16 @@ jobs:
 
       - name: Bundle assets & create portable ZIP archives
         run: |
+          Copy-Item "sender.py" -Destination "dist\sender\sender.py" -Force
+          Copy-Item "receiver.py" -Destination "dist\receiver\receiver.py" -Force
           Copy-Item "icon.ico" -Destination "dist\sender\icon.ico" -ErrorAction SilentlyContinue
           Copy-Item "icon.png" -Destination "dist\sender\icon.png" -ErrorAction SilentlyContinue
           Copy-Item "icon.ico" -Destination "dist\receiver\icon.ico" -ErrorAction SilentlyContinue
           Copy-Item "icon.png" -Destination "dist\receiver\icon.png" -ErrorAction SilentlyContinue
-          
+          Get-ChildItem -Path . -Filter "*.py" | ForEach-Object {
+            Copy-Item $_.FullName -Destination "dist\sender\" -Force
+            Copy-Item $_.FullName -Destination "dist\receiver\" -Force
+          }
           Compress-Archive -Path "dist\sender" -DestinationPath "dist\MrCoopersScreenShare-Sender-Windows.zip" -CompressionLevel Optimal
           Compress-Archive -Path "dist\receiver" -DestinationPath "dist\MrCoopersScreenShare-Receiver-Windows.zip" -CompressionLevel Optimal
 
