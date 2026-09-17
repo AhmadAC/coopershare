@@ -1,3 +1,5 @@
+#################### START OF FILE: video_backend.py ####################
+
 # video_backend.py
 
 """
@@ -178,7 +180,7 @@ if sys.platform == "win32":
             c_int,
             c_void_p,
             c_uint,
-            c_void_p,
+            POINTER(c_uint),
             c_uint,
             c_uint,
             POINTER(c_void_p),
@@ -254,6 +256,8 @@ class WindowsDXGIGrabber:
             enum_adapters1 = WINFUNCTYPE(HRESULT, c_void_p, c_uint, POINTER(c_void_p))(factory_vtbl[12])
 
             adapter_idx = 0
+            feature_levels = (c_uint * 4)(0xB000, 0xA100, 0xA000, 0x9300)
+
             while True:
                 curr_adapter_p = c_void_p()
                 hr = enum_adapters1(p_factory, adapter_idx, byref(curr_adapter_p))
@@ -291,8 +295,8 @@ class WindowsDXGIGrabber:
                             0,
                             None,
                             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                            None,
-                            0,
+                            feature_levels,
+                            4,
                             D3D11_SDK_VERSION,
                             byref(self.p_device),
                             byref(feature_level),
@@ -304,8 +308,8 @@ class WindowsDXGIGrabber:
                                 0,
                                 None,
                                 0,
-                                None,
-                                0,
+                                feature_levels,
+                                4,
                                 D3D11_SDK_VERSION,
                                 byref(self.p_device),
                                 byref(feature_level),
@@ -318,24 +322,21 @@ class WindowsDXGIGrabber:
 
                             if hr_q == 0 and p_output1.value:
                                 out1_vtbl = ctypes.cast(p_output1, POINTER(POINTER(c_void_p))).contents
-                                for slot_idx in (21, 22, 20):
-                                    try:
-                                        dup_func = WINFUNCTYPE(HRESULT, c_void_p, c_void_p, POINTER(c_void_p))(out1_vtbl[slot_idx])
-                                        hr_dup = dup_func(p_output1, self.p_device, byref(self.p_duplication))
-                                        if hr_dup == 0 and self.p_duplication.value:
-                                            self.width = mon_w
-                                            self.height = mon_h
-                                            self.mon_left = int(o_desc.DesktopCoordinates.left)
-                                            self.mon_top = int(o_desc.DesktopCoordinates.top)
+                                # IDXGIOutput1::DuplicateOutput is exact slot index 22
+                                dup_func = WINFUNCTYPE(HRESULT, c_void_p, c_void_p, POINTER(c_void_p))(out1_vtbl[22])
+                                hr_dup = dup_func(p_output1, self.p_device, byref(self.p_duplication))
+                                if hr_dup == 0 and self.p_duplication.value:
+                                    self.width = mon_w
+                                    self.height = mon_h
+                                    self.mon_left = int(o_desc.DesktopCoordinates.left)
+                                    self.mon_top = int(o_desc.DesktopCoordinates.top)
 
-                                            if self._create_staging_texture():
-                                                _release_com_ptr(p_output1)
-                                                _release_com_ptr(curr_out_p)
-                                                _release_com_ptr(curr_adapter_p)
-                                                _release_com_ptr(p_factory)
-                                                return True
-                                    except Exception:
-                                        pass
+                                    if self._create_staging_texture():
+                                        _release_com_ptr(p_output1)
+                                        _release_com_ptr(curr_out_p)
+                                        _release_com_ptr(curr_adapter_p)
+                                        _release_com_ptr(p_factory)
+                                        return True
                                 _release_com_ptr(p_output1)
                                 p_output1 = c_void_p()
 
@@ -366,6 +367,7 @@ class WindowsDXGIGrabber:
             D3D_DRIVER_TYPE_HARDWARE = 1
             D3D11_SDK_VERSION = 7
             D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20
+            feature_levels = (c_uint * 4)(0xB000, 0xA100, 0xA000, 0x9300)
             feature_level = c_uint(0)
 
             hr = ctypes.windll.d3d11.D3D11CreateDevice(
@@ -373,8 +375,8 @@ class WindowsDXGIGrabber:
                 D3D_DRIVER_TYPE_HARDWARE,
                 None,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                0,
+                feature_levels,
+                4,
                 D3D11_SDK_VERSION,
                 byref(self.p_device),
                 byref(feature_level),
@@ -422,18 +424,9 @@ class WindowsDXGIGrabber:
                 return False
 
             out1_vtbl = ctypes.cast(p_output1, POINTER(POINTER(c_void_p))).contents
-            dup_success = False
-            for slot_idx in (21, 22, 20):
-                try:
-                    dup_func = WINFUNCTYPE(HRESULT, c_void_p, c_void_p, POINTER(c_void_p))(out1_vtbl[slot_idx])
-                    hr = dup_func(p_output1, self.p_device, byref(self.p_duplication))
-                    if hr == 0 and self.p_duplication.value:
-                        dup_success = True
-                        break
-                except Exception:
-                    pass
-
-            if not dup_success or not self.p_duplication.value:
+            dup_func = WINFUNCTYPE(HRESULT, c_void_p, c_void_p, POINTER(c_void_p))(out1_vtbl[22])
+            hr = dup_func(p_output1, self.p_device, byref(self.p_duplication))
+            if hr != 0 or not self.p_duplication.value:
                 return False
 
             return self._create_staging_texture()
@@ -581,13 +574,27 @@ class BITMAPINFOHEADER(Structure):
 
 
 class WindowsFastGDIGrabber:
-    """Persistent Device Context & Reusable DIB Section Grabber."""
+    """Persistent Device Context & DIB Section Grabber with hardware-assisted scaling."""
 
     def __init__(self, mon_left: int = 0, mon_top: int = 0, width: int = 1920, height: int = 1080):
         self.mon_left = mon_left
         self.mon_top = mon_top
-        self.width = max(1, width)
-        self.height = max(1, height)
+        self.src_w = max(1, width)
+        self.src_h = max(1, height)
+
+        # Scale high-resolution screens (4K/1440p) in driver memory to avoid massive PCIe bus transfer stalls
+        max_bound = 1280
+        if self.src_w > max_bound or self.src_h > max_bound:
+            scale = max_bound / float(max(self.src_w, self.src_h))
+            self.dst_w = (int(round(self.src_w * scale)) // 2) * 2
+            self.dst_h = (int(round(self.src_h * scale)) // 2) * 2
+        else:
+            self.dst_w = (self.src_w // 2) * 2
+            self.dst_h = (self.src_h // 2) * 2
+
+        self.width = self.dst_w
+        self.height = self.dst_h
+
         self.src_dc = None
         self.mem_dc = None
         self.h_bitmap = None
@@ -610,10 +617,14 @@ class WindowsFastGDIGrabber:
             if not self.mem_dc:
                 return False
 
+            # Enable HALFTONE stretch blitting for fast anti-aliased scaling directly in GDI driver
+            HALFTONE = 4
+            gdi32.SetStretchBltMode(self.mem_dc, HALFTONE)
+
             bih = BITMAPINFOHEADER()
             bih.biSize = sizeof(BITMAPINFOHEADER)
-            bih.biWidth = self.width
-            bih.biHeight = -self.height
+            bih.biWidth = self.dst_w
+            bih.biHeight = -self.dst_h
             bih.biPlanes = 1
             bih.biBitCount = 32
             bih.biCompression = 0
@@ -635,15 +646,32 @@ class WindowsFastGDIGrabber:
         try:
             gdi32 = ctypes.windll.gdi32
             SRCCOPY = 0x00CC0020
-            success = gdi32.BitBlt(
-                self.mem_dc, 0, 0, self.width, self.height, self.src_dc, self.mon_left, self.mon_top, SRCCOPY
-            )
+
+            if self.src_w == self.dst_w and self.src_h == self.dst_h:
+                success = gdi32.BitBlt(
+                    self.mem_dc, 0, 0, self.dst_w, self.dst_h, self.src_dc, self.mon_left, self.mon_top, SRCCOPY
+                )
+            else:
+                success = gdi32.StretchBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    self.dst_w,
+                    self.dst_h,
+                    self.src_dc,
+                    self.mon_left,
+                    self.mon_top,
+                    self.src_w,
+                    self.src_h,
+                    SRCCOPY,
+                )
+
             if not success:
                 return None
 
-            buf_size = self.width * self.height * 4
+            buf_size = self.dst_w * self.dst_h * 4
             c_buf = (c_ubyte * buf_size).from_address(self.p_bits.value)
-            raw_4ch = np.frombuffer(c_buf, dtype=np.uint8).reshape((self.height, self.width, 4))
+            raw_4ch = np.frombuffer(c_buf, dtype=np.uint8).reshape((self.dst_h, self.dst_w, 4))
             return raw_4ch
         except Exception:
             return None

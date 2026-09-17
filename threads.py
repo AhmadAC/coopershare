@@ -8,8 +8,10 @@ Features:
 - True H.264 Real-Time Low-Latency Video Streaming (libx264 / zero-latency I/P-frame encoding)
 - Direct zero-copy BGRA memory ingestion into libavcodec (0.0ms color conversion)
 - Ultra-low payload size (0.5 KB - 8 KB per P-frame at 60 FPS)
+- High-performance adaptive congestion backpressure with automatic network stall protection
+- Direct single-hop capture-to-encoder pipeline eliminating redundant sleep delays
 - Fractions timebase compatibility for PyAV libavcodec integration
-- Seamless fallback to Adaptive JPEG engine if PyAV is not installed or unsupported by receiver
+- Seamless fallback to Turbo-JPEG engine if PyAV is not installed or unsupported by receiver
 - High-rate zero-copy display grabber
 - Linux KWin ScreenShot2 kernel pipe capture & MSS fallback
 """
@@ -542,7 +544,7 @@ class ScreenSenderThread(QThread):
             h, w = frame_raw.shape[:2]
             channels = frame_raw.shape[2] if frame_raw.ndim == 3 else 1
 
-            # Downscale high-resolution frames (e.g. >1080p) to maintain low latency
+            # Downscale high-resolution frames when not pixel-perfect to protect network bandwidth
             max_dim = 1280
             if not self.native_resolution and (w > max_dim or h > max_dim):
                 scale = max_dim / float(max(w, h))
@@ -596,10 +598,10 @@ class ScreenSenderThread(QThread):
                     frame_bgr = frame_raw
 
                 eff_quality = self.quality
-                if self._last_net_duration > 20.0:
-                    eff_quality = min(eff_quality, 55)
-                elif self._last_net_duration > 10.0:
-                    eff_quality = min(eff_quality, 68)
+                if self._last_net_duration > 25.0:
+                    eff_quality = min(eff_quality, 50)
+                elif self._last_net_duration > 15.0:
+                    eff_quality = min(eff_quality, 65)
 
                 encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), eff_quality]
                 success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
@@ -803,84 +805,6 @@ class ScreenSenderThread(QThread):
 
             self.pipeline_running = True
 
-            capture_queue = queue.Queue(maxsize=1)
-            capture_running = [True]
-
-            def capture_loop():
-                while self.running and self.pipeline_running and capture_running[0]:
-                    if self.paused:
-                        time.sleep(0.03)
-                        continue
-
-                    t_c_start = time.perf_counter()
-                    f_raw = None
-                    try:
-                        if use_dxgi and dxgi_grabber:
-                            f_raw = dxgi_grabber.grab()
-                            if f_raw is not None:
-                                render_cursor_on_frame(
-                                    f_raw,
-                                    monitor_left=dxgi_grabber.mon_left,
-                                    monitor_top=dxgi_grabber.mon_top,
-                                    scale_factor=screen_dpr,
-                                )
-                        elif use_kwin:
-                            use_native_res = bool(self.native_resolution and self.quality >= 95)
-                            f_raw = kwin_grabber.grab(
-                                include_cursor=True,
-                                native_resolution=use_native_res,
-                            )
-                        elif use_spectacle and spectacle_grabber:
-                            f_raw = spectacle_grabber.grab()
-                            if f_raw is not None:
-                                render_cursor_on_frame(
-                                    f_raw,
-                                    monitor_left=mon_left,
-                                    monitor_top=mon_top,
-                                    scale_factor=screen_dpr,
-                                )
-                        elif use_fast_gdi and fast_gdi_grabber:
-                            f_raw = fast_gdi_grabber.grab()
-                            if f_raw is not None:
-                                render_cursor_on_frame(
-                                    f_raw,
-                                    monitor_left=mon_left,
-                                    monitor_top=mon_top,
-                                    scale_factor=screen_dpr,
-                                )
-                        else:
-                            sct_frame = sct.grab(monitor)
-                            f_raw = np.frombuffer(sct_frame.raw, dtype=np.uint8).reshape((sct_frame.height, sct_frame.width, 4))
-                            if f_raw is not None:
-                                render_cursor_on_frame(
-                                    f_raw,
-                                    monitor_left=mon_left,
-                                    monitor_top=mon_top,
-                                    scale_factor=screen_dpr,
-                                )
-                    except Exception:
-                        pass
-
-                    t_c_end = time.perf_counter()
-                    c_ms = (t_c_end - t_c_start) * 1000.0
-
-                    if f_raw is not None:
-                        if capture_queue.full():
-                            try:
-                                capture_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                        capture_queue.put_nowait((f_raw, c_ms))
-
-                    t_target = 1.0 / max(1, self.fps_limit)
-                    elapsed = time.perf_counter() - t_c_start
-                    to_sleep = t_target - elapsed
-                    if to_sleep > 0.002:
-                        time.sleep(to_sleep - 0.001)
-
-            cap_worker = threading.Thread(target=capture_loop, name="CaptureWorker", daemon=True)
-            cap_worker.start()
-
             enc_worker = threading.Thread(
                 target=self._encoder_worker, name="H264EncoderWorker", daemon=True
             )
@@ -934,31 +858,75 @@ class ScreenSenderThread(QThread):
                     continue
 
                 t_frame_start = time.perf_counter()
+                f_raw = None
 
                 try:
-                    frame_raw, cap_ms = capture_queue.get(timeout=0.04)
-                except queue.Empty:
-                    continue
+                    if use_dxgi and dxgi_grabber:
+                        f_raw = dxgi_grabber.grab()
+                        if f_raw is not None:
+                            render_cursor_on_frame(
+                                f_raw,
+                                monitor_left=dxgi_grabber.mon_left,
+                                monitor_top=dxgi_grabber.mon_top,
+                                scale_factor=screen_dpr,
+                            )
+                    elif use_kwin:
+                        use_native_res = bool(self.native_resolution and self.quality >= 95)
+                        f_raw = kwin_grabber.grab(
+                            include_cursor=True,
+                            native_resolution=use_native_res,
+                        )
+                    elif use_spectacle and spectacle_grabber:
+                        f_raw = spectacle_grabber.grab()
+                        if f_raw is not None:
+                            render_cursor_on_frame(
+                                f_raw,
+                                monitor_left=mon_left,
+                                monitor_top=mon_top,
+                                scale_factor=screen_dpr,
+                            )
+                    elif use_fast_gdi and fast_gdi_grabber:
+                        f_raw = fast_gdi_grabber.grab()
+                        if f_raw is not None:
+                            render_cursor_on_frame(
+                                f_raw,
+                                monitor_left=mon_left,
+                                monitor_top=mon_top,
+                                scale_factor=screen_dpr,
+                            )
+                    else:
+                        sct_frame = sct.grab(monitor)
+                        f_raw = np.frombuffer(sct_frame.raw, dtype=np.uint8).reshape((sct_frame.height, sct_frame.width, 4))
+                        if f_raw is not None:
+                            render_cursor_on_frame(
+                                f_raw,
+                                monitor_left=mon_left,
+                                monitor_top=mon_top,
+                                scale_factor=screen_dpr,
+                            )
+                except Exception:
+                    f_raw = None
 
-                if self.raw_queue.full():
-                    try:
-                        self.raw_queue.get_nowait()
-                    except queue.Empty:
-                        pass
+                t_frame_end = time.perf_counter()
+                cap_ms = (t_frame_end - t_frame_start) * 1000.0
 
-                self.raw_queue.put_nowait((frame_counter, frame_raw, cap_ms))
-                frame_counter += 1
+                if f_raw is not None:
+                    if self.raw_queue.full():
+                        try:
+                            self.raw_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                    self.raw_queue.put_nowait((frame_counter, f_raw, cap_ms))
+                    frame_counter += 1
 
-                frame_elapsed = time.perf_counter() - t_frame_start
+                elapsed = time.perf_counter() - t_frame_start
                 target_frame_time = 1.0 / max(1, self.fps_limit)
-                sleep_sec = target_frame_time - frame_elapsed
+                sleep_sec = target_frame_time - elapsed
 
                 if sleep_sec > 0.002:
                     time.sleep(sleep_sec - 0.001)
 
-        capture_running[0] = False
         self.pipeline_running = False
-        cap_worker.join(timeout=0.3)
         enc_worker.join(timeout=0.3)
         net_worker.join(timeout=0.3)
 
