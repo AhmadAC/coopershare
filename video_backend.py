@@ -48,7 +48,6 @@ class GUID(Structure):
 
 
 def make_guid(d1: int, d2: int, d3: int, b1: int, b2: int, b3: int, b4: int, b5: int, b6: int, b7: int, b8: int) -> GUID:
-    """Byte-exact binary GUID construction using memmove to prevent ctypes array truncation."""
     g = GUID()
     g.Data1 = d1
     g.Data2 = d2
@@ -58,7 +57,6 @@ def make_guid(d1: int, d2: int, d3: int, b1: int, b2: int, b3: int, b4: int, b5:
     return g
 
 
-# Official DirectX / DXGI Interface Identifiers
 IID_IUnknown = make_guid(0x00000000, 0x0000, 0x0000, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46)
 IID_IDXGIFactory1 = make_guid(0x770AAE78, 0xF26F, 0x4DBA, 0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87)
 IID_IDXGIAdapter = make_guid(0x2411E7E1, 0x12AC, 0x4CCF, 0xBD, 0x14, 0x97, 0x98, 0xE8, 0x53, 0x4D, 0x00)
@@ -173,9 +171,6 @@ class DXGI_OUTDUPL_FRAME_INFO(Structure):
     ]
 
 
-# ---------------------------------------------------------------------------
-# Explicit 64-bit Prototype Bindings for D3D11 & DXGI Core Functions
-# ---------------------------------------------------------------------------
 if sys.platform == "win32":
     try:
         ctypes.windll.d3d11.D3D11CreateDevice.argtypes = [
@@ -236,11 +231,9 @@ class WindowsDXGIGrabber:
     def _initialize(self) -> bool:
         self._cleanup()
 
-        # Probe Strategy 1: Factory Enumeration & Adapter-Bound Context
         if self._try_init_via_factory():
             return True
 
-        # Probe Strategy 2: Direct Hardware D3D11 Device -> DXGIDevice -> Adapter -> Output1
         if self._try_init_default_hardware():
             return True
 
@@ -542,15 +535,14 @@ class WindowsDXGIGrabber:
             else:
                 frame_bgra = raw_arr[:, :expected_line].reshape((self.height, self.width, 4))
 
-            frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
             unmap_func(self.p_context, self.p_staging_tex, 0)
 
             if not self.first_frame_logged:
                 print(f"[DXGI-Perf] First hardware GPU frame captured successfully ({self.width}x{self.height})", flush=True)
                 self.first_frame_logged = True
 
-            self.last_frame = frame_bgr
-            return frame_bgr
+            self.last_frame = frame_bgra
+            return frame_bgra
 
         except Exception:
             _release_com_ptr(p_desktop_tex)
@@ -652,7 +644,7 @@ class WindowsFastGDIGrabber:
             buf_size = self.width * self.height * 4
             c_buf = (c_ubyte * buf_size).from_address(self.p_bits.value)
             raw_4ch = np.frombuffer(c_buf, dtype=np.uint8).reshape((self.height, self.width, 4))
-            return cv2.cvtColor(raw_4ch, cv2.COLOR_BGRA2BGR)
+            return raw_4ch
         except Exception:
             return None
 

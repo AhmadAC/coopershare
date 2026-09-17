@@ -1,3 +1,5 @@
+#################### START OF FILE: receiver.py ####################
+
 # receiver.py
 
 """
@@ -1013,7 +1015,12 @@ class DiscoveryBeaconThread(QThread):
                 local_ip = get_local_ip()
                 pin_req = bool(self.get_pin_req_func())
                 payload = json.dumps(
-                    {"service": "MrCoopersScreenShare", "ip": local_ip, "pin_required": pin_req}
+                    {
+                        "service": "MrCoopersScreenShare",
+                        "ip": local_ip,
+                        "pin_required": pin_req,
+                        "h264_supported": H264_RECEIVER_AVAILABLE,
+                    }
                 ).encode("utf-8")
                 sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
             except Exception as e:
@@ -1100,7 +1107,11 @@ class VideoServerThread(QThread):
                 conn.sendall(struct.pack(">L", len(resp)) + resp)
                 return False
 
-            resp = json.dumps({"auth": True, "msg": "OK"}).encode("utf-8")
+            resp = json.dumps({
+                "auth": True,
+                "msg": "OK",
+                "h264_supported": H264_RECEIVER_AVAILABLE,
+            }).encode("utf-8")
             conn.sendall(struct.pack(">L", len(resp)) + resp)
             conn.settimeout(None)
             return True
@@ -1115,7 +1126,7 @@ class VideoServerThread(QThread):
         except Exception:
             pass
 
-        conn.settimeout(1.0)
+        conn.settimeout(1.5)
         header_buf = bytearray(4)
         header_mv = memoryview(header_buf)
         frame_buf = bytearray(4 * 1024 * 1024)
@@ -1124,7 +1135,9 @@ class VideoServerThread(QThread):
         if H264_RECEIVER_AVAILABLE:
             try:
                 codec = av.CodecContext.create("h264", "r")
+                codec.open()
                 h264_decoder = codec
+                logger.info("Initialized PyAV low-latency H.264 video decoder.")
             except Exception as ex:
                 logger.warning(f"Could not open PyAV H.264 decoder: {ex}")
                 h264_decoder = None
@@ -1148,19 +1161,23 @@ class VideoServerThread(QThread):
                 raw_bytes = bytes(frame_mv)
 
                 # Decode True H.264 video streams
-                if raw_bytes.startswith(b"H264") and h264_decoder is not None:
-                    h264_data = raw_bytes[4:]
-                    try:
-                        packet = av.Packet(h264_data)
-                        frames = h264_decoder.decode(packet)
-                        for f in frames:
-                            bgr = f.to_ndarray(format="bgr24")
-                            h, w, ch = bgr.shape
-                            qimg = QImage(bgr.data, w, h, ch * w, QImage.Format_BGR888).copy()
-                            self.frame_received.emit(qimg)
+                if raw_bytes.startswith(b"H264"):
+                    if h264_decoder is not None:
+                        h264_data = raw_bytes[4:]
+                        try:
+                            packet = av.Packet(h264_data)
+                            frames = h264_decoder.decode(packet)
+                            for f in frames:
+                                bgr = np.ascontiguousarray(f.to_ndarray(format="bgr24"))
+                                h, w, ch = bgr.shape
+                                qimg = QImage(bgr.data, w, h, ch * w, QImage.Format_BGR888).copy()
+                                self.frame_received.emit(qimg)
+                            continue
+                        except Exception as ex:
+                            logger.error(f"H.264 frame decode error: {ex}")
+                            continue
+                    else:
                         continue
-                    except Exception:
-                        pass
 
                 # Turbo-JPEG Fallback
                 if raw_bytes.startswith(b"JPEG"):
@@ -1177,9 +1194,17 @@ class VideoServerThread(QThread):
 
             except (ConnectionResetError, BrokenPipeError):
                 break
+            except socket.timeout:
+                continue
             except Exception as ex:
                 logger.error(f"Video client processing error from {client_ip}: {ex}")
                 break
+
+        if h264_decoder is not None:
+            try:
+                h264_decoder.close()
+            except Exception:
+                pass
 
         try:
             conn.close()

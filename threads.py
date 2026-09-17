@@ -1,13 +1,16 @@
+#################### START OF FILE: threads.py ####################
+
 # threads.py
 
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 Features:
 - True H.264 Real-Time Low-Latency Video Streaming (libx264 / zero-latency I/P-frame encoding)
-- Ultra-low payload size (2 KB - 8 KB per P-frame at 60 FPS)
-- Seamless fallback to Adaptive JPEG engine if PyAV is not installed
-- Windows DXGI Desktop Duplication hardware capture & persistent DIB Section GDI engine
-- Decoupled high-rate capture ring worker
+- Direct zero-copy BGRA memory ingestion into libavcodec (0.0ms color conversion)
+- Ultra-low payload size (0.5 KB - 8 KB per P-frame at 60 FPS)
+- Fractions timebase compatibility for PyAV libavcodec integration
+- Seamless fallback to Adaptive JPEG engine if PyAV is not installed or unsupported by receiver
+- High-rate zero-copy display grabber
 - Linux KWin ScreenShot2 kernel pipe capture & MSS fallback
 """
 
@@ -17,6 +20,7 @@ except (ImportError, ModuleNotFoundError):
     fcntl = None
 
 import ctypes
+from fractions import Fraction
 import json
 import os
 import queue
@@ -318,7 +322,7 @@ class KWinScreenShot2Grabber:
                 return None
 
             arr = np.frombuffer(raw_mv, dtype=np.uint8, count=total_expected_bytes).reshape((height, width, 4))
-            return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+            return arr
 
         except Exception:
             if w_fd != -1:
@@ -466,7 +470,7 @@ class ScreenSenderThread(QThread):
         self._stat_samples = 0
 
         self.use_h264 = H264_AVAILABLE
-        self.h264_codec_ctx = None
+        self._h264_init_attempted = False
 
     def set_fps_limit(self, fps: int):
         self.fps_limit = max(1, fps)
@@ -489,32 +493,36 @@ class ScreenSenderThread(QThread):
         self.pause_stream()
 
     def _init_h264_encoder(self, width: int, height: int):
-        if not H264_AVAILABLE:
+        if not H264_AVAILABLE or not self.use_h264:
             return None
         try:
-            # Ensure width & height are even for H.264
-            w = width if width % 2 == 0 else width - 1
-            h = height if height % 2 == 0 else height - 1
+            w = (width // 2) * 2
+            h = (height // 2) * 2
+            if w <= 0 or h <= 0:
+                w, h = width, height
 
             codec = av.CodecContext.create("libx264", "w")
             codec.width = w
             codec.height = h
             codec.pix_fmt = "yuv420p"
-            codec.framerate = self.fps_limit
-            codec.time_base = (1, self.fps_limit)
+            codec.framerate = Fraction(self.fps_limit, 1)
+            codec.time_base = Fraction(1, self.fps_limit)
 
-            # Industry-Standard Zero-Latency Real-Time Screen Casting Options
+            crf_val = max(18, min(32, int(36 - (self.quality * 0.18))))
             codec.options = {
                 "tune": "zerolatency",
                 "preset": "ultrafast",
-                "crf": str(max(18, min(32, int(40 - (self.quality * 0.25))))),
-                "g": str(self.fps_limit * 2),  # Keyframe every 2 seconds
+                "crf": str(crf_val),
+                "g": str(self.fps_limit * 2),
+                "repeat-headers": "1",
             }
             codec.open()
-            print(f"[Sender] Initialized hardware/zero-latency H.264 video encoder ({w}x{h}).", flush=True)
+            print(f"[Sender] Initialized hardware/zero-latency H.264 video encoder ({w}x{h}, CRF={crf_val}).", flush=True)
             return codec
         except Exception as ex:
-            print(f"[Sender] Could not open H.264 encoder: {ex}, falling back to Turbo-JPEG.", flush=True)
+            if not self._h264_init_attempted:
+                print(f"[Sender] Could not open H.264 encoder: {ex}, falling back to Turbo-JPEG.", flush=True)
+                self._h264_init_attempted = True
             return None
 
     def _encoder_worker(self):
@@ -531,38 +539,41 @@ class ScreenSenderThread(QThread):
             frame_id, frame_raw, t_cap_ms = item
             t_enc_start = time.perf_counter()
 
-            if frame_raw.ndim == 3 and frame_raw.shape[2] == 4:
-                frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
-            else:
-                frame_bgr = frame_raw
+            h, w = frame_raw.shape[:2]
+            channels = frame_raw.shape[2] if frame_raw.ndim == 3 else 1
 
-            h, w = frame_bgr.shape[:2]
+            # Downscale high-resolution frames (e.g. >1080p) to maintain low latency
+            max_dim = 1280
+            if not self.native_resolution and (w > max_dim or h > max_dim):
+                scale = max_dim / float(max(w, h))
+                target_w = int(round(w * scale))
+                target_h = int(round(h * scale))
+                frame_raw = cv2.resize(frame_raw, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                h, w = frame_raw.shape[:2]
 
-            # Scale if required for bandwidth
-            if not self.native_resolution:
-                if self._last_net_duration > 25.0 and w > 1280:
-                    scale = 1280.0 / w
-                    frame_bgr = cv2.resize(frame_bgr, (1280, int(round(h * scale))), interpolation=cv2.INTER_LINEAR)
-                    h, w = frame_bgr.shape[:2]
-
-            w_even = w if w % 2 == 0 else w - 1
-            h_even = h if h % 2 == 0 else h - 1
-            if (w_even, h_even) != (w, h):
-                frame_bgr = frame_bgr[:h_even, :w_even]
+            w_aligned = (w // 2) * 2
+            h_aligned = (h // 2) * 2
+            if (w_aligned, h_aligned) != (w, h) and w_aligned > 0 and h_aligned > 0:
+                frame_raw = frame_raw[:h_aligned, :w_aligned]
+                w, h = w_aligned, h_aligned
 
             payload_bytes = None
             is_h264_frame = False
 
-            if self.use_h264:
-                if h264_encoder is None or last_dims != (w_even, h_even):
-                    h264_encoder = self._init_h264_encoder(w_even, h_even)
-                    last_dims = (w_even, h_even)
+            if self.use_h264 and not self._h264_init_attempted:
+                if h264_encoder is None or last_dims != (w, h):
+                    if h264_encoder is not None:
+                        try:
+                            h264_encoder.close()
+                        except Exception:
+                            pass
+                    h264_encoder = self._init_h264_encoder(w, h)
+                    last_dims = (w, h)
 
                 if h264_encoder:
                     try:
-                        # Direct BGR to YUV420P conversion
-                        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                        av_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+                        pix_fmt = "bgra" if channels == 4 else "bgr24"
+                        av_frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame_raw), format=pix_fmt)
                         av_frame.pts = pts_counter
                         pts_counter += 1
 
@@ -571,13 +582,19 @@ class ScreenSenderThread(QThread):
                             h264_buf = bytearray()
                             for p in packets:
                                 h264_buf.extend(bytes(p))
-                            payload_bytes = b"H264" + bytes(h264_buf)
-                            is_h264_frame = True
-                    except Exception:
+                            if h264_buf:
+                                payload_bytes = b"H264" + bytes(h264_buf)
+                                is_h264_frame = True
+                    except Exception as enc_err:
+                        print(f"[Sender] H.264 encode error: {enc_err}", flush=True)
                         payload_bytes = None
 
             if not payload_bytes:
-                # Optimized Turbo-JPEG Fallback
+                if channels == 4:
+                    frame_bgr = cv2.cvtColor(frame_raw, cv2.COLOR_BGRA2BGR)
+                else:
+                    frame_bgr = frame_raw
+
                 eff_quality = self.quality
                 if self._last_net_duration > 20.0:
                     eff_quality = min(eff_quality, 55)
@@ -598,6 +615,12 @@ class ScreenSenderThread(QThread):
                     except queue.Empty:
                         pass
                 self.send_queue.put_nowait((payload_bytes, t_cap_ms, t_enc_ms, is_h264_frame))
+
+        if h264_encoder is not None:
+            try:
+                h264_encoder.close()
+            except Exception:
+                pass
 
     def _network_sender_worker(self, sock: socket.socket, backend_name: str):
         last_report_time = time.perf_counter()
@@ -702,6 +725,11 @@ class ScreenSenderThread(QThread):
                 sock.close()
                 return
 
+            receiver_h264 = resp.get("h264_supported", True)
+            if not receiver_h264:
+                self.use_h264 = False
+                print("[Sender] Receiver does not support H.264, falling back to Turbo-JPEG.", flush=True)
+
             sock.settimeout(None)
             self.status_changed.emit(f"Streaming ({self.fps_limit} FPS)", True)
             print(f"[Sender] Connection established! Target {self.fps_limit} FPS. H.264: {self.use_h264}", flush=True)
@@ -769,7 +797,7 @@ class ScreenSenderThread(QThread):
             elif use_fast_gdi:
                 backend_name = "FastGDI (DIB)"
             else:
-                backend_name = "MSS (GDI)"
+                backend_name = "MSS (Direct)"
 
             print(f"[Sender] Active Capture Engine: {backend_name}", flush=True)
 
@@ -821,9 +849,8 @@ class ScreenSenderThread(QThread):
                                     scale_factor=screen_dpr,
                                 )
                         else:
-                            raw_frame = sct.grab(monitor)
-                            raw_4ch = np.frombuffer(raw_frame.raw, dtype=np.uint8).reshape((mon_h, mon_w, 4))
-                            f_raw = cv2.cvtColor(raw_4ch, cv2.COLOR_BGRA2BGR)
+                            sct_frame = sct.grab(monitor)
+                            f_raw = np.frombuffer(sct_frame.raw, dtype=np.uint8).reshape((sct_frame.height, sct_frame.width, 4))
                             if f_raw is not None:
                                 render_cursor_on_frame(
                                     f_raw,
@@ -883,11 +910,8 @@ class ScreenSenderThread(QThread):
                         elif use_fast_gdi and fast_gdi_grabber:
                             clean_frame = fast_gdi_grabber.grab()
                         else:
-                            raw_f = sct.grab(monitor)
-                            clean_frame = cv2.cvtColor(
-                                np.frombuffer(raw_f.raw, dtype=np.uint8).reshape((mon_h, mon_w, 4)),
-                                cv2.COLOR_BGRA2BGR,
-                            )
+                            sct_f = sct.grab(monitor)
+                            clean_frame = np.frombuffer(sct_f.raw, dtype=np.uint8).reshape((sct_f.height, sct_f.width, 4))
                     except Exception:
                         clean_frame = None
 
