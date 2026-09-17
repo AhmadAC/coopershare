@@ -9,6 +9,7 @@ vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 mo
 cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WirePlumber),
 toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, Windows DWM capture exclusion,
 multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown,
+graceful handling of remote TV receiver shutdown,
 and z-order guarded topmost dropdown popups that always render in front of the GUI on Windows 11.
 """
 
@@ -849,10 +850,10 @@ class FloatingSenderWindow(QWidget):
         ip_row.addWidget(self.connect_btn)
         self.card_layout.addLayout(ip_row)
 
-        # Row 2: Real-time Low-Latency Streaming Presets (Industry Standard)
+        # Row 2: Streaming Presets (60 FPS & 30 FPS, High Quality Standards)
         qual_row = QHBoxLayout()
         self.fps_combo = TopmostComboBox()
-        self.fps_combo.addItems(["60 FPS (Ultra Smooth)", "30 FPS (Standard)", "120 FPS", "15 FPS"])
+        self.fps_combo.addItems(["60 FPS (Ultra Smooth)", "30 FPS (Standard)"])
         saved_fps = self.history_data.get("fps_preset", "")
         if saved_fps:
             matched_f = -1
@@ -869,7 +870,6 @@ class FloatingSenderWindow(QWidget):
         self.quality_combo = TopmostComboBox()
         self.quality_combo.addItems(
             [
-                "Ultra Smooth (60 FPS Fast)",
                 "Balanced HD (72%)",
                 "High Quality HD (82%)",
                 "Studio Crisp (88% 4:4:4)",
@@ -891,9 +891,6 @@ class FloatingSenderWindow(QWidget):
                     matched_q = i
                     break
                 elif "balanced" in str(saved_quality).lower() and "balanced" in txt.lower():
-                    matched_q = i
-                    break
-                elif "ultra" in str(saved_quality).lower() and "ultra" in txt.lower():
                     matched_q = i
                     break
             self.quality_combo.setCurrentIndex(matched_q if matched_q != -1 else 0)
@@ -1614,7 +1611,7 @@ class FloatingSenderWindow(QWidget):
             self.enforce_always_on_top()
 
     def on_fps_changed(self, index: int):
-        fps_map = {0: 60, 1: 30, 2: 120, 3: 15}
+        fps_map = {0: 60, 1: 30}
         chosen_fps = fps_map.get(index, 60)
 
         self.history_data["fps_preset"] = self.fps_combo.currentText()
@@ -1633,10 +1630,8 @@ class FloatingSenderWindow(QWidget):
             return 88, True, True
         elif "high" in text or "82%" in text:
             return 82, False, False
-        elif "balanced" in text or "72%" in text:
-            return 72, False, False
         else:
-            return 68, False, False
+            return 72, False, False
 
     def on_quality_changed(self, index: int):
         target_quality, use_444, native_res = self._get_quality_settings(index)
@@ -1714,7 +1709,7 @@ class FloatingSenderWindow(QWidget):
             print("[Sender-Main] Cannot start: No target IP specified.", flush=True)
             return
 
-        fps_map = {0: 60, 1: 30, 2: 120, 3: 15}
+        fps_map = {0: 60, 1: 30}
         chosen_fps = fps_map.get(self.fps_combo.currentIndex(), 60)
         pin_code = self.pin_input.text().strip()
 
@@ -1747,10 +1742,17 @@ class FloatingSenderWindow(QWidget):
     def stop_sharing(self):
         print("\n[Sender-Main] Stopping screen share session...", flush=True)
         if self.stream_thread:
-            self.stream_thread.stop()
+            try:
+                self.stream_thread.stop()
+            except Exception:
+                pass
             self.stream_thread = None
+
         if self.audio_thread:
-            self.audio_thread.stop()
+            try:
+                self.audio_thread.stop()
+            except Exception:
+                pass
             self.audio_thread = None
 
         self.is_paused = False
@@ -1766,7 +1768,10 @@ class FloatingSenderWindow(QWidget):
             self.viewer_window = None
 
         if self.control_thread and not self.viewer_window:
-            self.control_thread.stop()
+            try:
+                self.control_thread.stop()
+            except Exception:
+                pass
             self.control_thread = None
 
         self.connect_btn.setText("Share")
@@ -1778,7 +1783,7 @@ class FloatingSenderWindow(QWidget):
         self.stream_mute_btn.setEnabled(False)
 
         self._update_status_color("#8f9bb3")
-        print("[Sender-Main] Session stopped.", flush=True)
+        print("[Sender-Main] Session stopped gracefully.", flush=True)
 
     def toggle_pause(self):
         if self.stream_thread:
@@ -1828,13 +1833,7 @@ class FloatingSenderWindow(QWidget):
     def on_stream_status(self, text: str, active: bool):
         if active:
             color = "#f37021" if self.is_paused else "#00d084"
-        else:
-            color = "#d83b01"
-            self.fps_badge.setVisible(False)
-            self.fps_badge.setText("")
-        self._update_status_color(color)
-
-        if active:
+            self._update_status_color(color)
             connected_ip = self.get_selected_target_ip() or self.discovered_ip
             if connected_ip:
                 self.history_data["last_ip"] = connected_ip
@@ -1842,8 +1841,17 @@ class FloatingSenderWindow(QWidget):
                     self.history_data.setdefault("devices", {})[connected_ip] = ""
                 self._schedule_history_save()
         else:
-            if not self.viewer_window:
-                self.stop_sharing()
+            color = "#d83b01"
+            self.fps_badge.setVisible(False)
+            self.fps_badge.setText("")
+            self._update_status_color(color)
+            # Dispatch teardown to next Qt event loop iteration to avoid deadlock
+            QTimer.singleShot(0, self._handle_remote_disconnect)
+
+    def _handle_remote_disconnect(self):
+        if self.stream_thread or self.audio_thread or (self.connect_btn.text() == "Stop"):
+            print("[Sender-Main] Receiver disconnected or closed remotely. Resetting session...", flush=True)
+            self.stop_sharing()
 
     def _update_status_color(self, color_hex: str):
         self.status_color = color_hex

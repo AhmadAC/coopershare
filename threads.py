@@ -540,7 +540,6 @@ class ScreenSenderThread(QThread):
             h, w = frame_raw.shape[:2]
             channels = frame_raw.shape[2] if frame_raw.ndim == 3 else 1
 
-            # When falling back to Turbo-JPEG, resize 1440p+ to avoid saturating network
             if (not self.use_h264 or self._h264_init_attempted) and not self.native_resolution:
                 max_bound = 1280
                 if w > max_bound or h > max_bound:
@@ -639,9 +638,13 @@ class ScreenSenderThread(QThread):
             t_send_start = time.perf_counter()
             try:
                 sock.sendall(struct.pack(">L", len(data)) + data)
+            except (ConnectionResetError, BrokenPipeError, socket.error, OSError):
+                self.pipeline_running = False
+                break
             except Exception:
                 self.pipeline_running = False
                 break
+
             t_send_end = time.perf_counter()
             net_ms = (t_send_end - t_send_start) * 1000.0
             self._last_net_duration = net_ms
@@ -1017,6 +1020,8 @@ class AudioSenderThread(QThread):
                 if chunk and self.sock:
                     try:
                         self.sock.sendall(chunk)
+                    except (ConnectionResetError, BrokenPipeError, socket.error, OSError):
+                        break
                     except Exception:
                         break
                 else:
@@ -1041,6 +1046,8 @@ class AudioSenderThread(QThread):
                                     self.sock.sendall(scaled.tobytes())
                                 else:
                                     self.sock.sendall(indata.tobytes())
+                        except (ConnectionResetError, BrokenPipeError, socket.error, OSError):
+                            self.running = False
                         except Exception:
                             pass
 
@@ -1116,6 +1123,12 @@ class InputReceiverThread(QThread):
                 try:
                     data = json.dumps(cmd).encode("utf-8")
                     self.sock.sendall(struct.pack(">L", len(data)) + data)
+                except (ConnectionResetError, BrokenPipeError, socket.error, OSError):
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
                 except Exception:
                     try:
                         self.sock.close()
@@ -1158,6 +1171,16 @@ class InputReceiverThread(QThread):
             except socket.timeout:
                 continue
             except (BlockingIOError, InterruptedError):
+                continue
+            except (ConnectionResetError, BrokenPipeError, socket.error, OSError):
+                with self._send_lock:
+                    try:
+                        if self.sock:
+                            self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+                self.msleep(300)
                 continue
             except Exception:
                 with self._send_lock:
@@ -1275,7 +1298,7 @@ class ReverseScreenReceiverThread(QThread):
                     qimg = QImage(img.data, w, h, ch * w, QImage.Format_BGR888).copy()
                     self.frame_received.emit(qimg)
 
-            except ConnectionResetError:
+            except (ConnectionResetError, BrokenPipeError, socket.error, OSError):
                 break
             except Exception:
                 break
