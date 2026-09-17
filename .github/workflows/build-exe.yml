@@ -2,10 +2,10 @@ name: Build MrCoopersScreenShare Executables
 
 on:
   push:
-    branches: [ "realbad", "master" ]
+    branches: [ "realbad", "master", "main" ]
     tags: [ "v*" ]
   pull_request:
-    branches: [ "realbad", "master" ]
+    branches: [ "realbad", "master", "main" ]
   workflow_dispatch:
 
 jobs:
@@ -17,10 +17,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14.6"
+          python-version: "3.12"
           cache: "pip"
 
       - name: Install Python Dependencies
@@ -35,7 +35,6 @@ jobs:
             --icon "icon.ico" `
             --add-data "icon.ico;." `
             --add-data "icon.png;." `
-            --add-data "sender.py;." `
             --hidden-import "sounddevice" `
             --hidden-import "pynput" `
             --hidden-import "pynput.keyboard._win32" `
@@ -44,6 +43,17 @@ jobs:
             --hidden-import "cv2" `
             --hidden-import "av" `
             --hidden-import "PySide6.QtSvg" `
+            --hidden-import "PySide6.QtCore" `
+            --hidden-import "PySide6.QtGui" `
+            --hidden-import "PySide6.QtWidgets" `
+            --hidden-import "audio_backend" `
+            --hidden-import "config" `
+            --hidden-import "input_backend" `
+            --hidden-import "threads" `
+            --hidden-import "ui_main" `
+            --hidden-import "ui_viewer" `
+            --hidden-import "utils" `
+            --hidden-import "video_backend" `
             sender.py
 
       - name: Build receiver (onedir) with PyInstaller
@@ -53,7 +63,6 @@ jobs:
             --icon "icon.ico" `
             --add-data "icon.ico;." `
             --add-data "icon.png;." `
-            --add-data "receiver.py;." `
             --hidden-import "sounddevice" `
             --hidden-import "pynput" `
             --hidden-import "pynput.keyboard._win32" `
@@ -62,37 +71,54 @@ jobs:
             --hidden-import "cv2" `
             --hidden-import "av" `
             --hidden-import "PySide6.QtSvg" `
+            --hidden-import "PySide6.QtCore" `
+            --hidden-import "PySide6.QtGui" `
+            --hidden-import "PySide6.QtWidgets" `
+            --hidden-import "audio_backend" `
+            --hidden-import "config" `
+            --hidden-import "input_backend" `
+            --hidden-import "threads" `
+            --hidden-import "ui_main" `
+            --hidden-import "ui_viewer" `
+            --hidden-import "utils" `
+            --hidden-import "video_backend" `
             receiver.py
 
-      - name: Bundle assets & create portable ZIP archives
+      - name: Bundle raw scripts & assets into onedir folders
         run: |
-          Copy-Item "sender.py" -Destination "dist\sender\sender.py" -Force
-          Copy-Item "receiver.py" -Destination "dist\receiver\receiver.py" -Force
-          Copy-Item "icon.ico" -Destination "dist\sender\icon.ico" -ErrorAction SilentlyContinue
-          Copy-Item "icon.png" -Destination "dist\sender\icon.png" -ErrorAction SilentlyContinue
-          Copy-Item "icon.ico" -Destination "dist\receiver\icon.ico" -ErrorAction SilentlyContinue
-          Copy-Item "icon.png" -Destination "dist\receiver\icon.png" -ErrorAction SilentlyContinue
+          if (-not (Test-Path "dist\sender\sender.exe")) {
+            throw "sender.exe was not created in dist\sender"
+          }
+          if (-not (Test-Path "dist\receiver\receiver.exe")) {
+            throw "receiver.exe was not created in dist\receiver"
+          }
+
           Get-ChildItem -Path . -Filter "*.py" | ForEach-Object {
             Copy-Item $_.FullName -Destination "dist\sender\" -Force
             Copy-Item $_.FullName -Destination "dist\receiver\" -Force
           }
-          Compress-Archive -Path "dist\sender" -DestinationPath "dist\MrCoopersScreenShare-Sender-Windows.zip" -CompressionLevel Optimal
-          Compress-Archive -Path "dist\receiver" -DestinationPath "dist\MrCoopersScreenShare-Receiver-Windows.zip" -CompressionLevel Optimal
 
-      # Separate Upload 1: Sender ZIP
+          Copy-Item "icon.ico" -Destination "dist\sender\icon.ico" -ErrorAction SilentlyContinue
+          Copy-Item "icon.png" -Destination "dist\sender\icon.png" -ErrorAction SilentlyContinue
+          Copy-Item "icon.ico" -Destination "dist\receiver\icon.ico" -ErrorAction SilentlyContinue
+          Copy-Item "icon.png" -Destination "dist\receiver\icon.png" -ErrorAction SilentlyContinue
+          Copy-Item "history.json" -Destination "dist\sender\history.json" -ErrorAction SilentlyContinue
+          Copy-Item "receiver_config.json" -Destination "dist\receiver\receiver_config.json" -ErrorAction SilentlyContinue
+
+      # Upload Sender (GitHub Actions automatically creates a single ZIP)
       - name: Upload Sender Artifact
         uses: actions/upload-artifact@v4
         with:
           name: MrCoopersScreenShare-Sender-Windows
-          path: dist/MrCoopersScreenShare-Sender-Windows.zip
+          path: dist/sender
           retention-days: 14
 
-      # Separate Upload 2: Receiver ZIP
+      # Upload Receiver (GitHub Actions automatically creates a single ZIP)
       - name: Upload Receiver Artifact
         uses: actions/upload-artifact@v4
         with:
           name: MrCoopersScreenShare-Receiver-Windows
-          path: dist/MrCoopersScreenShare-Receiver-Windows.zip
+          path: dist/receiver
           retention-days: 14
 
   create-release:
@@ -104,13 +130,22 @@ jobs:
       contents: write
 
     steps:
-      # Downloads all artifacts and merges them into `release-assets/` directly
       - name: Download Windows Artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: 'MrCoopersScreenShare-*'
-          path: release-assets
-          merge-multiple: true
+          path: release-temp
+
+      - name: Package Release ZIP Archives
+        run: |
+          mkdir -p release-assets
+          cd release-temp
+          if [ -d "MrCoopersScreenShare-Sender-Windows" ]; then
+            cd MrCoopersScreenShare-Sender-Windows && zip -r ../../release-assets/MrCoopersScreenShare-Sender-Windows.zip . && cd ..
+          fi
+          if [ -d "MrCoopersScreenShare-Receiver-Windows" ]; then
+            cd MrCoopersScreenShare-Receiver-Windows && zip -r ../../release-assets/MrCoopersScreenShare-Receiver-Windows.zip . && cd ..
+          fi
+          cd ..
 
       - name: Create Release and Upload Zip Archives
         uses: softprops/action-gh-release@v2
