@@ -6,9 +6,10 @@
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 Features:
 - Windows DXGI Desktop Duplication hardware capture (sub-1ms VRAM reading)
-- Dual parallel multithreaded JPEG encoders to remove the single-core CPU bottleneck and reach 60 FPS
-- Detailed live console verbose performance telemetry every second
-- Linux KWin ScreenShot2 kernel pipe capture and MSS fallback
+- High-speed persistent DIB Section GDI fallback grabber
+- Parallel dual-threaded SIMD JPEG encoders bypassing the CPU core bottleneck to achieve 60 FPS
+- Live verbose performance telemetry every second
+- Linux KWin ScreenShot2 kernel pipe capture & MSS fallback
 """
 
 try:
@@ -52,7 +53,11 @@ from config import (
 )
 from input_backend import UniversalInputInjector
 from utils import create_mss_instance, ensure_kde_desktop_entry, recv_exact
-from video_backend import WindowsDXGIGrabber, render_cursor_on_frame
+from video_backend import (
+    WindowsDXGIGrabber,
+    WindowsFastGDIGrabber,
+    render_cursor_on_frame,
+)
 
 if AUDIO_AVAILABLE:
     import sounddevice as sd
@@ -479,7 +484,7 @@ class ScreenSenderThread(QThread):
         self.pause_stream()
 
     def _encoder_worker(self, worker_id: int):
-        """High-speed worker: Encodes in parallel across CPU cores to bypass single-core bottlenecks."""
+        """Encodes frames in parallel across cores to bypass single-core CPU limitations."""
         while self.pipeline_running:
             try:
                 item = self.raw_queue.get(timeout=0.04)
@@ -516,7 +521,6 @@ class ScreenSenderThread(QThread):
                 with self.encoded_lock:
                     self.encoded_stash[frame_id] = (data, t_cap_ms, t_enc_ms)
 
-                    # In-order dispatch to socket queue
                     while self.next_send_id in self.encoded_stash:
                         dispatch_item = self.encoded_stash.pop(self.next_send_id)
                         self.next_send_id += 1
@@ -528,7 +532,6 @@ class ScreenSenderThread(QThread):
                         self.send_queue.put_nowait(dispatch_item)
 
     def _network_sender_worker(self, sock: socket.socket, backend_name: str):
-        """Dedicated worker for socket transmission and second-by-second terminal telemetry."""
         last_report_time = time.perf_counter()
 
         while self.pipeline_running:
@@ -626,7 +629,7 @@ class ScreenSenderThread(QThread):
 
             sock.settimeout(None)
             self.status_changed.emit(f"Streaming ({self.fps_limit} FPS)", True)
-            print(f"[Sender] Connection established! Starting parallel capture/encode pipeline at target {self.fps_limit} FPS.", flush=True)
+            print(f"[Sender] Connection established! Target {self.fps_limit} FPS.", flush=True)
         except Exception as e:
             self.status_changed.emit(f"Connect Error: {e}", False)
             print(f"[Sender] Failed to connect: {e}", flush=True)
@@ -652,43 +655,8 @@ class ScreenSenderThread(QThread):
 
         dxgi_grabber = None
         use_dxgi = False
-        if sys.platform == "win32":
-            try:
-                dxgi_grabber = WindowsDXGIGrabber(output_index=0)
-                use_dxgi = dxgi_grabber.available
-            except Exception as ex:
-                print(f"[Sender] Windows DXGI initialization exception: {ex}", flush=True)
-                use_dxgi = False
-
-        if use_dxgi:
-            backend_name = "DXGI (GPU)"
-        elif use_kwin:
-            backend_name = "KWin (D-Bus)"
-        elif use_spectacle:
-            backend_name = "Spectacle"
-        else:
-            backend_name = "MSS (GDI)"
-
-        print(f"[Sender] Active Capture Engine: {backend_name}", flush=True)
-
-        self.pipeline_running = True
-        self.next_send_id = 0
-        self.encoded_stash.clear()
-
-        # Dual worker threads: parallel SIMD JPEG encoding across cores
-        enc_worker_1 = threading.Thread(
-            target=self._encoder_worker, args=(1,), name="EncoderWorker-1", daemon=True
-        )
-        enc_worker_2 = threading.Thread(
-            target=self._encoder_worker, args=(2,), name="EncoderWorker-2", daemon=True
-        )
-        net_worker = threading.Thread(
-            target=self._network_sender_worker, args=(sock, backend_name), name="NetSenderWorker", daemon=True
-        )
-
-        enc_worker_1.start()
-        enc_worker_2.start()
-        net_worker.start()
+        fast_gdi_grabber = None
+        use_fast_gdi = False
 
         screen = QGuiApplication.primaryScreen()
         screen_dpr = float(screen.devicePixelRatio()) if screen else 1.0
@@ -699,6 +667,55 @@ class ScreenSenderThread(QThread):
             mon_top = monitor.get("top", 0)
             mon_w = monitor.get("width", 1920)
             mon_h = monitor.get("height", 1080)
+
+            if sys.platform == "win32":
+                try:
+                    dxgi_grabber = WindowsDXGIGrabber(target_monitor_index=0)
+                    use_dxgi = dxgi_grabber.available
+                except Exception as ex:
+                    print(f"[Sender] Windows DXGI exception: {ex}", flush=True)
+                    use_dxgi = False
+
+                if not use_dxgi:
+                    try:
+                        fast_gdi_grabber = WindowsFastGDIGrabber(
+                            mon_left=mon_left, mon_top=mon_top, width=mon_w, height=mon_h
+                        )
+                        use_fast_gdi = fast_gdi_grabber.initialized
+                    except Exception:
+                        use_fast_gdi = False
+
+            if use_dxgi:
+                backend_name = "DXGI (GPU)"
+            elif use_kwin:
+                backend_name = "KWin (D-Bus)"
+            elif use_spectacle:
+                backend_name = "Spectacle"
+            elif use_fast_gdi:
+                backend_name = "FastGDI (DIB)"
+            else:
+                backend_name = "MSS (GDI)"
+
+            print(f"[Sender] Active Capture Engine: {backend_name}", flush=True)
+
+            self.pipeline_running = True
+            self.next_send_id = 0
+            self.encoded_stash.clear()
+
+            enc_worker_1 = threading.Thread(
+                target=self._encoder_worker, args=(1,), name="EncoderWorker-1", daemon=True
+            )
+            enc_worker_2 = threading.Thread(
+                target=self._encoder_worker, args=(2,), name="EncoderWorker-2", daemon=True
+            )
+            net_worker = threading.Thread(
+                target=self._network_sender_worker, args=(sock, backend_name), name="NetSenderWorker", daemon=True
+            )
+
+            enc_worker_1.start()
+            enc_worker_2.start()
+            net_worker.start()
+
             frame_counter = 0
 
             while self.running and self.pipeline_running:
@@ -715,6 +732,8 @@ class ScreenSenderThread(QThread):
                             )
                         elif use_spectacle and spectacle_grabber:
                             clean_frame = spectacle_grabber.grab()
+                        elif use_fast_gdi and fast_gdi_grabber:
+                            clean_frame = fast_gdi_grabber.grab()
                         else:
                             raw_f = sct.grab(monitor)
                             clean_frame = np.frombuffer(
@@ -763,6 +782,15 @@ class ScreenSenderThread(QThread):
                         )
                     elif use_spectacle and spectacle_grabber:
                         frame_raw = spectacle_grabber.grab()
+                        if frame_raw is not None:
+                            render_cursor_on_frame(
+                                frame_raw,
+                                monitor_left=mon_left,
+                                monitor_top=mon_top,
+                                scale_factor=screen_dpr,
+                            )
+                    elif use_fast_gdi and fast_gdi_grabber:
+                        frame_raw = fast_gdi_grabber.grab()
                         if frame_raw is not None:
                             render_cursor_on_frame(
                                 frame_raw,
@@ -824,6 +852,8 @@ class ScreenSenderThread(QThread):
 
         if dxgi_grabber:
             dxgi_grabber.close()
+        if fast_gdi_grabber:
+            fast_gdi_grabber.close()
         if kwin_grabber:
             kwin_grabber.cleanup()
         if spectacle_grabber:
@@ -840,7 +870,7 @@ class ScreenSenderThread(QThread):
             except Exception:
                 pass
 
-        print(f"[Sender] Stream finished.", flush=True)
+        print(f"[Sender] Stream session finished.", flush=True)
         self.status_changed.emit("Disconnected", False)
 
     def stop(self):

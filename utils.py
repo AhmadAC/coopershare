@@ -1,9 +1,11 @@
+#################### START OF FILE: utils.py ####################
+
 # utils.py
 
 """
-Persistence, image generation, low-level socket utilities, SVG vector icon renderers,
+Persistence, low-level high-speed socket memoryview utilities, SVG vector icon renderers,
 KDE Plasma Wayland & uinput permission helpers, and Windows DWM screen capture exclusion.
-Supports generating history.json outside Linux AppImages and frozen executables.
+Supports zero-allocation frame receiving and robust storage resolution across AppImages and frozen bundles.
 """
 
 import ctypes
@@ -332,19 +334,29 @@ SVG_TRASH = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke
 SVG_LOGOUT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>"""
 
 
-def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
-    buf = bytearray()
-    while len(buf) < count:
+def recv_exact_into(sock: socket.socket, buffer: memoryview, count: int) -> bool:
+    """Reads exactly `count` bytes into a preallocated memoryview buffer without allocations."""
+    offset = 0
+    while offset < count:
         try:
-            chunk = sock.recv(count - len(buf))
-            if not chunk:
-                return None
-            buf.extend(chunk)
+            n = sock.recv_into(buffer[offset:], count - offset)
+            if n == 0:
+                return False
+            offset += n
         except (socket.timeout, BlockingIOError):
             continue
         except Exception:
-            return None
-    return bytes(buf)
+            return False
+    return True
+
+
+def recv_exact(sock: socket.socket, count: int) -> Optional[bytes]:
+    """Reads exactly `count` bytes using a fast preallocated memory buffer."""
+    buf = bytearray(count)
+    mv = memoryview(buf)
+    if recv_exact_into(sock, mv, count):
+        return bytes(buf)
+    return None
 
 
 def create_mss_instance():

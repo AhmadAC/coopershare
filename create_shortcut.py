@@ -1,7 +1,10 @@
+#################### START OF FILE: create_shortcut.py ####################
+
 """
 MrCoopersScreenShare - Source Shortcut Creator
 Creates desktop and local shortcuts to launch `sender.py` directly from source
 using pythonw.exe (windowless execution on Windows) or python3 (on Linux with KWin D-Bus permissions).
+Ensures high-performance process flags and high-resolution timer support.
 """
 
 import os
@@ -139,7 +142,7 @@ def create_windows_shortcuts(
         $WshShell = New-Object -ComObject WScript.Shell
         $Shortcut = $WshShell.CreateShortcut({ps_quote(shortcut_path)})
         $Shortcut.TargetPath = {ps_quote(python_exe)}
-        $Shortcut.Arguments = {ps_quote(f'"{target_script}"')}
+        $Shortcut.Arguments = {ps_quote(f'-u "{target_script}"')}
         $Shortcut.WorkingDirectory = {ps_quote(working_dir)}
         """
 

@@ -1,6 +1,10 @@
+#################### START OF FILE: config.py ####################
+
+# config.py
 
 """
-Global configuration constants and environment flags.
+Global configuration constants, socket buffer tuning, and environment flags.
+Tuned for high-framerate 60 FPS streaming across 1Gbps and Wi-Fi 6 LAN networks.
 """
 
 import sys
@@ -13,7 +17,10 @@ REVERSE_VIDEO_PORT = 9992
 
 DEFAULT_SAMPLE_RATE = 48000
 CHANNELS = 2
-SOCKET_BUFFER_SIZE = 4 * 1024 * 1024
+
+# Enlarged TCP window buffers to prevent packet queueing stalls at 60 FPS
+SOCKET_BUFFER_SIZE = 8 * 1024 * 1024
+SOCKET_CHUNK_SIZE = 128 * 1024
 
 try:
     import sounddevice as sd

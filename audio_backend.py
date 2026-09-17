@@ -1,8 +1,11 @@
+#################### START OF FILE: audio_backend.py ####################
+
 # audio_backend.py
+
 """
 Native 64-bit Windows WASAPI Desktop Audio Loopback & Physical Speaker Mute Controller (ctypes COM).
 Cross-platform host speaker mute support for Linux (PipeWire / WirePlumber / PulseAudio / ALSA).
-Provides safe cross-platform fallbacks for non-Windows environments (Linux / macOS).
+Optimized for high-frequency low-latency streaming alongside high-framerate video pipelines.
 """
 
 import ctypes
@@ -31,7 +34,6 @@ import numpy as np
 
 from config import CHANNELS, DEFAULT_SAMPLE_RATE
 
-# Cross-platform fallbacks for Windows-specific ctypes types
 HRESULT = getattr(ctypes, "HRESULT", ctypes.c_long)
 WINFUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 
@@ -128,7 +130,6 @@ class HostAudioController:
         env = _get_clean_host_env()
         val_str = "1" if mute else "0"
 
-        # 1. WirePlumber CLI (wpctl) - Default on Fedora 44 (PipeWire)
         wpctl = shutil.which("wpctl")
         if wpctl:
             for target in ("@DEFAULT_AUDIO_SINK@", "@DEFAULT_SINK@"):
@@ -145,7 +146,6 @@ class HostAudioController:
                 except Exception:
                     pass
 
-        # 2. PulseAudio / PipeWire-Pulse compatibility (pactl)
         pactl = shutil.which("pactl")
         if pactl:
             for target in ("@DEFAULT_SINK@", "0"):
@@ -162,7 +162,6 @@ class HostAudioController:
                 except Exception:
                     pass
 
-        # 3. ALSA (amixer)
         amixer = shutil.which("amixer")
         if amixer:
             action = "mute" if mute else "unmute"
@@ -186,7 +185,6 @@ class HostAudioController:
     def _linux_get_mute(cls) -> bool:
         env = _get_clean_host_env()
 
-        # 1. WirePlumber CLI (wpctl)
         wpctl = shutil.which("wpctl")
         if wpctl:
             for target in ("@DEFAULT_AUDIO_SINK@", "@DEFAULT_SINK@"):
@@ -203,7 +201,6 @@ class HostAudioController:
                 except Exception:
                     pass
 
-        # 2. PulseAudio / PipeWire-Pulse compatibility (pactl)
         pactl = shutil.which("pactl")
         if pactl:
             for target in ("@DEFAULT_SINK@", "0"):
@@ -220,7 +217,6 @@ class HostAudioController:
                 except Exception:
                     pass
 
-        # 3. ALSA (amixer)
         amixer = shutil.which("amixer")
         if amixer:
             try:
@@ -419,6 +415,7 @@ class NativeWindowsWasapiLoopback:
                 fmt.wFormatTag == 0xFFFE and self.bits_per_sample == 32
             )
 
+            # Request 20ms audio buffer to keep packet jitter low
             init_func = WINFUNCTYPE(
                 HRESULT, c_void_p, c_int, c_ulong, c_int64, c_int64, c_void_p, c_void_p
             )(client_vtbl[3])
@@ -426,7 +423,7 @@ class NativeWindowsWasapiLoopback:
                 self.audio_client,
                 AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_LOOPBACK,
-                2000000,
+                200000,
                 0,
                 pwfx,
                 None,
