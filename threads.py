@@ -6,7 +6,7 @@ Features:
 - Windows DXGI Desktop Duplication hardware capture (sub-1ms VRAM reading)
 - High-speed persistent DIB Section GDI fallback grabber
 - Parallel dual-threaded SIMD JPEG encoders bypassing the CPU core bottleneck to achieve 60 FPS
-- Automatic bandwidth management keeping frames under 55 KB for ultra-fast Wi-Fi transmission
+- Automatic bandwidth management keeping frames under 75 KB for ultra-fast Wi-Fi transmission
 - Live verbose performance telemetry every second
 - Linux KWin ScreenShot2 kernel pipe capture & MSS fallback
 """
@@ -491,7 +491,7 @@ class ScreenSenderThread(QThread):
             frame_id, frame_raw, t_cap_ms = item
             t_enc_start = time.perf_counter()
 
-            # Dynamic Bandwidth Budgeting: automatically clamp quality based on real network send time
+            # Industry-Standard Dynamic Bandwidth Budgeting (ABR)
             eff_quality = self.quality
             if self._last_net_duration > 35.0:
                 eff_quality = min(eff_quality, 45)
@@ -720,7 +720,7 @@ class ScreenSenderThread(QThread):
             self.next_send_id = 0
             self.encoded_stash.clear()
 
-            # Dedicated Double-Buffered Capture Worker
+            # High-Performance Asynchronous Double-Buffered Capture Ring
             capture_queue = queue.Queue(maxsize=1)
             capture_running = [True]
 

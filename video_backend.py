@@ -61,7 +61,6 @@ def make_guid(d1: int, d2: int, d3: int, b1: int, b2: int, b3: int, b4: int, b5:
 # Official DirectX / DXGI Interface Identifiers
 IID_IUnknown = make_guid(0x00000000, 0x0000, 0x0000, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46)
 IID_IDXGIFactory1 = make_guid(0x770AAE78, 0xF26F, 0x4DBA, 0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87)
-IID_IDXGIFactory2 = make_guid(0x50C83A1C, 0xE072, 0x4C48, 0x87, 0xB0, 0x36, 0x30, 0xFA, 0x36, 0xA6, 0xD0)
 IID_IDXGIAdapter = make_guid(0x2411E7E1, 0x12AC, 0x4CCF, 0xBD, 0x14, 0x97, 0x98, 0xE8, 0x53, 0x4D, 0x00)
 IID_IDXGIAdapter1 = make_guid(0x29038F61, 0x3839, 0x4626, 0x91, 0xFD, 0x08, 0x68, 0x79, 0x01, 0x1A, 0x05)
 IID_IDXGIDevice = make_guid(0x54EC77FA, 0x1377, 0x44E6, 0x8C, 0x32, 0x88, 0xFD, 0x5F, 0x44, 0xC8, 0x4C)
@@ -184,7 +183,7 @@ if sys.platform == "win32":
             c_int,
             c_void_p,
             c_uint,
-            POINTER(c_uint),
+            c_void_p,
             c_uint,
             c_uint,
             POINTER(c_void_p),
@@ -224,7 +223,7 @@ class WindowsDXGIGrabber:
         self.p_staging_tex = c_void_p()
 
         if sys.platform == "win32":
-            print("[DXGI-Init] Initializing DirectX 11 Desktop Duplication pipeline...", flush=True)
+            print("[DXGI-Init] Probing DirectX 11 Hardware Duplication interfaces...", flush=True)
             self.available = self._initialize()
             if self.available:
                 print(
@@ -237,11 +236,11 @@ class WindowsDXGIGrabber:
     def _initialize(self) -> bool:
         self._cleanup()
 
-        # Strategy 1: Factory Enumeration & Adapter-Bound D3D11 Context
+        # Probe Strategy 1: Factory Enumeration & Adapter-Bound Context
         if self._try_init_via_factory():
             return True
 
-        # Strategy 2: Default Hardware D3D11 Device -> DXGIDevice -> Adapter -> Output1
+        # Probe Strategy 2: Direct Hardware D3D11 Device -> DXGIDevice -> Adapter -> Output1
         if self._try_init_default_hardware():
             return True
 
@@ -287,7 +286,6 @@ class WindowsDXGIGrabber:
                         mon_w = int(o_desc.DesktopCoordinates.right - o_desc.DesktopCoordinates.left)
                         mon_h = int(o_desc.DesktopCoordinates.bottom - o_desc.DesktopCoordinates.top)
 
-                        # Create D3D11 device explicitly on this adapter
                         feature_level = c_uint(0)
                         D3D11_SDK_VERSION = 7
                         D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20
@@ -297,7 +295,7 @@ class WindowsDXGIGrabber:
 
                         hr_dev = ctypes.windll.d3d11.D3D11CreateDevice(
                             curr_adapter_p,
-                            0,  # D3D_DRIVER_TYPE_UNKNOWN
+                            0,
                             None,
                             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                             None,
