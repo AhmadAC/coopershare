@@ -429,7 +429,7 @@ class ScreenSenderThread(QThread):
         self,
         target_ip: str,
         pin: str = "",
-        quality: int = 89,
+        quality: int = 80,
         fps_limit: int = 60,
         use_444_chroma: bool = False,
         native_resolution: bool = False,
@@ -445,11 +445,11 @@ class ScreenSenderThread(QThread):
         self.paused = False
         self._pause_requested = False
 
-        self.raw_queue = queue.Queue(maxsize=2)
+        self.raw_queue = queue.Queue(maxsize=1)
         self.encoded_stash = {}
         self.encoded_lock = threading.Lock()
         self.next_send_id = 0
-        self.send_queue = queue.Queue(maxsize=2)
+        self.send_queue = queue.Queue(maxsize=1)
         self.pipeline_running = False
 
         self._stats_lock = threading.Lock()
@@ -484,22 +484,21 @@ class ScreenSenderThread(QThread):
     def _encoder_worker(self, worker_id: int):
         while self.pipeline_running:
             try:
-                item = self.raw_queue.get(timeout=0.03)
+                item = self.raw_queue.get(timeout=0.02)
             except queue.Empty:
                 continue
 
             frame_id, frame_raw, t_cap_ms = item
-
             t_enc_start = time.perf_counter()
 
-            # Dynamic Bandwidth Budgeting: clamp JPEG quality based on real network send time
+            # Dynamic Bandwidth Budgeting: automatically clamp quality based on real network send time
             eff_quality = self.quality
-            if self._last_net_duration > 50.0:
-                eff_quality = min(eff_quality, 45)
-            elif self._last_net_duration > 25.0:
-                eff_quality = min(eff_quality, 55)
-            elif self._last_net_duration > 15.0:
+            if self._last_net_duration > 35.0:
+                eff_quality = min(eff_quality, 50)
+            elif self._last_net_duration > 20.0:
                 eff_quality = min(eff_quality, 65)
+            elif self._last_net_duration > 10.0:
+                eff_quality = min(eff_quality, 75)
 
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), eff_quality]
 
@@ -513,19 +512,18 @@ class ScreenSenderThread(QThread):
             else:
                 frame_bgr = frame_raw
 
-            # Bandwidth Optimization: Scale frame down to maintain low network latency
+            # Bandwidth Optimization: Scale frame down slightly when network latency rises
             h, w = frame_bgr.shape[:2]
             if not self.native_resolution:
-                if self._last_net_duration > 35.0:
-                    if w > 960:
-                        scale = 960.0 / w
-                        frame_bgr = cv2.resize(
-                            frame_bgr, (960, int(round(h * scale))), interpolation=cv2.INTER_AREA
-                        )
-                elif w > 1280:
+                if self._last_net_duration > 30.0 and w > 1280:
                     scale = 1280.0 / w
                     frame_bgr = cv2.resize(
-                        frame_bgr, (1280, int(round(h * scale))), interpolation=cv2.INTER_AREA
+                        frame_bgr, (1280, int(round(h * scale))), interpolation=cv2.INTER_LINEAR
+                    )
+                elif self._last_net_duration > 50.0 and w > 960:
+                    scale = 960.0 / w
+                    frame_bgr = cv2.resize(
+                        frame_bgr, (960, int(round(h * scale))), interpolation=cv2.INTER_LINEAR
                     )
 
             success, enc_img = cv2.imencode(".jpg", frame_bgr, encode_params)
@@ -558,7 +556,7 @@ class ScreenSenderThread(QThread):
                     break
 
             try:
-                data, t_cap_ms, t_enc_ms = self.send_queue.get(timeout=0.03)
+                data, t_cap_ms, t_enc_ms = self.send_queue.get(timeout=0.02)
             except queue.Empty:
                 continue
 
