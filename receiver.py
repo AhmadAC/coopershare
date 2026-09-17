@@ -2,17 +2,18 @@
 
 """
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
-Features: Fullscreen Frameless Mode, Local Script / Executable Launcher with JSON History Memory,
-          Local & Remote Timer Launcher with Robust sys.argv Argument Passing (Raw Numbers / Unit Strings),
-          Reverse Desktop Screen Streaming & Interactive Remote Input (Mouse + Keyboard / Hotkeys),
-          Remote Window Management (Maximize, Normal, Minimize),
-          Right-Click Context Menu (Run Script, Show Timer, Fullscreen, Standby Details Visibility),
-          Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput),
-          UDP Discovery Beacon, 4-Digit PIN Authentication,
-          Vector SVG Icons replacing emojis,
-          Zero-Copy High-FPS Hardware Frame Receiving & Direct QImage Surface Rendering,
-          Hardware Multi-Touch QTouchEvent Processing,
-          Native Win32 Taskbar & Window Icon Binding (WM_SETICON & Shell PE Resource Extraction).
+Features:
+- True H.264 Real-Time Hardware/Low-Latency Video Stream Decoder & Turbo-JPEG fallback
+- Fullscreen Frameless Mode, Local Script / Executable Launcher with JSON History Memory
+- Local & Remote Timer Launcher with Robust sys.argv Argument Passing (Raw Numbers / Unit Strings)
+- Reverse Desktop Screen Streaming & Interactive Remote Input (Mouse + Keyboard / Hotkeys)
+- Remote Window Management (Maximize, Normal, Minimize)
+- Right-Click Context Menu (Run Script, Show Timer, Fullscreen, Standby Details Visibility)
+- Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput)
+- UDP Discovery Beacon, 4-Digit PIN Authentication
+- Zero-Copy High-FPS Direct QImage Surface Rendering
+- Hardware Multi-Touch QTouchEvent Processing
+- Native Win32 Taskbar & Window Icon Binding (WM_SETICON & Shell PE Resource Extraction)
 """
 
 import ctypes
@@ -124,6 +125,13 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    import av
+    H264_RECEIVER_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    av = None
+    H264_RECEIVER_AVAILABLE = False
 
 logger = logging.getLogger("Receiver")
 logger.setLevel(logging.DEBUG)
@@ -320,12 +328,6 @@ def apply_win32_window_icon(hwnd: int):
         try:
             ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_icon_small)
             ctypes.windll.user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, h_icon_small)
-        except Exception:
-            pass
-    elif h_icon_big:
-        try:
-            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_icon_big)
-            ctypes.windll.user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, h_icon_big)
         except Exception:
             pass
 
@@ -1118,6 +1120,15 @@ class VideoServerThread(QThread):
         header_mv = memoryview(header_buf)
         frame_buf = bytearray(4 * 1024 * 1024)
 
+        h264_decoder = None
+        if H264_RECEIVER_AVAILABLE:
+            try:
+                codec = av.CodecContext.create("h264", "r")
+                h264_decoder = codec
+            except Exception as ex:
+                logger.warning(f"Could not open PyAV H.264 decoder: {ex}")
+                h264_decoder = None
+
         while self.running:
             try:
                 if not recv_exact_into(conn, header_mv, 4):
@@ -1134,7 +1145,30 @@ class VideoServerThread(QThread):
                 if not recv_exact_into(conn, frame_mv, msg_size):
                     break
 
-                np_arr = np.frombuffer(frame_mv, dtype=np.uint8)
+                raw_bytes = bytes(frame_mv)
+
+                # Decode True H.264 video streams
+                if raw_bytes.startswith(b"H264") and h264_decoder is not None:
+                    h264_data = raw_bytes[4:]
+                    try:
+                        packet = av.Packet(h264_data)
+                        frames = h264_decoder.decode(packet)
+                        for f in frames:
+                            bgr = f.to_ndarray(format="bgr24")
+                            h, w, ch = bgr.shape
+                            qimg = QImage(bgr.data, w, h, ch * w, QImage.Format_BGR888).copy()
+                            self.frame_received.emit(qimg)
+                        continue
+                    except Exception:
+                        pass
+
+                # Turbo-JPEG Fallback
+                if raw_bytes.startswith(b"JPEG"):
+                    jpeg_data = raw_bytes[4:]
+                else:
+                    jpeg_data = raw_bytes
+
+                np_arr = np.frombuffer(jpeg_data, dtype=np.uint8)
                 img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if img is not None:
                     h, w, ch = img.shape
@@ -1460,8 +1494,6 @@ class ControlServerThread(QThread):
 
 
 class StandbyContainer(QWidget):
-    """Standby Screen Container ensuring all right-click events trigger the context menu."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
@@ -1497,11 +1529,6 @@ class StandbyContainer(QWidget):
 
 
 class TouchDisplayCanvas(QWidget):
-    """
-    High-DPI Canvas with direct zero-copy QImage rendering, avoiding QPixmap CPU conversion bottlenecks.
-    Supports hardware multi-touch and mouse events with solid boundaries.
-    """
-
     def __init__(self, control_server: Optional[ControlServerThread] = None, parent=None):
         super().__init__(parent)
         self.control_server = control_server
