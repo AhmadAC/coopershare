@@ -1,4 +1,4 @@
-#################### START OF FILE: sender.py ####################
+# sender.py
 
 """
 MrCoopersScreenShare - Sender (PC Presenter & Remote Controller)
@@ -26,7 +26,7 @@ if sys.platform == "win32":
         pass
 
 print("=" * 70, flush=True)
-print(f"[Sender-Bootstrap] MrCoopersScreenShare Sender Starting...", flush=True)
+print("[Sender-Bootstrap] MrCoopersScreenShare Sender Starting...", flush=True)
 print(f"[Sender-Bootstrap] Python: {sys.version.split()[0]} ({sys.executable})", flush=True)
 print(f"[Sender-Bootstrap] Platform: {sys.platform}", flush=True)
 print("=" * 70, flush=True)
@@ -57,7 +57,6 @@ if getattr(sys, "frozen", False) and os.environ.get("_MRCOOPERS_BOOTSTRAP") != "
 
 from ui_main import FloatingSenderWindow
 from utils import (
-    WindowsCaptureExclusionFilter,
     create_application_icon,
     ensure_kde_desktop_entry,
     ensure_uinput_permissions,
@@ -78,10 +77,6 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
     app.setWindowIcon(create_application_icon())
-
-    if sys.platform == "win32":
-        exclusion_filter = WindowsCaptureExclusionFilter(app)
-        app.installEventFilter(exclusion_filter)
 
     win = FloatingSenderWindow()
     win.show()

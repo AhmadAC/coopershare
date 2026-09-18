@@ -7,28 +7,20 @@ industry-standard real-time streaming presets (ABR frame budgeting for 60 FPS),
 with computer-specific dynamic color shades applied exclusively to the target computer dropdown box,
 vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
 cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WirePlumber),
-toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, Windows DWM capture exclusion,
+toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter,
 multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown,
-graceful handling of remote TV receiver shutdown,
-and anti-snap fixed size enforcement to prevent external apps and tiling managers from resizing the GUI.
+graceful handling of remote TV receiver shutdown, and clean geometry constraints.
 """
 
 import ctypes
-from ctypes import Structure, c_int, c_long, c_uint, c_void_p
 import math
 import re
 import sys
 import time
 from typing import Optional
 
-if sys.platform == "win32":
-    try:
-        import ctypes.wintypes
-    except ImportError:
-        pass
-
 from PySide6.QtCore import QByteArray, QEvent, QPoint, QRect, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeyEvent, QResizeEvent
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeyEvent, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -230,13 +222,10 @@ class TimerDialog(QDialog):
         input_layout.addWidget(self.timer_btn)
         layout.addLayout(input_layout)
 
-        if sys.platform == "win32":
-            exclude_from_capture(self)
-
     def showEvent(self, event):
+        super().showEvent(event)
         if sys.platform == "win32":
             exclude_from_capture(self)
-        super().showEvent(event)
 
     def get_args(self) -> str:
         return self.timer_edit.text().strip().strip('"').strip("'")
@@ -333,13 +322,10 @@ class EditTvDialog(QDialog):
         btn_layout.addWidget(self.save_btn)
         layout.addLayout(btn_layout)
 
-        if sys.platform == "win32":
-            exclude_from_capture(self)
-
     def showEvent(self, event):
+        super().showEvent(event)
         if sys.platform == "win32":
             exclude_from_capture(self)
-        super().showEvent(event)
 
     def get_data(self) -> tuple[str, list[str]]:
         name = self.name_edit.text().strip()
@@ -412,10 +398,9 @@ class TopmostComboBox(QComboBox):
                         0,
                         0,
                         0,
-                        0x0001 | 0x0002 | 0x0040,
+                        0x0001 | 0x0002 | 0x0010,
                     )
                     ctypes.windll.user32.BringWindowToTop(hwnd)
-                    exclude_from_capture(hwnd)
                 except Exception:
                     pass
             popup.raise_()
@@ -464,7 +449,7 @@ class FloatingSenderWindow(QWidget):
 
         self.is_pulsing = False
         self.pulse_start_time = 0.0
-        self._expanded_size = QSize(412, 254)
+        self._expanded_size = QSize(420, 310)
 
         self._save_debounce_timer = QTimer(self)
         self._save_debounce_timer.setSingleShot(True)
@@ -472,7 +457,7 @@ class FloatingSenderWindow(QWidget):
         self._save_debounce_timer.timeout.connect(self._flush_history_save)
 
         self.topmost_timer = QTimer(self)
-        self.topmost_timer.setInterval(500)
+        self.topmost_timer.setInterval(1000)
         self.topmost_timer.timeout.connect(self._on_topmost_timer)
         self.topmost_timer.start()
 
@@ -492,6 +477,16 @@ class FloatingSenderWindow(QWidget):
         self.discovery_thread.start()
         print("[Sender-Main] UDP discovery listener active on port 9991.", flush=True)
 
+    def paintEvent(self, event):
+        """
+        Clears the translucent window surface with clear composition mode.
+        Mandatory on Wayland to prevent dirty buffer reuse, tearing, and half-window distortions.
+        """
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode_Clear)
+        painter.fillRect(self.rect(), Qt.transparent)
+        painter.end()
+
     def _schedule_history_save(self):
         self._save_debounce_timer.start()
 
@@ -503,7 +498,6 @@ class FloatingSenderWindow(QWidget):
             Qt.Window
             | Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
-            | Qt.WindowMinimizeButtonHint
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
@@ -511,83 +505,6 @@ class FloatingSenderWindow(QWidget):
         op_val = max(20, min(100, int(saved_op))) if isinstance(saved_op, (int, float)) else 94
         self.current_opacity = op_val / 100.0
         self.apply_opacity(self.current_opacity)
-
-        if sys.platform == "win32":
-            try:
-                hwnd = int(self.winId())
-                GWL_STYLE = -16
-                WS_CAPTION = 0x00C00000
-                WS_THICKFRAME = 0x00040000
-                WS_MAXIMIZEBOX = 0x00010000
-                WS_MINIMIZEBOX = 0x00020000
-                WS_SYSMENU = 0x00080000
-                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
-                # Strip WS_THICKFRAME and WS_MAXIMIZEBOX so Windows Aero Snap / Snap Assist
-                # and external tiling managers NEVER resize or snap this floating tool window
-                new_style = (
-                    style & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX & ~WS_CAPTION
-                ) | WS_MINIMIZEBOX | WS_SYSMENU
-                if new_style != style:
-                    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
-            except Exception:
-                pass
-            exclude_from_capture(self)
-
-        self.enforce_always_on_top()
-
-    def nativeEvent(self, eventType, message):
-        if sys.platform == "win32":
-            try:
-                msg = ctypes.wintypes.MSG.from_address(int(message))
-                if msg.message == 0x0024:  # WM_GETMINMAXINFO
-                    class POINT(Structure):
-                        _fields_ = [("x", c_long), ("y", c_long)]
-
-                    class MINMAXINFO(Structure):
-                        _fields_ = [
-                            ("ptReserved", POINT),
-                            ("ptMaxSize", POINT),
-                            ("ptMaxPosition", POINT),
-                            ("ptMinTrackSize", POINT),
-                            ("ptMaxTrackSize", POINT),
-                        ]
-
-                    target_w = self.width()
-                    target_h = self.height()
-                    mmi = MINMAXINFO.from_address(msg.lParam)
-                    mmi.ptMinTrackSize.x = target_w
-                    mmi.ptMinTrackSize.y = target_h
-                    mmi.ptMaxTrackSize.x = target_w
-                    mmi.ptMaxTrackSize.y = target_h
-                    return True, 0
-
-                elif msg.message == 0x0046:  # WM_WINDOWPOSCHANGING
-                    class WINDOWPOS(Structure):
-                        _fields_ = [
-                            ("hwnd", c_void_p),
-                            ("hwndInsertAfter", c_void_p),
-                            ("x", c_int),
-                            ("y", c_int),
-                            ("cx", c_int),
-                            ("cy", c_int),
-                            ("flags", c_uint),
-                        ]
-
-                    wp = WINDOWPOS.from_address(msg.lParam)
-                    SWP_NOSIZE = 0x0001
-                    if not (wp.flags & SWP_NOSIZE) and not self.isMinimized():
-                        wp.cx = self.width()
-                        wp.cy = self.height()
-                        wp.flags |= SWP_NOSIZE
-            except Exception:
-                pass
-        return super().nativeEvent(eventType, message)
-
-    def resizeEvent(self, event: QResizeEvent):
-        super().resizeEvent(event)
-        target = QSize(48, 16) if self.is_mini_mode else getattr(self, "_expanded_size", None)
-        if target and (event.size().width() != target.width() or event.size().height() != target.height()):
-            self.setFixedSize(target)
 
     def is_any_popup_open(self) -> bool:
         for combo in (
@@ -620,7 +537,7 @@ class FloatingSenderWindow(QWidget):
             self._update_mini_bar_style()
 
     def enforce_always_on_top(self):
-        if self.is_any_popup_open():
+        if not self.isVisible() or self.is_any_popup_open():
             return
 
         if sys.platform == "win32":
@@ -642,11 +559,16 @@ class FloatingSenderWindow(QWidget):
                     0,
                     0,
                     0,
-                    0x0002 | 0x0001 | 0x0010 | 0x0040,
+                    0x0002 | 0x0001 | 0x0010,
                 )
             except Exception:
                 pass
-        self.raise_()
+            self.raise_()
+        else:
+            # On Linux Wayland, only raise if in mini mode or if active window.
+            # Calling raise() when another GUI is active causes compositor damage fight and distortion.
+            if self.is_mini_mode or self.isActiveWindow():
+                self.raise_()
 
     def _on_topmost_timer(self):
         if self.is_any_popup_open():
@@ -675,23 +597,23 @@ class FloatingSenderWindow(QWidget):
         self.enforce_always_on_top()
 
     def changeEvent(self, event: QEvent):
-        if event.type() in (QEvent.WindowStateChange, QEvent.ActivationChange):
+        if event.type() == QEvent.WindowStateChange:
             if self.is_any_popup_open():
                 super().changeEvent(event)
                 return
             if self.is_mini_mode:
                 if self.isMinimized():
                     self.showNormal()
-                self.setFixedSize(48, 16)
+                if self.size() != QSize(48, 16):
+                    self.setFixedSize(48, 16)
                 self.enforce_always_on_top()
                 self.trigger_mini_pulse()
             else:
                 if not self.isMinimized():
-                    if hasattr(self, "_expanded_size"):
+                    if hasattr(self, "_expanded_size") and self.size() != self._expanded_size:
                         self.setFixedSize(self._expanded_size)
-                    self.enforce_always_on_top()
-                    if hasattr(self, "opacity_slider"):
-                        self.apply_opacity(self.opacity_slider.value() / 100.0)
+                    if sys.platform == "win32":
+                        self.enforce_always_on_top()
         super().changeEvent(event)
 
     def _update_device_combo_style(self, device_text: Optional[str] = None):
@@ -850,8 +772,7 @@ class FloatingSenderWindow(QWidget):
         self._update_card_style()
 
         self.card_layout = QVBoxLayout(self.card)
-        self.card_layout.setSizeConstraint(QVBoxLayout.SetFixedSize)
-        self.card_layout.setContentsMargins(12, 10, 12, 10)
+        self.card_layout.setContentsMargins(14, 12, 14, 12)
         self.card_layout.setSpacing(8)
 
         # Header Bar
@@ -1182,8 +1103,6 @@ class FloatingSenderWindow(QWidget):
         self.apply_opacity(0.35)
         self.setFixedSize(48, 16)
         self.enforce_always_on_top()
-        if sys.platform == "win32":
-            exclude_from_capture(self)
 
     def expand_window(self):
         self.is_mini_mode = False
@@ -1193,17 +1112,17 @@ class FloatingSenderWindow(QWidget):
         op_val = self.opacity_slider.value() if hasattr(self, "opacity_slider") else 94
         self.apply_opacity(op_val / 100.0)
 
-        # Strictly lock dimensions to prevent Wayland KWin / Snap Assist tiling
         self.card.adjustSize()
         hint = self.card.sizeHint()
-        target_w = max(412, hint.width())
-        target_h = max(254, hint.height())
+        target_w = max(420, hint.width())
+        target_h = max(310, hint.height())
         self._expanded_size = QSize(target_w, target_h)
         self.setFixedSize(self._expanded_size)
 
-        self.enforce_always_on_top()
-        if sys.platform == "win32":
-            exclude_from_capture(self)
+        if self.isVisible():
+            self.enforce_always_on_top()
+            if sys.platform == "win32":
+                exclude_from_capture(self)
 
     def _get_tv_info_for_selection(self) -> tuple[str, list[str]]:
         current_ip = self.get_selected_target_ip()
@@ -1465,7 +1384,6 @@ class FloatingSenderWindow(QWidget):
             return
         if self.is_mini_mode and not self.is_pulsing:
             self.apply_opacity(1.0)
-        self.enforce_always_on_top()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
@@ -1474,7 +1392,6 @@ class FloatingSenderWindow(QWidget):
             return
         if self.is_mini_mode and not self.is_pulsing:
             self.apply_opacity(0.35)
-        self.enforce_always_on_top()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
@@ -1509,10 +1426,10 @@ class FloatingSenderWindow(QWidget):
                 self.enforce_always_on_top()
 
     def showEvent(self, event):
+        super().showEvent(event)
         self.enforce_always_on_top()
         if sys.platform == "win32":
             exclude_from_capture(self)
-        super().showEvent(event)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -1925,7 +1842,6 @@ class FloatingSenderWindow(QWidget):
             self.fps_badge.setVisible(False)
             self.fps_badge.setText("")
             self._update_status_color(color)
-            # Dispatch teardown to next Qt event loop iteration to avoid deadlock
             QTimer.singleShot(0, self._handle_remote_disconnect)
 
     def _handle_remote_disconnect(self):

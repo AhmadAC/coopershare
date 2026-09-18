@@ -1,5 +1,3 @@
-#################### START OF FILE: utils.py ####################
-
 # utils.py
 
 """
@@ -77,11 +75,15 @@ def save_history(history_data: dict):
 
 
 WDA_NONE = 0x00000000
-WDA_MONITOR = 0x00000001
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 
 def exclude_from_capture(target) -> bool:
+    """
+    Excludes the window from screen capture/recording streams (Windows 10 2004+ and Windows 11).
+    Does NOT fall back to WDA_MONITOR to prevent the window from blacking out or disappearing
+    in remote desktop sessions, virtual displays, or translucent layered mode.
+    """
     if sys.platform != "win32" or not target:
         return False
 
@@ -102,8 +104,6 @@ def exclude_from_capture(target) -> bool:
     try:
         user32 = ctypes.windll.user32
         res = user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
-        if not res:
-            res = user32.SetWindowDisplayAffinity(hwnd, WDA_MONITOR)
         return bool(res)
     except Exception:
         return False
