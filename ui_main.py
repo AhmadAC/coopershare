@@ -10,18 +10,25 @@ cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WireP
 toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter, Windows DWM capture exclusion,
 multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown,
 graceful handling of remote TV receiver shutdown,
-and z-order guarded topmost dropdown popups that always render in front of the GUI on Windows 11.
+and anti-snap fixed size enforcement to prevent external apps and tiling managers from resizing the GUI.
 """
 
 import ctypes
+from ctypes import Structure, c_int, c_long, c_uint, c_void_p
 import math
 import re
 import sys
 import time
 from typing import Optional
 
+if sys.platform == "win32":
+    try:
+        import ctypes.wintypes
+    except ImportError:
+        pass
+
 from PySide6.QtCore import QByteArray, QEvent, QPoint, QRect, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeyEvent
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeyEvent, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -457,6 +464,7 @@ class FloatingSenderWindow(QWidget):
 
         self.is_pulsing = False
         self.pulse_start_time = 0.0
+        self._expanded_size = QSize(412, 254)
 
         self._save_debounce_timer = QTimer(self)
         self._save_debounce_timer.setSingleShot(True)
@@ -508,17 +516,78 @@ class FloatingSenderWindow(QWidget):
             try:
                 hwnd = int(self.winId())
                 GWL_STYLE = -16
+                WS_CAPTION = 0x00C00000
+                WS_THICKFRAME = 0x00040000
+                WS_MAXIMIZEBOX = 0x00010000
                 WS_MINIMIZEBOX = 0x00020000
                 WS_SYSMENU = 0x00080000
                 style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
-                ctypes.windll.user32.SetWindowLongW(
-                    hwnd, GWL_STYLE, style | WS_MINIMIZEBOX | WS_SYSMENU
-                )
+                # Strip WS_THICKFRAME and WS_MAXIMIZEBOX so Windows Aero Snap / Snap Assist
+                # and external tiling managers NEVER resize or snap this floating tool window
+                new_style = (
+                    style & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX & ~WS_CAPTION
+                ) | WS_MINIMIZEBOX | WS_SYSMENU
+                if new_style != style:
+                    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, new_style)
             except Exception:
                 pass
             exclude_from_capture(self)
 
         self.enforce_always_on_top()
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32":
+            try:
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                if msg.message == 0x0024:  # WM_GETMINMAXINFO
+                    class POINT(Structure):
+                        _fields_ = [("x", c_long), ("y", c_long)]
+
+                    class MINMAXINFO(Structure):
+                        _fields_ = [
+                            ("ptReserved", POINT),
+                            ("ptMaxSize", POINT),
+                            ("ptMaxPosition", POINT),
+                            ("ptMinTrackSize", POINT),
+                            ("ptMaxTrackSize", POINT),
+                        ]
+
+                    target_w = self.width()
+                    target_h = self.height()
+                    mmi = MINMAXINFO.from_address(msg.lParam)
+                    mmi.ptMinTrackSize.x = target_w
+                    mmi.ptMinTrackSize.y = target_h
+                    mmi.ptMaxTrackSize.x = target_w
+                    mmi.ptMaxTrackSize.y = target_h
+                    return True, 0
+
+                elif msg.message == 0x0046:  # WM_WINDOWPOSCHANGING
+                    class WINDOWPOS(Structure):
+                        _fields_ = [
+                            ("hwnd", c_void_p),
+                            ("hwndInsertAfter", c_void_p),
+                            ("x", c_int),
+                            ("y", c_int),
+                            ("cx", c_int),
+                            ("cy", c_int),
+                            ("flags", c_uint),
+                        ]
+
+                    wp = WINDOWPOS.from_address(msg.lParam)
+                    SWP_NOSIZE = 0x0001
+                    if not (wp.flags & SWP_NOSIZE) and not self.isMinimized():
+                        wp.cx = self.width()
+                        wp.cy = self.height()
+                        wp.flags |= SWP_NOSIZE
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
+    def resizeEvent(self, event: QResizeEvent):
+        super().resizeEvent(event)
+        target = QSize(48, 16) if self.is_mini_mode else getattr(self, "_expanded_size", None)
+        if target and (event.size().width() != target.width() or event.size().height() != target.height()):
+            self.setFixedSize(target)
 
     def is_any_popup_open(self) -> bool:
         for combo in (
@@ -613,10 +682,13 @@ class FloatingSenderWindow(QWidget):
             if self.is_mini_mode:
                 if self.isMinimized():
                     self.showNormal()
+                self.setFixedSize(48, 16)
                 self.enforce_always_on_top()
                 self.trigger_mini_pulse()
             else:
                 if not self.isMinimized():
+                    if hasattr(self, "_expanded_size"):
+                        self.setFixedSize(self._expanded_size)
                     self.enforce_always_on_top()
                     if hasattr(self, "opacity_slider"):
                         self.apply_opacity(self.opacity_slider.value() / 100.0)
@@ -778,11 +850,13 @@ class FloatingSenderWindow(QWidget):
         self._update_card_style()
 
         self.card_layout = QVBoxLayout(self.card)
+        self.card_layout.setSizeConstraint(QVBoxLayout.SetFixedSize)
         self.card_layout.setContentsMargins(12, 10, 12, 10)
         self.card_layout.setSpacing(8)
 
         # Header Bar
         self.header_bar = QWidget()
+        self.header_bar.setFixedHeight(26)
         h_layout = QHBoxLayout(self.header_bar)
         h_layout.setContentsMargins(0, 0, 0, 0)
         h_layout.setSpacing(6)
@@ -796,6 +870,7 @@ class FloatingSenderWindow(QWidget):
 
         self.fps_badge = QLabel("")
         self.fps_badge.setVisible(False)
+        self.fps_badge.setFixedHeight(18)
         self.fps_badge.setStyleSheet(
             "color: #00d084; font-weight: bold; font-size: 11px; padding: 1px 5px; "
             "background: rgba(0, 208, 132, 0.15); border: 1px solid rgba(0, 208, 132, 0.35); border-radius: 4px;"
@@ -820,12 +895,12 @@ class FloatingSenderWindow(QWidget):
         )
         self.close_btn.clicked.connect(self.close)
 
-        h_layout.addWidget(self.status_dot)
-        h_layout.addWidget(self.title_lbl)
-        h_layout.addWidget(self.fps_badge)
+        h_layout.addWidget(self.status_dot, alignment=Qt.AlignVCenter)
+        h_layout.addWidget(self.title_lbl, alignment=Qt.AlignVCenter)
+        h_layout.addWidget(self.fps_badge, alignment=Qt.AlignVCenter)
         h_layout.addStretch()
-        h_layout.addWidget(self.collapse_btn)
-        h_layout.addWidget(self.close_btn)
+        h_layout.addWidget(self.collapse_btn, alignment=Qt.AlignVCenter)
+        h_layout.addWidget(self.close_btn, alignment=Qt.AlignVCenter)
 
         self.card_layout.addWidget(self.header_bar)
 
@@ -1114,13 +1189,18 @@ class FloatingSenderWindow(QWidget):
         self.is_mini_mode = False
         if hasattr(self, "pulse_timer") and self.pulse_timer.isActive():
             self.pulse_timer.stop()
-        self.setMinimumSize(0, 0)
-        self.setMaximumSize(16777215, 16777215)
         self.stack.setCurrentWidget(self.card)
         op_val = self.opacity_slider.value() if hasattr(self, "opacity_slider") else 94
         self.apply_opacity(op_val / 100.0)
+
+        # Strictly lock dimensions to prevent Wayland KWin / Snap Assist tiling
         self.card.adjustSize()
-        self.adjustSize()
+        hint = self.card.sizeHint()
+        target_w = max(412, hint.width())
+        target_h = max(254, hint.height())
+        self._expanded_size = QSize(target_w, target_h)
+        self.setFixedSize(self._expanded_size)
+
         self.enforce_always_on_top()
         if sys.platform == "win32":
             exclude_from_capture(self)
