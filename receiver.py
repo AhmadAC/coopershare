@@ -10,6 +10,7 @@ Features:
 - Remote Window Management (Maximize, Normal, Minimize)
 - Right-Click Context Menu (Silent Mode, Run Script, Show Timer, Fullscreen, Standby Details Visibility)
 - Silent Mode with System Tray minimization (hidden from taskbar, remembered across restarts)
+- Auto-Maximization out of Silent Mode upon sender screen share connection
 - Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput)
 - UDP Discovery Beacon, 4-Digit PIN Authentication
 - Zero-Copy High-FPS Direct QImage Surface Rendering
@@ -1822,7 +1823,7 @@ class ReceiverMainWindow(QMainWindow):
             QSystemTrayIcon.ActivationReason.Trigger,
             QSystemTrayIcon.ActivationReason.DoubleClick,
         ):
-            if self.isVisible():
+            if self.isVisible() and not self.isMinimized():
                 self.raise_()
                 self.activateWindow()
             else:
@@ -1831,11 +1832,43 @@ class ReceiverMainWindow(QMainWindow):
     def hide_to_tray(self):
         self.hide()
 
-    def restore_from_tray(self):
+    def maximize_receiver_window(self):
+        """Restores and maximizes the display frameless window reliably to full display."""
+        if self.isMinimized() or self.isHidden() or not self.isVisible():
+            self.showNormal()
         self.show()
         self.set_receiver_fullscreen(True)
+        self._ensure_frameless_style()
         self.raise_()
         self.activateWindow()
+
+        if sys.platform == "win32":
+            try:
+                hwnd = int(self.winId())
+                SW_RESTORE = 9
+                SW_SHOWMAXIMIZED = 3
+                ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+                ctypes.windll.user32.ShowWindow(hwnd, SW_SHOWMAXIMIZED)
+
+                HWND_TOPMOST = -1
+                HWND_NOTOPMOST = -2
+                SWP_NOMOVE = 0x0002
+                SWP_NOSIZE = 0x0001
+                SWP_SHOWWINDOW = 0x0040
+
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                )
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                )
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                ctypes.windll.user32.BringWindowToTop(hwnd)
+            except Exception as e:
+                logger.debug(f"Win32 maximize foreground notice: {e}")
+
+    def restore_from_tray(self):
+        self.maximize_receiver_window()
 
     def toggle_silent_mode(self, checked: Optional[bool] = None):
         if checked is None:
@@ -1852,7 +1885,7 @@ class ReceiverMainWindow(QMainWindow):
         if self.silent_mode:
             self.hide_to_tray()
         else:
-            if self.isHidden():
+            if self.isHidden() or self.isMinimized():
                 self.restore_from_tray()
 
     def quit_application(self):
@@ -2127,11 +2160,7 @@ class ReceiverMainWindow(QMainWindow):
         if cmd_type == "window_control":
             action = cmd.get("action")
             if action == "maximize":
-                if self.isMinimized() or self.isHidden():
-                    self.showNormal()
-                self.set_receiver_fullscreen(True)
-                self.raise_()
-                self.activateWindow()
+                self.maximize_receiver_window()
             elif action == "normal":
                 if self.isMinimized() or self.isHidden():
                     self.showNormal()
@@ -2273,10 +2302,8 @@ class ReceiverMainWindow(QMainWindow):
     def on_connected(self, ip: str):
         self.canvas.control_server = self.control_thread
         self.stack.setCurrentWidget(self.canvas)
-        if self.isHidden():
-            self.show()
-            self.set_receiver_fullscreen(True)
-        self._ensure_frameless_style()
+        # Automatically unhide from system tray and maximize display GUI on connect
+        self.maximize_receiver_window()
 
     def on_disconnected(self):
         self.canvas.current_frame = None
@@ -2287,6 +2314,10 @@ class ReceiverMainWindow(QMainWindow):
             self._ensure_frameless_style()
 
     def on_frame(self, img: QImage):
+        if self.stack.currentWidget() != self.canvas:
+            self.stack.setCurrentWidget(self.canvas)
+        if not self.isVisible() or self.isMinimized():
+            self.maximize_receiver_window()
         self.canvas.update_frame(img)
 
     def closeEvent(self, event):

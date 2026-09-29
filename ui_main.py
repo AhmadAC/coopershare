@@ -1,3 +1,4 @@
+
 # ui_main.py
 
 """
@@ -10,6 +11,7 @@ cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WireP
 toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter,
 multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown,
 graceful handling of remote TV receiver shutdown, and clean geometry constraints.
+Automatically commands the receiver window to maximize on connect so silent-mode displays share properly.
 """
 
 import ctypes
@@ -565,8 +567,6 @@ class FloatingSenderWindow(QWidget):
                 pass
             self.raise_()
         else:
-            # On Linux Wayland, only raise if in mini mode or if active window.
-            # Calling raise() when another GUI is active causes compositor damage fight and distortion.
             if self.is_mini_mode or self.isActiveWindow():
                 self.raise_()
 
@@ -1735,6 +1735,8 @@ class FloatingSenderWindow(QWidget):
         self.audio_thread.start()
 
         self.ensure_control_channel(target_ip)
+        # Pre-emptively send maximize request to bring silent receiver out of tray
+        QTimer.singleShot(250, lambda: self.send_receiver_window_command("maximize"))
 
     def stop_sharing(self):
         print("\n[Sender-Main] Stopping screen share session...", flush=True)
@@ -1837,6 +1839,8 @@ class FloatingSenderWindow(QWidget):
                 if connected_ip not in self.history_data.get("devices", {}):
                     self.history_data.setdefault("devices", {})[connected_ip] = ""
                 self._schedule_history_save()
+            # Command receiver display to maximize onto full screen
+            self.send_receiver_window_command("maximize")
         else:
             color = "#d83b01"
             self.fps_badge.setVisible(False)
