@@ -8,7 +8,8 @@ Features:
 - Local & Remote Timer Launcher with Robust sys.argv Argument Passing (Raw Numbers / Unit Strings)
 - Reverse Desktop Screen Streaming & Interactive Remote Input (Mouse + Keyboard / Hotkeys)
 - Remote Window Management (Maximize, Normal, Minimize)
-- Right-Click Context Menu (Run Script, Show Timer, Fullscreen, Standby Details Visibility)
+- Right-Click Context Menu (Silent Mode, Run Script, Show Timer, Fullscreen, Standby Details Visibility)
+- Silent Mode with System Tray minimization (hidden from taskbar, remembered across restarts)
 - Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput)
 - UDP Discovery Beacon, 4-Digit PIN Authentication
 - Zero-Copy High-FPS Direct QImage Surface Rendering
@@ -122,6 +123,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QStackedWidget,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -372,6 +374,8 @@ REC_SVG_FULLSCREEN = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColo
 REC_SVG_EXIT_FULLSCREEN = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><polyline points="14 14 20 14 20 20"/><polyline points="10 10 4 10 4 4"/></svg>"""
 REC_SVG_DISCONNECT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/><line x1="2" y1="2" x2="22" y2="22"/></svg>"""
 REC_SVG_LOGOUT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>"""
+REC_SVG_SILENT = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13.73 21a2 2 0 0 1-3.46 0"/><path d="M18.63 13A17.89 17.89 0 0 1 18 8"/><path d="M6.26 6.26A5.86 5.86 0 0 0 6 8c0 7-3 9-3 9h14"/><path d="M18 8a6 6 0 0 0-9.33-5"/><line x1="1" y1="1" x2="23" y2="23"/></svg>"""
+REC_SVG_MINIMIZE = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>"""
 
 
 def load_receiver_config() -> dict:
@@ -381,11 +385,14 @@ def load_receiver_config() -> dict:
                 data = json.load(f)
                 if not isinstance(data.get("recent_scripts"), list):
                     data["recent_scripts"] = []
+                if "silent_mode" not in data:
+                    data["silent_mode"] = False
                 return data
         except Exception as e:
             logger.warning(f"Failed to read receiver_config.json: {e}")
     return {
         "hide_details": False,
+        "silent_mode": False,
         "last_script_path": "",
         "last_script_args": "",
         "last_timer_args": "",
@@ -1594,7 +1601,6 @@ class TouchDisplayCanvas(QWidget):
         r = self._get_video_rect()
         if r.width() <= 0 or r.height() <= 0:
             return None
-        # Clamp coordinates to ensure edge dragging/releases work at 0.0 and 1.0 boundaries
         raw_nx = (pos.x() - r.x()) / float(r.width())
         raw_ny = (pos.y() - r.y()) / float(r.height())
         nx = max(0.0, min(1.0, raw_nx))
@@ -1718,6 +1724,7 @@ class ReceiverMainWindow(QMainWindow):
 
         self.config = load_receiver_config()
         self.hide_details = self.config.get("hide_details", False)
+        self.silent_mode = bool(self.config.get("silent_mode", False))
         self.pin = f"{random.randint(1000, 9999)}"
         self._pin_required = False
         self.pin_req_cb: Optional[QCheckBox] = None
@@ -1736,6 +1743,7 @@ class ReceiverMainWindow(QMainWindow):
 
         self._setup_ui()
         self._apply_details_visibility()
+        self._setup_system_tray(app_icon)
 
         self.video_thread.frame_received.connect(self.on_frame)
         self.video_thread.client_connected.connect(self.on_connected)
@@ -1752,6 +1760,106 @@ class ReceiverMainWindow(QMainWindow):
             th.start()
 
         self._ensure_frameless_style()
+
+    def _setup_system_tray(self, app_icon: QIcon):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(app_icon)
+        self.tray_icon.setToolTip("MrCoopersScreenShare Receiver")
+
+        self.tray_menu = QMenu()
+        self.tray_menu.setStyleSheet(
+            """
+            QMenu {
+                background-color: #1a1e29;
+                color: #ffffff;
+                border: 1px solid #3d475f;
+                border-radius: 8px;
+                padding: 4px;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 13px;
+            }
+            QMenu::item {
+                padding: 7px 24px 7px 12px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #333c4d;
+                margin: 4px 6px;
+            }
+            """
+        )
+
+        open_act = QAction("Open Receiver GUI", self)
+        open_act.setIcon(svg_to_icon(REC_SVG_FULLSCREEN, 16, "#00a2ed"))
+        open_act.triggered.connect(self.restore_from_tray)
+        self.tray_menu.addAction(open_act)
+
+        self.tray_silent_act = QAction("Silent Mode", self)
+        self.tray_silent_act.setIcon(svg_to_icon(REC_SVG_SILENT, 16, "#00d084"))
+        self.tray_silent_act.setCheckable(True)
+        self.tray_silent_act.setChecked(self.silent_mode)
+        self.tray_silent_act.triggered.connect(self.toggle_silent_mode)
+        self.tray_menu.addAction(self.tray_silent_act)
+
+        self.tray_menu.addSeparator()
+
+        exit_act = QAction("Exit Application", self)
+        exit_act.setIcon(svg_to_icon(REC_SVG_LOGOUT, 16, "#ff6b6b"))
+        exit_act.triggered.connect(self.quit_application)
+        self.tray_menu.addAction(exit_act)
+
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            if self.isVisible():
+                self.raise_()
+                self.activateWindow()
+            else:
+                self.restore_from_tray()
+
+    def hide_to_tray(self):
+        self.hide()
+
+    def restore_from_tray(self):
+        self.show()
+        self.set_receiver_fullscreen(True)
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_silent_mode(self, checked: Optional[bool] = None):
+        if checked is None:
+            self.silent_mode = not self.silent_mode
+        else:
+            self.silent_mode = checked
+
+        self.config["silent_mode"] = self.silent_mode
+        save_receiver_config(self.config)
+
+        if hasattr(self, "tray_silent_act"):
+            self.tray_silent_act.setChecked(self.silent_mode)
+
+        if self.silent_mode:
+            self.hide_to_tray()
+        else:
+            if self.isHidden():
+                self.restore_from_tray()
+
+    def quit_application(self):
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.hide()
+        self.close()
+        QApplication.quit()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -2019,19 +2127,22 @@ class ReceiverMainWindow(QMainWindow):
         if cmd_type == "window_control":
             action = cmd.get("action")
             if action == "maximize":
-                if self.isMinimized():
+                if self.isMinimized() or self.isHidden():
                     self.showNormal()
                 self.set_receiver_fullscreen(True)
                 self.raise_()
                 self.activateWindow()
             elif action == "normal":
-                if self.isMinimized():
+                if self.isMinimized() or self.isHidden():
                     self.showNormal()
                 self.set_receiver_fullscreen(False)
                 self.raise_()
                 self.activateWindow()
             elif action == "minimize":
-                self.showMinimized()
+                if self.silent_mode:
+                    self.hide_to_tray()
+                else:
+                    self.showMinimized()
 
         elif cmd_type == "run_script":
             target_path = cmd.get("path", "").strip()
@@ -2044,7 +2155,10 @@ class ReceiverMainWindow(QMainWindow):
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Escape:
-            self.close()
+            if self.silent_mode:
+                self.hide_to_tray()
+            else:
+                self.close()
         elif event.key() == Qt.Key_F11:
             self.set_receiver_fullscreen(not self.isFullScreen())
         super().keyPressEvent(event)
@@ -2116,6 +2230,19 @@ class ReceiverMainWindow(QMainWindow):
         toggle_info_act.triggered.connect(self.toggle_details_visibility)
         menu.addAction(toggle_info_act)
 
+        silent_act = QAction("Silent Mode", self)
+        silent_act.setIcon(svg_to_icon(REC_SVG_SILENT, 16, "#00a2ed" if self.silent_mode else "#ffffff"))
+        silent_act.setCheckable(True)
+        silent_act.setChecked(self.silent_mode)
+        silent_act.triggered.connect(self.toggle_silent_mode)
+        menu.addAction(silent_act)
+
+        if self.silent_mode:
+            min_tray_act = QAction("Minimize to System Tray", self)
+            min_tray_act.setIcon(svg_to_icon(REC_SVG_MINIMIZE, 16, "#8f9bb3"))
+            min_tray_act.triggered.connect(self.hide_to_tray)
+            menu.addAction(min_tray_act)
+
         menu.addSeparator()
 
         if self.isFullScreen():
@@ -2138,7 +2265,7 @@ class ReceiverMainWindow(QMainWindow):
 
         exit_act = QAction("Exit Application (Esc)", self)
         exit_act.setIcon(svg_to_icon(REC_SVG_LOGOUT, 16, "#ff6b6b"))
-        exit_act.triggered.connect(self.close)
+        exit_act.triggered.connect(self.quit_application)
         menu.addAction(exit_act)
 
         menu.exec(global_pos)
@@ -2146,17 +2273,25 @@ class ReceiverMainWindow(QMainWindow):
     def on_connected(self, ip: str):
         self.canvas.control_server = self.control_thread
         self.stack.setCurrentWidget(self.canvas)
+        if self.isHidden():
+            self.show()
+            self.set_receiver_fullscreen(True)
         self._ensure_frameless_style()
 
     def on_disconnected(self):
         self.canvas.current_frame = None
         self.stack.setCurrentWidget(self.standby)
-        self._ensure_frameless_style()
+        if self.silent_mode:
+            self.hide_to_tray()
+        else:
+            self._ensure_frameless_style()
 
     def on_frame(self, img: QImage):
         self.canvas.update_frame(img)
 
     def closeEvent(self, event):
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.hide()
         self.beacon_thread.stop()
         self.video_thread.stop()
         self.reverse_video_thread.stop()
@@ -2181,6 +2316,7 @@ if __name__ == "__main__":
             pass
 
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
 
     app_palette = app.palette()
     app_palette.setColor(QPalette.Window, Qt.black)
@@ -2192,6 +2328,11 @@ if __name__ == "__main__":
 
     win = ReceiverMainWindow()
     win.setWindowIcon(app_icon)
-    win.show()
-    win.set_receiver_fullscreen(True)
+
+    if not win.silent_mode:
+        win.show()
+        win.set_receiver_fullscreen(True)
+    else:
+        win.hide_to_tray()
+
     sys.exit(app.exec())
