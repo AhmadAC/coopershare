@@ -1,9 +1,11 @@
+
 # threads.py
 
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 Features:
 - True H.264 Real-Time Low-Latency Video Streaming (libx264 / zero-latency I/P-frame encoding)
+- Dual-display / Screen Extension sharing option with live on-the-fly target switching
 - Direct zero-copy BGRA memory ingestion into libavcodec (0.0ms color conversion)
 - Dual-tier capture failover: DXGI Hardware GPU Duplication with instant FastGDI backup
 - Steady frame pacing guarantee (caches last frame on static scenes so stream never starves)
@@ -442,6 +444,7 @@ class ScreenSenderThread(QThread):
         fps_limit: int = 60,
         use_444_chroma: bool = False,
         native_resolution: bool = False,
+        share_extension: bool = False,
     ):
         super().__init__()
         self.target_ip = target_ip
@@ -450,6 +453,8 @@ class ScreenSenderThread(QThread):
         self.fps_limit = fps_limit
         self.use_444_chroma = use_444_chroma
         self.native_resolution = native_resolution
+        self.share_extension = share_extension
+        self._target_display_changed = False
         self.running = True
         self.paused = False
         self._pause_requested = False
@@ -469,6 +474,12 @@ class ScreenSenderThread(QThread):
 
         self.use_h264 = H264_AVAILABLE
         self._h264_init_attempted = False
+
+    def set_share_extension(self, enabled: bool):
+        if self.share_extension != enabled:
+            self.share_extension = enabled
+            self._target_display_changed = True
+            print(f"[Sender] Screen extension mode toggled: {enabled}", flush=True)
 
     def set_fps_limit(self, fps: int):
         self.fps_limit = max(1, fps)
@@ -767,7 +778,17 @@ class ScreenSenderThread(QThread):
         screen_dpr = float(screen.devicePixelRatio()) if screen else 1.0
 
         with create_mss_instance() as sct:
-            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            def get_target_monitor_and_idx():
+                num_mons = len(sct.monitors)
+                if self.share_extension and num_mons > 2:
+                    mon_idx = 2
+                    dxgi_idx = 1
+                else:
+                    mon_idx = 1 if num_mons > 1 else 0
+                    dxgi_idx = 0
+                return sct.monitors[mon_idx], dxgi_idx, mon_idx
+
+            monitor, dxgi_target_idx, active_mon_idx = get_target_monitor_and_idx()
             mon_left = monitor.get("left", 0)
             mon_top = monitor.get("top", 0)
             mon_w = monitor.get("width", 1920)
@@ -775,7 +796,7 @@ class ScreenSenderThread(QThread):
 
             if sys.platform == "win32":
                 try:
-                    dxgi_grabber = WindowsDXGIGrabber(target_monitor_index=0)
+                    dxgi_grabber = WindowsDXGIGrabber(target_monitor_index=dxgi_target_idx)
                     use_dxgi = dxgi_grabber.available
                 except Exception as ex:
                     print(f"[Sender] Windows DXGI exception: {ex}", flush=True)
@@ -791,19 +812,19 @@ class ScreenSenderThread(QThread):
 
             active_backend = "MSS (Direct)"
             if use_dxgi:
-                active_backend = "DXGI (GPU)"
+                active_backend = f"DXGI (GPU - Display {dxgi_target_idx + 1})"
             elif use_kwin:
                 active_backend = "KWin (D-Bus)"
             elif use_spectacle:
                 active_backend = "Spectacle"
             elif use_fast_gdi:
-                active_backend = "FastGDI (DIB)"
+                active_backend = f"FastGDI (Display {dxgi_target_idx + 1})"
 
             def get_backend_name():
                 nonlocal active_backend
                 return active_backend
 
-            print(f"[Sender] Active Capture Engine: {active_backend}", flush=True)
+            print(f"[Sender] Active Capture Engine: {active_backend} (Display {active_mon_idx})", flush=True)
 
             self.pipeline_running = True
 
@@ -821,6 +842,58 @@ class ScreenSenderThread(QThread):
             last_cached_frame = None
 
             while self.running and self.pipeline_running:
+                if self._target_display_changed:
+                    self._target_display_changed = False
+                    monitor, dxgi_target_idx, active_mon_idx = get_target_monitor_and_idx()
+                    mon_left = monitor.get("left", 0)
+                    mon_top = monitor.get("top", 0)
+                    mon_w = monitor.get("width", 1920)
+                    mon_h = monitor.get("height", 1080)
+                    last_cached_frame = None
+
+                    if dxgi_grabber:
+                        try:
+                            dxgi_grabber.close()
+                        except Exception:
+                            pass
+                        dxgi_grabber = None
+                    if fast_gdi_grabber:
+                        try:
+                            fast_gdi_grabber.close()
+                        except Exception:
+                            pass
+                        fast_gdi_grabber = None
+
+                    if sys.platform == "win32":
+                        try:
+                            dxgi_grabber = WindowsDXGIGrabber(target_monitor_index=dxgi_target_idx)
+                            use_dxgi = dxgi_grabber.available
+                        except Exception:
+                            use_dxgi = False
+                        try:
+                            fast_gdi_grabber = WindowsFastGDIGrabber(
+                                mon_left=mon_left, mon_top=mon_top, width=mon_w, height=mon_h
+                            )
+                            use_fast_gdi = fast_gdi_grabber.initialized
+                        except Exception:
+                            use_fast_gdi = False
+
+                    active_backend = "MSS (Direct)"
+                    if use_dxgi:
+                        active_backend = f"DXGI (GPU - Display {dxgi_target_idx + 1})"
+                    elif use_kwin:
+                        active_backend = "KWin (D-Bus)"
+                    elif use_spectacle:
+                        active_backend = "Spectacle"
+                    elif use_fast_gdi:
+                        active_backend = f"FastGDI (Display {dxgi_target_idx + 1})"
+
+                    print(
+                        f"[Sender] Switched capture target to Display {active_mon_idx} "
+                        f"({mon_w}x{mon_h} at {mon_left},{mon_top}) via {active_backend}",
+                        flush=True,
+                    )
+
                 if self._pause_requested:
                     use_native_res = bool(self.native_resolution and self.quality >= 95)
                     clean_frame = None
@@ -867,7 +940,7 @@ class ScreenSenderThread(QThread):
                     if use_dxgi and dxgi_grabber:
                         f_raw = dxgi_grabber.grab()
                         if f_raw is not None:
-                            active_backend = "DXGI (GPU)"
+                            active_backend = f"DXGI (GPU - Display {dxgi_target_idx + 1})"
                             render_cursor_on_frame(
                                 f_raw,
                                 monitor_left=dxgi_grabber.mon_left,
@@ -880,7 +953,7 @@ class ScreenSenderThread(QThread):
                     if f_raw is None and use_fast_gdi and fast_gdi_grabber:
                         f_raw = fast_gdi_grabber.grab()
                         if f_raw is not None:
-                            active_backend = "FastGDI (DIB)"
+                            active_backend = f"FastGDI (Display {dxgi_target_idx + 1})"
                             render_cursor_on_frame(
                                 f_raw,
                                 monitor_left=mon_left,
@@ -913,7 +986,7 @@ class ScreenSenderThread(QThread):
                         sct_frame = sct.grab(monitor)
                         f_raw = np.frombuffer(sct_frame.raw, dtype=np.uint8).reshape((sct_frame.height, sct_frame.width, 4)).copy()
                         if f_raw is not None:
-                            active_backend = "MSS (Direct)"
+                            active_backend = f"MSS (Display {active_mon_idx})"
                             render_cursor_on_frame(
                                 f_raw,
                                 monitor_left=mon_left,
@@ -925,7 +998,6 @@ class ScreenSenderThread(QThread):
                 except Exception:
                     f_raw = None
 
-                # Keep last frame cached so identical static screens maintain the target frame rate
                 if f_raw is not None:
                     last_cached_frame = f_raw
                 elif last_cached_frame is not None:
@@ -1099,6 +1171,15 @@ class InputReceiverThread(QThread):
         self.running = True
         self.sock: Optional[socket.socket] = None
         self._send_lock = threading.Lock()
+        self._injector: Optional[UniversalInputInjector] = None
+
+    def update_geometry(self, scr_w: int, scr_h: int, mon_l: int = 0, mon_t: int = 0):
+        self.scr_w = max(1, scr_w)
+        self.scr_h = max(1, scr_h)
+        self.mon_l = mon_l
+        self.mon_t = mon_t
+        if self._injector:
+            self._injector.update_geometry(self.scr_w, self.scr_h, self.mon_l, self.mon_t)
 
     def _ensure_socket_connected(self) -> bool:
         with self._send_lock:
@@ -1137,13 +1218,12 @@ class InputReceiverThread(QThread):
                     self.sock = None
 
     def run(self):
-        injector = None
         try:
-            injector = UniversalInputInjector(
+            self._injector = UniversalInputInjector(
                 self.scr_w, self.scr_h, mon_left=self.mon_l, mon_top=self.mon_t
             )
         except Exception:
-            pass
+            self._injector = None
 
         self._ensure_socket_connected()
 
@@ -1204,13 +1284,15 @@ class InputReceiverThread(QThread):
                 try:
                     event = json.loads(raw_msg.decode("utf-8"))
                     if self.is_input_enabled_func():
-                        if injector:
-                            injector.execute(event)
+                        if self._injector:
+                            self._injector.execute(event)
                 except Exception:
                     pass
 
-        if injector:
-            injector.close()
+        if self._injector:
+            self._injector.close()
+            self._injector = None
+
         with self._send_lock:
             try:
                 if self.sock:

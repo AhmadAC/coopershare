@@ -1,22 +1,9 @@
-
 # ui_main.py
-
-"""
-Main Floating Frameless Controller UI, Collapsed Mini Pill, Context Menu & Remote Timer Dialog.
-Features persistent state loading and debounced saving to history.json,
-industry-standard real-time streaming presets (ABR frame budgeting for 60 FPS),
-with computer-specific dynamic color shades applied exclusively to the target computer dropdown box,
-vector SVG icons, dynamic audio-pause toggle feedback, full Linux Wayland/X11 move & opacity support,
-cross-platform physical host mute control (Windows WASAPI & Linux PipeWire/WirePlumber),
-toggleable Remote TV Viewer session controller, live 1-second GUI FPS counter,
-multi-IP friendly name manager for TVs, keyboard arrow navigation for device dropdown,
-graceful handling of remote TV receiver shutdown, and clean geometry constraints.
-Automatically commands the receiver window to maximize on connect so silent-mode displays share properly.
-"""
 
 import ctypes
 import math
 import re
+import subprocess
 import sys
 import time
 from typing import Optional
@@ -52,6 +39,7 @@ from utils import (
     SVG_CHEVRON_DOWN,
     SVG_CLOSE,
     SVG_DISPLAY,
+    SVG_EXTEND,
     SVG_LOGOUT,
     SVG_MAXIMIZE,
     SVG_MINIMIZE,
@@ -66,6 +54,7 @@ from utils import (
     SVG_VOLUME_MUTE,
     SVG_VOLUME_ON,
     create_application_icon,
+    create_mss_instance,
     exclude_from_capture,
     load_history,
     save_history,
@@ -437,6 +426,7 @@ class FloatingSenderWindow(QWidget):
         self.is_paused = False
         self.is_stream_muted = False
         self.is_host_muted = False
+        self.share_extension = bool(self.history_data.get("share_extension", False))
         self.input_enabled = bool(self.history_data.get("touch_input", True))
         self.allow_audio_when_paused = bool(self.history_data.get("allow_audio_when_paused", False))
 
@@ -927,12 +917,16 @@ class FloatingSenderWindow(QWidget):
         auto_row.addWidget(self.pin_input)
         self.card_layout.addLayout(auto_row)
 
-        # Row 4: Action Buttons (Pause/Resume, TV Audio Mute, Host Speaker Mute)
+        # Row 4: Action Buttons (Pause, Extend Screen, TV Audio, Host Mute)
         btn_row = QHBoxLayout()
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.setIcon(svg_to_icon(SVG_PAUSE, 14, "#ffffff"))
         self.pause_btn.clicked.connect(self.toggle_pause)
         self.pause_btn.setEnabled(False)
+
+        self.extend_btn = QPushButton("Extend Screen")
+        self.extend_btn.clicked.connect(self.toggle_share_extension)
+        self._update_extend_btn_ui()
 
         self.stream_mute_btn = QPushButton("TV Audio")
         self.stream_mute_btn.setIcon(svg_to_icon(SVG_VOLUME_ON, 14, "#ffffff"))
@@ -944,6 +938,7 @@ class FloatingSenderWindow(QWidget):
         self.host_mute_btn.clicked.connect(self.toggle_host_mute)
 
         btn_row.addWidget(self.pause_btn)
+        btn_row.addWidget(self.extend_btn)
         btn_row.addWidget(self.stream_mute_btn)
         btn_row.addWidget(self.host_mute_btn)
         self.card_layout.addLayout(btn_row)
@@ -1014,6 +1009,60 @@ class FloatingSenderWindow(QWidget):
 
         self.is_host_muted = HostAudioController.get_host_mute()
         self._update_host_mute_ui()
+
+    def _update_extend_btn_ui(self):
+        if not hasattr(self, "extend_btn"):
+            return
+        if self.share_extension:
+            self.extend_btn.setText("Screen Ext.")
+            self.extend_btn.setIcon(svg_to_icon(SVG_EXTEND, 14, "#ffffff"))
+            self.extend_btn.setToolTip("Currently sharing Screen Extension (Display 2). Click to switch to Main Screen.")
+            self.extend_btn.setStyleSheet(
+                "background-color: #0078d4; color: #ffffff; font-weight: bold;"
+            )
+        else:
+            self.extend_btn.setText("Extend Screen")
+            self.extend_btn.setIcon(svg_to_icon(SVG_EXTEND, 14, "#8f9bb3"))
+            self.extend_btn.setToolTip("Share Screen Extension (Display 2) when 2 displays are connected. Click to switch.")
+            self.extend_btn.setStyleSheet(
+                "background-color: #262c3b; color: #ffffff;"
+            )
+
+    def _get_target_monitor_geometry(self) -> tuple[int, int, int, int]:
+        with create_mss_instance() as sct:
+            num_mons = len(sct.monitors)
+            if self.share_extension and num_mons > 2:
+                m = sct.monitors[2]
+            else:
+                m = sct.monitors[1] if num_mons > 1 else sct.monitors[0]
+            return m.get("width", 1920), m.get("height", 1080), m.get("left", 0), m.get("top", 0)
+
+    def toggle_share_extension(self):
+        with create_mss_instance() as sct:
+            num_mons = len(sct.monitors) - 1
+
+        if not self.share_extension and num_mons < 2:
+            if sys.platform == "win32":
+                try:
+                    subprocess.Popen(["DisplaySwitch.exe", "/extend"])
+                    time.sleep(0.4)
+                except Exception:
+                    pass
+
+        self.share_extension = not self.share_extension
+        self.history_data["share_extension"] = self.share_extension
+        self._schedule_history_save()
+        self._update_extend_btn_ui()
+
+        if self.stream_thread and self.stream_thread.isRunning():
+            self.stream_thread.set_share_extension(self.share_extension)
+
+        if self.control_thread and self.control_thread.isRunning():
+            scr_w, scr_h, mon_l, mon_t = self._get_target_monitor_geometry()
+            self.control_thread.update_geometry(scr_w, scr_h, mon_l, mon_t)
+
+        mode_name = "Screen Extension (Display 2)" if self.share_extension else "Main Screen (Display 1)"
+        print(f"[Sender-Main] Target display set to: {mode_name}", flush=True)
 
     def on_fps_updated(self, fps: float):
         if self.stream_thread and self.stream_thread.isRunning() and not self.is_paused:
@@ -1191,17 +1240,7 @@ class FloatingSenderWindow(QWidget):
 
     def ensure_control_channel(self, target_ip: str) -> bool:
         if not self.control_thread or not self.control_thread.isRunning():
-            screen = self.screen() or QGuiApplication.primaryScreen()
-            if screen:
-                geom = screen.geometry()
-                dpr = float(screen.devicePixelRatio())
-                scr_w = max(1, int(round(geom.width() * dpr)))
-                scr_h = max(1, int(round(geom.height() * dpr)))
-                mon_l = int(round(geom.x() * dpr))
-                mon_t = int(round(geom.y() * dpr))
-            else:
-                scr_w, scr_h, mon_l, mon_t = 1920, 1080, 0, 0
-
+            scr_w, scr_h, mon_l, mon_t = self._get_target_monitor_geometry()
             self.control_thread = InputReceiverThread(
                 target_ip,
                 self.is_input_enabled,
@@ -1478,6 +1517,13 @@ class FloatingSenderWindow(QWidget):
 
         menu.addSeparator()
 
+        extend_act = QAction("Share Screen Extension (Display 2)", self)
+        extend_act.setIcon(svg_to_icon(SVG_EXTEND, 16, "#00a2ed" if self.share_extension else "#ffffff"))
+        extend_act.setCheckable(True)
+        extend_act.setChecked(self.share_extension)
+        extend_act.triggered.connect(self.toggle_share_extension)
+        menu.addAction(extend_act)
+
         timer_act = QAction("TV Timer...", self)
         timer_act.setIcon(svg_to_icon(SVG_TIMER, 16, "#00d084"))
         timer_act.triggered.connect(self.open_timer_dialog)
@@ -1712,7 +1758,12 @@ class FloatingSenderWindow(QWidget):
 
         target_quality, use_444, native_res = self._get_quality_settings()
 
-        print(f"\n[Sender-Main] Launching screen share session to {target_ip} ({chosen_fps} FPS, Q={target_quality})...", flush=True)
+        display_desc = "Screen Extension (Display 2)" if self.share_extension else "Main Screen (Display 1)"
+        print(
+            f"\n[Sender-Main] Launching screen share session to {target_ip} ({chosen_fps} FPS, Q={target_quality}) "
+            f"target: {display_desc}...",
+            flush=True,
+        )
         self.connect_btn.setText("Stop")
         self.connect_btn.setStyleSheet("background-color: #d83b01;")
         self.pause_btn.setEnabled(True)
@@ -1725,6 +1776,7 @@ class FloatingSenderWindow(QWidget):
             fps_limit=chosen_fps,
             use_444_chroma=use_444,
             native_resolution=native_res,
+            share_extension=self.share_extension,
         )
         self.stream_thread.status_changed.connect(self.on_stream_status)
         self.stream_thread.fps_updated.connect(self.on_fps_updated)
@@ -1735,7 +1787,6 @@ class FloatingSenderWindow(QWidget):
         self.audio_thread.start()
 
         self.ensure_control_channel(target_ip)
-        # Pre-emptively send maximize request to bring silent receiver out of tray
         QTimer.singleShot(250, lambda: self.send_receiver_window_command("maximize"))
 
     def stop_sharing(self):
@@ -1839,7 +1890,6 @@ class FloatingSenderWindow(QWidget):
                 if connected_ip not in self.history_data.get("devices", {}):
                     self.history_data.setdefault("devices", {})[connected_ip] = ""
                 self._schedule_history_save()
-            # Command receiver display to maximize onto full screen
             self.send_receiver_window_command("maximize")
         else:
             color = "#d83b01"

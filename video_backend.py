@@ -204,7 +204,7 @@ class WindowsDXGIGrabber:
 
     def __init__(self, target_monitor_index: int = 0):
         self.available = False
-        self.target_monitor_index = target_monitor_index
+        self.target_monitor_index = max(0, int(target_monitor_index))
         self.width = 0
         self.height = 0
         self.mon_left = 0
@@ -218,15 +218,19 @@ class WindowsDXGIGrabber:
         self.p_staging_tex = c_void_p()
 
         if sys.platform == "win32":
-            print("[DXGI-Init] Probing DirectX 11 Hardware Duplication interfaces...", flush=True)
+            print(f"[DXGI-Init] Probing DirectX 11 Hardware Duplication for monitor {self.target_monitor_index}...", flush=True)
             self.available = self._initialize()
             if self.available:
                 print(
-                    f"[DXGI-Init] SUCCESS: Hardware GPU Duplication ACTIVE ({self.width}x{self.height} at {self.mon_left},{self.mon_top})",
+                    f"[DXGI-Init] SUCCESS: Hardware GPU Duplication ACTIVE for monitor {self.target_monitor_index} "
+                    f"({self.width}x{self.height} at {self.mon_left},{self.mon_top})",
                     flush=True,
                 )
             else:
-                print("[DXGI-Init] DXGI hardware capture unavailable on display adapter, active fallback: FastGDI.", flush=True)
+                print(
+                    f"[DXGI-Init] DXGI hardware capture unavailable for monitor {self.target_monitor_index}, active fallback: FastGDI.",
+                    flush=True,
+                )
 
     def _initialize(self) -> bool:
         self._cleanup()
@@ -255,6 +259,7 @@ class WindowsDXGIGrabber:
 
             adapter_idx = 0
             feature_levels = (c_uint * 4)(0xB000, 0xA100, 0xA000, 0x9300)
+            desktop_mon_count = 0
 
             while True:
                 curr_adapter_p = c_void_p()
@@ -278,34 +283,22 @@ class WindowsDXGIGrabber:
                     get_out_desc(curr_out_p, byref(o_desc))
 
                     if o_desc.AttachedToDesktop:
-                        mon_w = int(o_desc.DesktopCoordinates.right - o_desc.DesktopCoordinates.left)
-                        mon_h = int(o_desc.DesktopCoordinates.bottom - o_desc.DesktopCoordinates.top)
+                        if desktop_mon_count == self.target_monitor_index:
+                            mon_w = int(o_desc.DesktopCoordinates.right - o_desc.DesktopCoordinates.left)
+                            mon_h = int(o_desc.DesktopCoordinates.bottom - o_desc.DesktopCoordinates.top)
 
-                        feature_level = c_uint(0)
-                        D3D11_SDK_VERSION = 7
-                        D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20
+                            feature_level = c_uint(0)
+                            D3D11_SDK_VERSION = 7
+                            D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20
 
-                        self.p_device = c_void_p()
-                        self.p_context = c_void_p()
+                            self.p_device = c_void_p()
+                            self.p_context = c_void_p()
 
-                        hr_dev = ctypes.windll.d3d11.D3D11CreateDevice(
-                            curr_adapter_p,
-                            0,
-                            None,
-                            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                            feature_levels,
-                            4,
-                            D3D11_SDK_VERSION,
-                            byref(self.p_device),
-                            byref(feature_level),
-                            byref(self.p_context),
-                        )
-                        if hr_dev != 0 or not self.p_device.value:
                             hr_dev = ctypes.windll.d3d11.D3D11CreateDevice(
                                 curr_adapter_p,
                                 0,
                                 None,
-                                0,
+                                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                 feature_levels,
                                 4,
                                 D3D11_SDK_VERSION,
@@ -313,31 +306,46 @@ class WindowsDXGIGrabber:
                                 byref(feature_level),
                                 byref(self.p_context),
                             )
+                            if hr_dev != 0 or not self.p_device.value:
+                                hr_dev = ctypes.windll.d3d11.D3D11CreateDevice(
+                                    curr_adapter_p,
+                                    0,
+                                    None,
+                                    0,
+                                    feature_levels,
+                                    4,
+                                    D3D11_SDK_VERSION,
+                                    byref(self.p_device),
+                                    byref(feature_level),
+                                    byref(self.p_context),
+                                )
 
-                        if hr_dev == 0 and self.p_device.value:
-                            out_qi = WINFUNCTYPE(HRESULT, c_void_p, POINTER(GUID), POINTER(c_void_p))(out_vtbl[0])
-                            hr_q = out_qi(curr_out_p, byref(IID_IDXGIOutput1), byref(p_output1))
+                            if hr_dev == 0 and self.p_device.value:
+                                out_qi = WINFUNCTYPE(HRESULT, c_void_p, POINTER(GUID), POINTER(c_void_p))(out_vtbl[0])
+                                hr_q = out_qi(curr_out_p, byref(IID_IDXGIOutput1), byref(p_output1))
 
-                            if hr_q == 0 and p_output1.value:
-                                out1_vtbl = ctypes.cast(p_output1, POINTER(POINTER(c_void_p))).contents
-                                dup_func = WINFUNCTYPE(HRESULT, c_void_p, c_void_p, POINTER(c_void_p))(out1_vtbl[22])
-                                hr_dup = dup_func(p_output1, self.p_device, byref(self.p_duplication))
-                                if hr_dup == 0 and self.p_duplication.value:
-                                    self.width = mon_w
-                                    self.height = mon_h
-                                    self.mon_left = int(o_desc.DesktopCoordinates.left)
-                                    self.mon_top = int(o_desc.DesktopCoordinates.top)
+                                if hr_q == 0 and p_output1.value:
+                                    out1_vtbl = ctypes.cast(p_output1, POINTER(POINTER(c_void_p))).contents
+                                    dup_func = WINFUNCTYPE(HRESULT, c_void_p, c_void_p, POINTER(c_void_p))(out1_vtbl[22])
+                                    hr_dup = dup_func(p_output1, self.p_device, byref(self.p_duplication))
+                                    if hr_dup == 0 and self.p_duplication.value:
+                                        self.width = mon_w
+                                        self.height = mon_h
+                                        self.mon_left = int(o_desc.DesktopCoordinates.left)
+                                        self.mon_top = int(o_desc.DesktopCoordinates.top)
 
-                                    if self._create_staging_texture():
-                                        _release_com_ptr(p_output1)
-                                        _release_com_ptr(curr_out_p)
-                                        _release_com_ptr(curr_adapter_p)
-                                        _release_com_ptr(p_factory)
-                                        return True
-                                _release_com_ptr(p_output1)
-                                p_output1 = c_void_p()
+                                        if self._create_staging_texture():
+                                            _release_com_ptr(p_output1)
+                                            _release_com_ptr(curr_out_p)
+                                            _release_com_ptr(curr_adapter_p)
+                                            _release_com_ptr(p_factory)
+                                            return True
+                                    _release_com_ptr(p_output1)
+                                    p_output1 = c_void_p()
 
-                            self._cleanup()
+                                self._cleanup()
+
+                        desktop_mon_count += 1
 
                     _release_com_ptr(curr_out_p)
                     out_idx += 1
@@ -401,6 +409,8 @@ class WindowsDXGIGrabber:
 
             hr = enum_outputs(p_adapter, self.target_monitor_index, byref(p_output))
             if hr != 0 or not p_output.value:
+                if self.target_monitor_index != 0:
+                    return False
                 hr = enum_outputs(p_adapter, 0, byref(p_output))
                 if hr != 0 or not p_output.value:
                     return False
@@ -500,7 +510,6 @@ class WindowsDXGIGrabber:
                 return self.last_frame
 
             ctx_vtbl = ctypes.cast(self.p_context, POINTER(POINTER(c_void_p))).contents
-            # Index 52 is ID3D11DeviceContext::CopyResource
             copy_resource = WINFUNCTYPE(None, c_void_p, c_void_p, c_void_p)(ctx_vtbl[52])
             copy_resource(self.p_context, self.p_staging_tex, p_desktop_tex)
 
@@ -508,7 +517,6 @@ class WindowsDXGIGrabber:
             _release_com_ptr(p_resource)
             release_frame_func(self.p_duplication)
 
-            # Index 14 is ID3D11DeviceContext::Map, Index 15 is Unmap
             map_func = WINFUNCTYPE(
                 HRESULT, c_void_p, c_void_p, c_uint, c_uint, c_uint, POINTER(D3D11_MAPPED_SUBRESOURCE)
             )(ctx_vtbl[14])
@@ -534,7 +542,7 @@ class WindowsDXGIGrabber:
             unmap_func(self.p_context, self.p_staging_tex, 0)
 
             if not self.first_frame_logged:
-                print(f"[DXGI-Perf] Hardware GPU frame captured successfully ({self.width}x{self.height})", flush=True)
+                print(f"[DXGI-Perf] Hardware GPU frame captured for monitor {self.target_monitor_index} ({self.width}x{self.height})", flush=True)
                 self.first_frame_logged = True
 
             self.last_frame = frame_bgra
@@ -717,7 +725,6 @@ def render_cursor_on_frame(
             cx = int(round((gx - monitor_left) * scale_factor))
             cy = int(round((gy - monitor_top) * scale_factor))
 
-    # Allow cursor to be rendered even when positioned directly on or partially past screen boundaries
     if -32 <= cx < (w + 32) and -32 <= cy < (h + 32):
         size_mult = max(1.0, scale_factor if sys.platform != "win32" else 1.0)
         if orig_screen_w > 0 and w != orig_screen_w:
