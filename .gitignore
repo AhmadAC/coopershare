@@ -2,13 +2,14 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+*.desktop
+*.lnk
 # Virtual environments
 venv/
 env/
 maxhub_env/
 .venv/
-
+history.json
 # PyInstaller / AppImage Build outputs
 build/
 dist/

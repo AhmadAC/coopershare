@@ -4,13 +4,15 @@
 MrCoopersScreenShare - Receiver (Interactive Touch Display & Sound Hub)
 Features:
 - True H.264 Real-Time Hardware/Low-Latency Video Stream Decoder & Turbo-JPEG fallback
+- Guaranteed Fullscreen Mode: Automatically locks and enforces true borderless fullscreen
+  whenever screen sharing connects or streams, eliminating taskbar overlap and windowed borders
 - Fullscreen Frameless Mode, Local Script / Executable Launcher with JSON History Memory
 - Local & Remote Timer Launcher with Robust sys.argv Argument Passing (Raw Numbers / Unit Strings)
 - Reverse Desktop Screen Streaming & Interactive Remote Input (Mouse + Keyboard / Hotkeys)
-- Remote Window Management (Maximize, Normal, Minimize)
+- Remote Window Management (Maximize/Fullscreen, Normal, Minimize)
 - Right-Click Context Menu (Silent Mode, Run Script, Show Timer, Fullscreen, Standby Details Visibility)
 - Silent Mode with System Tray minimization (hidden from taskbar, remembered across restarts)
-- Auto-Maximization out of Silent Mode upon sender screen share connection
+- Auto-Fullscreen and wake-up out of Silent Mode upon sender screen share connection
 - Dynamic Audio Playback, Native Win32 / Universal Input Injection (evdev/pynput)
 - UDP Discovery Beacon, 4-Digit PIN Authentication
 - Zero-Copy High-FPS Direct QImage Surface Rendering
@@ -124,6 +126,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QStackedWidget,
+    QStyle,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -281,6 +284,12 @@ def create_application_icon() -> QIcon:
         if not os.path.exists(ico_dest):
             pix_64 = icon.pixmap(64, 64)
             pix_64.save(ico_dest, "ICO")
+            
+        # CRITICAL FIX: Reload standard .ICO format natively so it shows up in Windows System Tray
+        if sys.platform == "win32" and os.path.exists(ico_dest):
+            ico_icon = QIcon(ico_dest)
+            if not ico_icon.isNull():
+                return ico_icon
     except Exception:
         pass
 
@@ -814,6 +823,10 @@ class LocalRunScriptDialog(QDialog):
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self.config = config
+        
+        # Ensures Dialog pops up visibly when screen is locked TopMost Fullscreen
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        
         self.setWindowTitle("Run Script / Executable on Display")
         self.setFixedWidth(520)
         self.setStyleSheet(
@@ -934,6 +947,10 @@ class LocalTimerDialog(QDialog):
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self.config = config
+        
+        # Ensures Dialog pops up visibly when screen is locked TopMost Fullscreen
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        
         self.setWindowTitle("Set Display Timer")
         self.setFixedWidth(380)
         self.setStyleSheet(
@@ -1762,8 +1779,45 @@ class ReceiverMainWindow(QMainWindow):
 
         self._ensure_frameless_style()
 
+    def _drop_topmost(self):
+        """Temporarily release TopMost priority so right-click menus and dialogs aren't rendered underneath the app."""
+        if sys.platform == "win32" and self.isFullScreen():
+            try:
+                hwnd = int(self.winId())
+                HWND_NOTOPMOST = -2
+                SWP_NOMOVE = 0x0002
+                SWP_NOSIZE = 0x0001
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE
+                )
+            except Exception as e:
+                logger.debug(f"Drop topmost error: {e}")
+
+    def _restore_topmost(self):
+        """Restores Native Win32 TopMost priority to cover taskbars seamlessly after the user closes the Menu/Dialog."""
+        if sys.platform == "win32" and self.isFullScreen() and self.isVisible():
+            try:
+                hwnd = int(self.winId())
+                HWND_TOPMOST = -1
+                SWP_NOMOVE = 0x0002
+                SWP_NOSIZE = 0x0001
+                SWP_SHOWWINDOW = 0x0040
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                )
+            except Exception as e:
+                logger.debug(f"Restore topmost error: {e}")
+
     def _setup_system_tray(self, app_icon: QIcon):
         self.tray_icon = QSystemTrayIcon(self)
+        
+        # Absolute fallback for Windows shell rendering limitations if the generated icon was null
+        if app_icon.isNull() or not app_icon.availableSizes():
+            try:
+                app_icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            except Exception:
+                pass
+                
         self.tray_icon.setIcon(app_icon)
         self.tray_icon.setToolTip("MrCoopersScreenShare Receiver")
 
@@ -1816,6 +1870,8 @@ class ReceiverMainWindow(QMainWindow):
 
         self.tray_icon.setContextMenu(self.tray_menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
+        
+        self.tray_icon.setVisible(True)
         self.tray_icon.show()
 
     def _on_tray_activated(self, reason):
@@ -1829,43 +1885,24 @@ class ReceiverMainWindow(QMainWindow):
             else:
                 self.restore_from_tray()
 
-    def hide_to_tray(self):
+    def hide_to_tray(self, show_notification: bool = True):
         self.hide()
+        
+        if show_notification:
+            try:
+                if self.tray_icon.isVisible():
+                    self.tray_icon.showMessage(
+                        "MrCoopersScreenShare",
+                        "Receiver is running in Silent Mode.\nDouble-click the tray icon to restore.",
+                        QSystemTrayIcon.MessageIcon.Information,
+                        3000
+                    )
+            except Exception as e:
+                logger.debug(f"Tray message error: {e}")
 
     def maximize_receiver_window(self):
-        """Restores and maximizes the display frameless window reliably to full display."""
-        if self.isMinimized() or self.isHidden() or not self.isVisible():
-            self.showNormal()
-        self.show()
+        """Wakes up the application from the tray and enforces true fullscreen."""
         self.set_receiver_fullscreen(True)
-        self._ensure_frameless_style()
-        self.raise_()
-        self.activateWindow()
-
-        if sys.platform == "win32":
-            try:
-                hwnd = int(self.winId())
-                SW_RESTORE = 9
-                SW_SHOWMAXIMIZED = 3
-                ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
-                ctypes.windll.user32.ShowWindow(hwnd, SW_SHOWMAXIMIZED)
-
-                HWND_TOPMOST = -1
-                HWND_NOTOPMOST = -2
-                SWP_NOMOVE = 0x0002
-                SWP_NOSIZE = 0x0001
-                SWP_SHOWWINDOW = 0x0040
-
-                ctypes.windll.user32.SetWindowPos(
-                    hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
-                )
-                ctypes.windll.user32.SetWindowPos(
-                    hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
-                )
-                ctypes.windll.user32.SetForegroundWindow(hwnd)
-                ctypes.windll.user32.BringWindowToTop(hwnd)
-            except Exception as e:
-                logger.debug(f"Win32 maximize foreground notice: {e}")
 
     def restore_from_tray(self):
         self.maximize_receiver_window()
@@ -1883,7 +1920,8 @@ class ReceiverMainWindow(QMainWindow):
             self.tray_silent_act.setChecked(self.silent_mode)
 
         if self.silent_mode:
-            self.hide_to_tray()
+            # Send balloon notification to help users find it
+            self.hide_to_tray(show_notification=True)
         else:
             if self.isHidden() or self.isMinimized():
                 self.restore_from_tray()
@@ -1943,10 +1981,33 @@ class ReceiverMainWindow(QMainWindow):
             except Exception as e:
                 logger.debug(f"Frameless enforcement notice: {e}")
 
-    def set_receiver_fullscreen(self, fullscreen: bool):
+    def set_receiver_fullscreen(self, fullscreen: bool = True):
+        """Safely transitions between windowed mode and true borderless fullscreen."""
         if fullscreen:
-            self.showFullScreen()
+            if self.isMinimized() or self.isHidden() or not self.isVisible():
+                self.showNormal()
+            self.show()
+            self.setWindowState(Qt.WindowFullScreen)
+            self.raise_()
+            self.activateWindow()
+
+            if sys.platform == "win32":
+                try:
+                    hwnd = int(self.winId())
+                    HWND_TOPMOST = -1
+                    SWP_NOMOVE = 0x0002
+                    SWP_NOSIZE = 0x0001
+                    SWP_SHOWWINDOW = 0x0040
+                    # Force the fullscreen window ABOVE the taskbar natively
+                    ctypes.windll.user32.SetWindowPos(
+                        hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                    )
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                    ctypes.windll.user32.BringWindowToTop(hwnd)
+                except Exception as e:
+                    logger.debug(f"Win32 topmost enforcement notice: {e}")
         else:
+            self.setWindowState(Qt.WindowNoState)
             self.showNormal()
             screen = self.screen() or QApplication.primaryScreen()
             if screen:
@@ -2133,17 +2194,21 @@ class ReceiverMainWindow(QMainWindow):
             logger.error(f"Failed to run timer: {ex}")
 
     def open_local_script_dialog(self):
+        self._drop_topmost()
         dlg = LocalRunScriptDialog(self.config, self)
         if dlg.exec() == QDialog.Accepted:
             path, args = dlg.get_data()
             if path:
                 self.execute_local_script(path, args)
+        self._restore_topmost()
 
     def open_local_timer_dialog(self):
+        self._drop_topmost()
         dlg = LocalTimerDialog(self.config, self)
         if dlg.exec() == QDialog.Accepted:
             args = dlg.get_args()
             self.execute_local_timer(args)
+        self._restore_topmost()
 
     def on_control_command(self, cmd: dict):
         cmd_type = cmd.get("type")
@@ -2159,7 +2224,7 @@ class ReceiverMainWindow(QMainWindow):
 
         if cmd_type == "window_control":
             action = cmd.get("action")
-            if action == "maximize":
+            if action in ("maximize", "fullscreen"):
                 self.maximize_receiver_window()
             elif action == "normal":
                 if self.isMinimized() or self.isHidden():
@@ -2169,7 +2234,7 @@ class ReceiverMainWindow(QMainWindow):
                 self.activateWindow()
             elif action == "minimize":
                 if self.silent_mode:
-                    self.hide_to_tray()
+                    self.hide_to_tray(show_notification=True)
                 else:
                     self.showMinimized()
 
@@ -2185,7 +2250,7 @@ class ReceiverMainWindow(QMainWindow):
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Escape:
             if self.silent_mode:
-                self.hide_to_tray()
+                self.hide_to_tray(show_notification=True)
             else:
                 self.close()
         elif event.key() == Qt.Key_F11:
@@ -2212,8 +2277,14 @@ class ReceiverMainWindow(QMainWindow):
     def show_context_menu(self, global_pos: Optional[QPoint] = None):
         if global_pos is None:
             global_pos = QCursor.pos()
+            
+        self._drop_topmost()
 
         menu = QMenu(self)
+        
+        # Ensures Context Menu pops up visibly when screen is locked TopMost
+        menu.setWindowFlags(menu.windowFlags() | Qt.WindowStaysOnTopHint)
+        
         menu.setStyleSheet(
             """
             QMenu {
@@ -2259,7 +2330,7 @@ class ReceiverMainWindow(QMainWindow):
         toggle_info_act.triggered.connect(self.toggle_details_visibility)
         menu.addAction(toggle_info_act)
 
-        silent_act = QAction("Silent Mode", self)
+        silent_act = QAction("Silent Mode (Hide to Tray)", self)
         silent_act.setIcon(svg_to_icon(REC_SVG_SILENT, 16, "#00a2ed" if self.silent_mode else "#ffffff"))
         silent_act.setCheckable(True)
         silent_act.setChecked(self.silent_mode)
@@ -2269,7 +2340,7 @@ class ReceiverMainWindow(QMainWindow):
         if self.silent_mode:
             min_tray_act = QAction("Minimize to System Tray", self)
             min_tray_act.setIcon(svg_to_icon(REC_SVG_MINIMIZE, 16, "#8f9bb3"))
-            min_tray_act.triggered.connect(self.hide_to_tray)
+            min_tray_act.triggered.connect(lambda: self.hide_to_tray(show_notification=True))
             menu.addAction(min_tray_act)
 
         menu.addSeparator()
@@ -2298,26 +2369,33 @@ class ReceiverMainWindow(QMainWindow):
         menu.addAction(exit_act)
 
         menu.exec(global_pos)
+        
+        self._restore_topmost()
 
     def on_connected(self, ip: str):
         self.canvas.control_server = self.control_thread
         self.stack.setCurrentWidget(self.canvas)
-        # Automatically unhide from system tray and maximize display GUI on connect
-        self.maximize_receiver_window()
+        # Always enforce full screen on the receiver when screen sharing connects
+        self.set_receiver_fullscreen(True)
 
     def on_disconnected(self):
         self.canvas.current_frame = None
         self.stack.setCurrentWidget(self.standby)
         if self.silent_mode:
-            self.hide_to_tray()
+            self.hide_to_tray(show_notification=False)
         else:
             self._ensure_frameless_style()
 
     def on_frame(self, img: QImage):
+        # Ensure canvas is active and display is guaranteed fullscreen whenever streaming frames
         if self.stack.currentWidget() != self.canvas:
             self.stack.setCurrentWidget(self.canvas)
-        if not self.isVisible() or self.isMinimized():
             self.maximize_receiver_window()
+            
+        # Only force wake-up if the user completely minimized or hid the window
+        elif not self.isVisible() or self.isMinimized():
+            self.maximize_receiver_window()
+
         self.canvas.update_frame(img)
 
     def closeEvent(self, event):
@@ -2364,6 +2442,7 @@ if __name__ == "__main__":
         win.show()
         win.set_receiver_fullscreen(True)
     else:
-        win.hide_to_tray()
+        # Don't throw notification balloons out automatically if they boot up their pc in silent mode
+        win.hide_to_tray(show_notification=False)
 
     sys.exit(app.exec())

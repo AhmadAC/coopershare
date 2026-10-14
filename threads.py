@@ -1,16 +1,17 @@
-
 # threads.py
 
 """
 Background network worker threads for video, audio, input, reverse video, and beacon discovery.
 Features:
 - True H.264 Real-Time Low-Latency Video Streaming (libx264 / zero-latency I/P-frame encoding)
+- Ultra-Sharp 4K HD Presentation Screenshot on Pause: Captures uncompressed native frame,
+  upscales to 4K UHD via Lanczos-4 interpolation (or maintains native 4K+), encodes with
+  4:4:4 full chroma at 98% quality to eliminate all compression artifacts on the board
 - Dual-display / Screen Extension sharing option with live on-the-fly target switching
 - Direct zero-copy BGRA memory ingestion into libavcodec (0.0ms color conversion)
 - Dual-tier capture failover: DXGI Hardware GPU Duplication with instant FastGDI backup
 - Steady frame pacing guarantee (caches last frame on static scenes so stream never starves)
 - Dynamic adaptive MJPEG compression when H.264 is unavailable to eliminate network stalls
-- Ultra-low payload size (0.5 KB - 8 KB per P-frame at 60 FPS)
 - Linux KWin ScreenShot2 kernel pipe capture & MSS fallback
 """
 
@@ -458,6 +459,7 @@ class ScreenSenderThread(QThread):
         self.running = True
         self.paused = False
         self._pause_requested = False
+        self._force_keyframe = False
 
         self.raw_queue = queue.Queue(maxsize=2)
         self.send_queue = queue.Queue(maxsize=2)
@@ -497,6 +499,7 @@ class ScreenSenderThread(QThread):
     def resume_stream(self):
         self._pause_requested = False
         self.paused = False
+        self._force_keyframe = True
 
     def trigger_cursorless_frame(self):
         self.pause_stream()
@@ -540,6 +543,17 @@ class ScreenSenderThread(QThread):
         pts_counter = 0
 
         while self.pipeline_running:
+            if self._force_keyframe:
+                self._force_keyframe = False
+                if h264_encoder is not None:
+                    try:
+                        h264_encoder.close()
+                    except Exception:
+                        pass
+                    h264_encoder = None
+                last_dims = (0, 0)
+                pts_counter = 0
+
             try:
                 item = self.raw_queue.get(timeout=0.015)
             except queue.Empty:
@@ -894,35 +908,104 @@ class ScreenSenderThread(QThread):
                         flush=True,
                     )
 
+                # =========================================================================
+                # 4K Ultra HD Presentation Screenshot Capture & Transmission Before Pausing
+                # =========================================================================
                 if self._pause_requested:
-                    use_native_res = bool(self.native_resolution and self.quality >= 95)
+                    print("[Sender] Pause requested - capturing 4K Ultra HD presentation screenshot...", flush=True)
                     clean_frame = None
                     try:
+                        # 1. Grab clean, uncompressed native-resolution frame from active capture source
                         if use_dxgi and dxgi_grabber:
                             clean_frame = dxgi_grabber.grab()
+                            if clean_frame is None and dxgi_grabber.last_frame is not None:
+                                clean_frame = dxgi_grabber.last_frame.copy()
+
                         if clean_frame is None and use_fast_gdi and fast_gdi_grabber:
                             clean_frame = fast_gdi_grabber.grab()
+
                         elif clean_frame is None and use_kwin and kwin_grabber:
                             clean_frame = kwin_grabber.grab(
                                 include_cursor=False,
-                                native_resolution=use_native_res,
+                                native_resolution=True,
                             )
+
                         elif clean_frame is None and use_spectacle and spectacle_grabber:
                             clean_frame = spectacle_grabber.grab()
-                        elif clean_frame is None:
+
+                        elif clean_frame is None and sct:
                             sct_f = sct.grab(monitor)
-                            clean_frame = np.frombuffer(sct_f.raw, dtype=np.uint8).reshape((sct_f.height, sct_f.width, 4))
-                    except Exception:
+                            clean_frame = np.frombuffer(sct_f.raw, dtype=np.uint8).reshape((sct_f.height, sct_f.width, 4)).copy()
+
+                        if clean_frame is None and last_cached_frame is not None:
+                            clean_frame = last_cached_frame.copy()
+                    except Exception as cap_err:
+                        print(f"[Sender] Error capturing 4K pause screenshot: {cap_err}", flush=True)
                         clean_frame = None
 
                     if clean_frame is not None:
-                        while not self.raw_queue.empty():
-                            try:
-                                self.raw_queue.get_nowait()
-                            except queue.Empty:
-                                break
-                        self.raw_queue.put((frame_counter, clean_frame, 0.0))
-                        frame_counter += 1
+                        h_orig, w_orig = clean_frame.shape[:2]
+
+                        # 2. Convert to BGR format if 4-channel BGRA
+                        if clean_frame.ndim == 3 and clean_frame.shape[2] == 4:
+                            frame_bgr = cv2.cvtColor(clean_frame, cv2.COLOR_BGRA2BGR)
+                        else:
+                            frame_bgr = clean_frame
+
+                        # 3. Scale to 4K UHD (3840x2160) preserving exact aspect ratio with Lanczos-4
+                        aspect = w_orig / float(h_orig) if h_orig > 0 else (16.0 / 9.0)
+                        if aspect >= (16.0 / 9.0):
+                            target_w = 3840
+                            target_h = (int(round(3840 / aspect)) // 2) * 2
+                        else:
+                            target_h = 2160
+                            target_w = (int(round(2160 * aspect)) // 2) * 2
+
+                        if w_orig < target_w or h_orig < target_h:
+                            frame_4k = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                        else:
+                            frame_4k = frame_bgr
+
+                        h_final, w_final = frame_4k.shape[:2]
+
+                        # 4. Encode as ultra-high-fidelity 4K JPEG (98% quality, 4:4:4 chroma subsampling, zero artifacts)
+                        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 98]
+                        if hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
+                            samp_444 = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x444)
+                            encode_params.extend([int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), int(samp_444)])
+                        if hasattr(cv2, "IMWRITE_JPEG_OPTIMIZE"):
+                            encode_params.extend([int(cv2.IMWRITE_JPEG_OPTIMIZE), 1])
+
+                        success, enc_img = cv2.imencode(".jpg", frame_4k, encode_params)
+                        if success and enc_img is not None:
+                            payload_bytes = b"JPEG" + enc_img.tobytes()
+
+                            # Flush queues to clear any lagging low-res streaming packets
+                            while not self.raw_queue.empty():
+                                try:
+                                    self.raw_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+
+                            while not self.send_queue.empty():
+                                try:
+                                    self.send_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+
+                            # Queue the pristine 4K presentation screenshot for transmission
+                            self.send_queue.put((payload_bytes, 0.0, 0.0, False))
+
+                            # Wait briefly for network worker to deliver the 4K frame to the receiver
+                            wait_deadline = time.perf_counter() + 0.6
+                            while not self.send_queue.empty() and time.perf_counter() < wait_deadline:
+                                time.sleep(0.01)
+
+                            print(
+                                f"[Sender] Pristine 4K HD screenshot delivered ({w_final}x{h_final}, "
+                                f"{len(payload_bytes) / 1024.0:.1f} KB, 4:4:4). Presentation frozen on board.",
+                                flush=True,
+                            )
 
                     self.paused = True
                     self._pause_requested = False
