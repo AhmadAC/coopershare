@@ -265,6 +265,253 @@ X-KDE-Wayland-Interfaces=org_kde_plasma_window_management,zkde_screencast_unstab
                     pass
 
 
+def ensure_kwin_rules(force: bool = False):
+    """
+    Installs and enforces KWin compositor window rules and a companion KWin script
+    on KDE Plasma 6 (Fedora 44 Kinoite / KDE Wayland).
+    Guarantees that MrCoopersScreenShare Sender stays in the KeepAbove layer
+    above all other windows (even other always-on-top windows) via:
+      1. ~/.config/kwinrulesrc rule with above=true, aboverule=2 (Force), matching substring.
+      2. ~/.local/share/kwin/scripts/mrcoopers-topmost KWin script that listens to
+         workspace.windowActivated and workspace.windowAdded to re-raise MrCoopersScreenShare
+         compositor-side without focus-stealing.
+      3. Live KWin reconfiguration via D-Bus (qdbus6 / qdbus / dbus-send).
+    """
+    if not sys.platform.startswith("linux"):
+        return
+
+    rule_group = "mrcoopers-sender-keepabove"
+    kwinrulesrc = os.path.expanduser("~/.config/kwinrulesrc")
+    updated_rules = False
+
+    try:
+        content = ""
+        if os.path.exists(kwinrulesrc):
+            with open(kwinrulesrc, "r", encoding="utf-8") as f:
+                content = f.read()
+
+        needs_rule_write = force or (f"[{rule_group}]" not in content) or ("aboverule=2" not in content)
+
+        if needs_rule_write:
+            rule_block = f"""
+[{rule_group}]
+Description=MrCoopersScreenShare Sender Force Always On Top
+above=true
+aboverule=2
+title=MrCoopersScreenShare
+titlematch=2
+wmclass=mrcoopers-screenshare-sender
+wmclassmatch=2
+wmclasscomplete=false
+types=4294967295
+"""
+            if "[General]" in content:
+                lines = content.splitlines()
+                new_lines = []
+                in_general = False
+                general_handled = False
+
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped == "[General]":
+                        in_general = True
+                        new_lines.append(line)
+                        continue
+                    elif stripped.startswith("[") and in_general:
+                        in_general = False
+
+                    if in_general and stripped.startswith("rules="):
+                        existing_rules = stripped.split("=", 1)[1].strip()
+                        rule_list = [r.strip() for r in existing_rules.split(",") if r.strip()]
+                        if rule_group not in rule_list:
+                            rule_list.append(rule_group)
+                        new_lines.append(f"rules={','.join(rule_list)}")
+                        general_handled = True
+                    elif in_general and stripped.startswith("count="):
+                        continue
+                    else:
+                        new_lines.append(line)
+
+                clean_content = "\n".join(new_lines)
+                if not general_handled:
+                    clean_content = clean_content.replace(
+                        "[General]", f"[General]\nrules={rule_group}\ncount=1"
+                    )
+
+                if f"[{rule_group}]" in clean_content:
+                    parts = clean_content.split(f"[{rule_group}]")
+                    before = parts[0]
+                    after = parts[1]
+                    next_sec_idx = after.find("\n[")
+                    if next_sec_idx != -1:
+                        remainder = after[next_sec_idx:]
+                    else:
+                        remainder = ""
+                    clean_content = before + rule_block.strip() + remainder
+                else:
+                    clean_content = clean_content.strip() + "\n" + rule_block
+
+                with open(kwinrulesrc, "w", encoding="utf-8") as f:
+                    f.write(clean_content.strip() + "\n")
+            else:
+                with open(kwinrulesrc, "w", encoding="utf-8") as f:
+                    f.write(f"[General]\ncount=1\nrules={rule_group}\n" + rule_block.strip() + "\n")
+
+            updated_rules = True
+
+        if shutil.which("kwriteconfig6"):
+            try:
+                subprocess.run(
+                    ["kwriteconfig6", "--file", "kwinrulesrc", "--group", rule_group, "--key", "above", "--type", "bool", "true"],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    ["kwriteconfig6", "--file", "kwinrulesrc", "--group", rule_group, "--key", "aboverule", "2"],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    ["kwriteconfig6", "--file", "kwinrulesrc", "--group", rule_group, "--key", "title", "MrCoopersScreenShare"],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    ["kwriteconfig6", "--file", "kwinrulesrc", "--group", rule_group, "--key", "titlematch", "2"],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    ["kwriteconfig6", "--file", "kwinrulesrc", "--group", rule_group, "--key", "types", "4294967295"],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        script_base = os.path.expanduser("~/.local/share/kwin/scripts/mrcoopers-topmost")
+        code_dir = os.path.join(script_base, "contents", "code")
+        os.makedirs(code_dir, exist_ok=True)
+
+        meta_path = os.path.join(script_base, "metadata.json")
+        meta_content = {
+            "KPlugin": {
+                "Name": "MrCoopersScreenShare Topmost Helper",
+                "Description": "Enforces MrCoopersScreenShare as the most top window",
+                "Icon": "preferences-system-windows",
+                "Id": "mrcoopers-topmost",
+                "Version": "1.0",
+                "Authors": [{"Name": "MrCoopers"}],
+                "License": "GPLv3",
+            },
+            "X-Plasma-API": "javascript",
+            "X-Plasma-MainScript": "code/main.js",
+            "KPackageStructure": "KWin/Script",
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_content, f, indent=4)
+
+        script_path = os.path.join(code_dir, "main.js")
+        script_js = """function enforceTopmost() {
+    try {
+        var list = workspace.stackingOrder;
+        for (var i = 0; i < list.length; i++) {
+            var w = list[i];
+            if (w && w.caption && w.caption.indexOf("MrCoopersScreenShare") !== -1) {
+                w.keepAbove = true;
+                workspace.raiseWindow(w);
+            }
+        }
+    } catch (e) {}
+}
+
+if (typeof workspace.windowActivated !== "undefined") {
+    workspace.windowActivated.connect(function(w) {
+        enforceTopmost();
+    });
+}
+if (typeof workspace.windowAdded !== "undefined") {
+    workspace.windowAdded.connect(function(w) {
+        enforceTopmost();
+    });
+}
+"""
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(script_js)
+
+        kwinrc_path = os.path.expanduser("~/.config/kwinrc")
+        kwinrc_content = ""
+        if os.path.exists(kwinrc_path):
+            with open(kwinrc_path, "r", encoding="utf-8") as f:
+                kwinrc_content = f.read()
+
+        if "mrcoopers-topmostEnabled=true" not in kwinrc_content:
+            if "[Plugins]" in kwinrc_content:
+                kwinrc_content = kwinrc_content.replace(
+                    "[Plugins]", "[Plugins]\nmrcoopers-topmostEnabled=true"
+                )
+            else:
+                kwinrc_content = kwinrc_content.strip() + "\n\n[Plugins]\nmrcoopers-topmostEnabled=true\n"
+
+            with open(kwinrc_path, "w", encoding="utf-8") as f:
+                f.write(kwinrc_content.strip() + "\n")
+            updated_rules = True
+
+        if shutil.which("kwriteconfig6"):
+            try:
+                subprocess.run(
+                    ["kwriteconfig6", "--file", "kwinrc", "--group", "Plugins", "--key", "mrcoopers-topmostEnabled", "true"],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if updated_rules or force:
+        for qdbus_bin in ("qdbus6", "qdbus", "qdbus-qt6"):
+            if shutil.which(qdbus_bin):
+                try:
+                    subprocess.run(
+                        [qdbus_bin, "org.kde.KWin", "/KWin", "reconfigure"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=1.5,
+                    )
+                    break
+                except Exception:
+                    pass
+
+        if shutil.which("dbus-send"):
+            try:
+                subprocess.run(
+                    [
+                        "dbus-send",
+                        "--session",
+                        "--type=method_call",
+                        "--dest=org.kde.KWin",
+                        "/KWin",
+                        "org.kde.KWin.reconfigure",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1.5,
+                )
+            except Exception:
+                pass
+
+
+def raise_wayland_topmost(window):
+    """Re-asserts topmost priority on Wayland compositors (KWin / Mutter / wlroots)."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        window.raise_()
+        wh = window.windowHandle()
+        if wh and hasattr(wh, "raise_"):
+            wh.raise_()
+    except Exception:
+        pass
+
+
 def create_application_icon() -> QIcon:
     for candidate in (
         os.path.join(STORAGE_DIR, "icon.ico"),

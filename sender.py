@@ -59,12 +59,14 @@ from ui_main import FloatingSenderWindow
 from utils import (
     create_application_icon,
     ensure_kde_desktop_entry,
+    ensure_kwin_rules,
     ensure_uinput_permissions,
 )
 
 # Ensure KDE screen capture & Linux kernel touch permissions exist
 ensure_kde_desktop_entry()
 ensure_uinput_permissions()
+ensure_kwin_rules()
 
 if __name__ == "__main__":
     if sys.platform == "win32":

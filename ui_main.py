@@ -1,3 +1,4 @@
+
 # ui_main.py
 
 import ctypes
@@ -55,8 +56,10 @@ from utils import (
     SVG_VOLUME_ON,
     create_application_icon,
     create_mss_instance,
+    ensure_kwin_rules,
     exclude_from_capture,
     load_history,
+    raise_wayland_topmost,
     save_history,
     svg_to_icon,
     svg_to_pixmap,
@@ -537,13 +540,21 @@ class FloatingSenderWindow(QWidget):
                 hwnd = int(self.winId())
                 GWL_EXSTYLE = -20
                 WS_EX_TOPMOST = 0x00000008
+                WS_EX_TOOLWINDOW = 0x00000080
                 ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                if not (ex_style & WS_EX_TOPMOST):
+                target_ex = ex_style | WS_EX_TOPMOST
+                if self.is_mini_mode:
+                    target_ex |= WS_EX_TOOLWINDOW
+                if (ex_style & target_ex) != target_ex:
                     ctypes.windll.user32.SetWindowLongW(
-                        hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOPMOST
+                        hwnd, GWL_EXSTYLE, target_ex
                     )
 
                 HWND_TOPMOST = -1
+                SWP_NOSIZE = 0x0001
+                SWP_NOMOVE = 0x0002
+                SWP_NOACTIVATE = 0x0010
+                SWP_SHOWWINDOW = 0x0040
                 ctypes.windll.user32.SetWindowPos(
                     hwnd,
                     HWND_TOPMOST,
@@ -551,14 +562,14 @@ class FloatingSenderWindow(QWidget):
                     0,
                     0,
                     0,
-                    0x0002 | 0x0001 | 0x0010,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 )
+                ctypes.windll.user32.BringWindowToTop(hwnd)
             except Exception:
                 pass
             self.raise_()
         else:
-            if self.is_mini_mode or self.isActiveWindow():
-                self.raise_()
+            raise_wayland_topmost(self)
 
     def _on_topmost_timer(self):
         if self.is_any_popup_open():
@@ -602,8 +613,7 @@ class FloatingSenderWindow(QWidget):
                 if not self.isMinimized():
                     if hasattr(self, "_expanded_size") and self.size() != self._expanded_size:
                         self.setFixedSize(self._expanded_size)
-                    if sys.platform == "win32":
-                        self.enforce_always_on_top()
+                    self.enforce_always_on_top()
         super().changeEvent(event)
 
     def _update_device_combo_style(self, device_text: Optional[str] = None):
@@ -1148,15 +1158,23 @@ class FloatingSenderWindow(QWidget):
 
     def collapse_to_mini(self):
         self.is_mini_mode = True
+        if hasattr(self, "topmost_timer"):
+            self.topmost_timer.setInterval(200)
         self.stack.setCurrentWidget(self.mini_container)
         self.apply_opacity(0.35)
         self.setFixedSize(48, 16)
         self.enforce_always_on_top()
+        QTimer.singleShot(40, self.enforce_always_on_top)
+        QTimer.singleShot(120, self.enforce_always_on_top)
+        if sys.platform.startswith("linux"):
+            ensure_kwin_rules()
 
     def expand_window(self):
         self.is_mini_mode = False
         if hasattr(self, "pulse_timer") and self.pulse_timer.isActive():
             self.pulse_timer.stop()
+        if hasattr(self, "topmost_timer"):
+            self.topmost_timer.setInterval(1000)
         self.stack.setCurrentWidget(self.card)
         op_val = self.opacity_slider.value() if hasattr(self, "opacity_slider") else 94
         self.apply_opacity(op_val / 100.0)
@@ -1423,6 +1441,7 @@ class FloatingSenderWindow(QWidget):
             return
         if self.is_mini_mode and not self.is_pulsing:
             self.apply_opacity(1.0)
+        self.enforce_always_on_top()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
