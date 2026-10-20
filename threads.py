@@ -1157,7 +1157,7 @@ class AudioSenderThread(QThread):
         sample_rate = wasapi.sample_rate if use_native_wasapi else DEFAULT_SAMPLE_RATE
 
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock = socket.socket(socket.AF_INET, socket.STREAM)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.sock.settimeout(3.0)
             self.sock.connect((self.target_ip, AUDIO_PORT))
@@ -1305,7 +1305,9 @@ class InputReceiverThread(QThread):
             self._injector = UniversalInputInjector(
                 self.scr_w, self.scr_h, mon_left=self.mon_l, mon_top=self.mon_t
             )
-        except Exception:
+            print("[InputReceiver] UniversalInputInjector initialized.", flush=True)
+        except Exception as e:
+            print(f"[InputReceiver] Failed to initialize UniversalInputInjector: {e}", flush=True)
             self._injector = None
 
         self._ensure_socket_connected()
@@ -1367,10 +1369,14 @@ class InputReceiverThread(QThread):
                 try:
                     event = json.loads(raw_msg.decode("utf-8"))
                     if self.is_input_enabled_func():
+                        ev_type = event.get("type", "")
+                        if ev_type in ("touch_down", "touch_move", "touch_up", "mouse_down", "mouse_move", "mouse_up", "scroll"):
+                            print(f"[Touch Receive] {ev_type} at {event.get('x')}, {event.get('y')}", flush=True)
+
                         if self._injector:
                             self._injector.execute(event)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[InputReceiver] Failed to process event: {e}", flush=True)
 
         if self._injector:
             self._injector.close()

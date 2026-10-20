@@ -53,6 +53,8 @@ BTN_RIGHT = 0x111
 BTN_MIDDLE = 0x112
 BTN_SIDE = 0x113
 BTN_EXTRA = 0x114
+BTN_TOUCH = 0x14a
+BTN_TOOL_FINGER = 0x145
 
 REL_WHEEL = 0x08
 
@@ -68,6 +70,7 @@ UI_DEV_CREATE = 0x5501
 UI_DEV_DESTROY = 0x5502
 
 INPUT_PROP_POINTER = 0x00
+INPUT_PROP_DIRECT = 0x01
 UINPUT_MAX_ABS = 32767
 
 
@@ -110,7 +113,7 @@ class PurePythonLinuxUInput:
 
         fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_SYN)
         fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
-        for btn in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA):
+        for btn in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA, BTN_TOUCH, BTN_TOOL_FINGER):
             fcntl.ioctl(self.fd, UI_SET_KEYBIT, btn)
 
         for key_code in range(1, 249):
@@ -128,6 +131,7 @@ class PurePythonLinuxUInput:
 
         try:
             fcntl.ioctl(self.fd, UI_SET_PROPBIT, INPUT_PROP_POINTER)
+            fcntl.ioctl(self.fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT)
         except Exception:
             pass
 
@@ -245,11 +249,15 @@ if sys.platform.startswith("linux"):
 
 Button = None
 MouseController = None
+Key = None
+KeyboardController = None
+PYNPUT_AVAILABLE = False
 try:
     from pynput.mouse import Button, Controller as MouseController
+    from pynput.keyboard import Key, Controller as KeyboardController
+    PYNPUT_AVAILABLE = True
 except Exception:
-    Button = None
-    MouseController = None
+    pass
 
 
 class UniversalInputInjector:
@@ -260,14 +268,21 @@ class UniversalInputInjector:
         self.mon_top = mon_top
         self.mode = "none"
         self.mouse = None
+        self.keyboard = None
         self.ui = None
         self.native_uinput = None
 
         if sys.platform == "win32":
             self.mode = "win32"
+            print(f"[InputBackend] Using native Win32 hardware input injection on bounds ({mon_left},{mon_top},{screen_w}x{screen_h}).", flush=True)
         elif sys.platform.startswith("linux"):
             if USE_EVDEV:
                 try:
+                    min_x = min(0, mon_left)
+                    max_x = max(self.screen_w, mon_left + self.screen_w)
+                    min_y = min(0, mon_top)
+                    max_y = max(self.screen_h, mon_top + self.screen_h)
+
                     cap = {
                         e.EV_KEY: [
                             e.BTN_LEFT,
@@ -275,31 +290,40 @@ class UniversalInputInjector:
                             e.BTN_MIDDLE,
                             e.BTN_SIDE,
                             e.BTN_EXTRA,
+                            e.BTN_TOUCH,
+                            e.BTN_TOOL_FINGER,
                         ],
                         e.EV_ABS: [
-                            (e.ABS_X, AbsInfo(value=0, min=0, max=UINPUT_MAX_ABS, fuzz=0, flat=0, resolution=1)),
-                            (e.ABS_Y, AbsInfo(value=0, min=0, max=UINPUT_MAX_ABS, fuzz=0, flat=0, resolution=1)),
+                            (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=1)),
+                            (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=1)),
                         ],
                         e.EV_REL: [e.REL_WHEEL],
                     }
-                    self.ui = UInput(cap, name="mrcoopers-virtual-pointer", input_props=[0])
+                    # Pass direct touch capabilities flags through to the kernel (Prop 0/1)
+                    self.ui = UInput(cap, name="mrcoopers-virtual-pointer", input_props=[0, 1])
                     self.mode = "evdev"
-                except Exception:
-                    pass
+                    print(f"[InputBackend] Linux evdev virtual pointer active ({max_x}x{max_y}).", flush=True)
+                except Exception as ex:
+                    print(f"[InputBackend] Linux evdev init notice: {ex}", flush=True)
+                    self.mode = "none"
 
             if self.mode == "none" and fcntl is not None:
                 try:
                     self.native_uinput = PurePythonLinuxUInput(max_abs=UINPUT_MAX_ABS)
                     self.mode = "direct_uinput"
-                except Exception:
-                    pass
+                    print("[InputBackend] Direct Linux uinput active.", flush=True)
+                except Exception as ex:
+                    print(f"[InputBackend] Direct uinput failed: {ex}", flush=True)
 
         if self.mode == "none":
-            if MouseController is not None:
+            if PYNPUT_AVAILABLE:
                 try:
                     self.mouse = MouseController()
+                    self.keyboard = KeyboardController()
                     self.mode = "pynput"
-                except Exception:
+                    print("[InputBackend] Using pynput fallback.", flush=True)
+                except Exception as ex:
+                    print(f"[InputBackend] pynput init failed: {ex}", flush=True)
                     self.mode = "unsupported"
             else:
                 self.mode = "unsupported"
@@ -375,8 +399,8 @@ class UniversalInputInjector:
                     kinp.u.ki.time = 0
                     kinp.u.ki.dwExtraInfo = None
                     ctypes.windll.user32.SendInput(1, byref(kinp), sizeof(INPUT))
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"[InputBackend] Win32 input injection exception: {ex}", flush=True)
 
         elif self.mode == "direct_uinput" and self.native_uinput:
             try:
@@ -388,12 +412,18 @@ class UniversalInputInjector:
                 if ev_type in ("touch_down", "mouse_down"):
                     btn_type = event.get("button", "left")
                     btn_code = BTN_RIGHT if btn_type == "right" else (BTN_MIDDLE if btn_type == "middle" else BTN_LEFT)
+                    if btn_code == BTN_LEFT:
+                        self.native_uinput.write_event(EV_KEY, BTN_TOUCH, 1)
+                        self.native_uinput.write_event(EV_KEY, BTN_TOOL_FINGER, 1)
                     self.native_uinput.write_event(EV_KEY, btn_code, 1)
                     self.native_uinput.syn()
 
                 elif ev_type in ("touch_up", "mouse_up"):
                     btn_type = event.get("button", "left")
                     btn_code = BTN_RIGHT if btn_type == "right" else (BTN_MIDDLE if btn_type == "middle" else BTN_LEFT)
+                    if btn_code == BTN_LEFT:
+                        self.native_uinput.write_event(EV_KEY, BTN_TOUCH, 0)
+                        self.native_uinput.write_event(EV_KEY, BTN_TOOL_FINGER, 0)
                     self.native_uinput.write_event(EV_KEY, btn_code, 0)
                     self.native_uinput.syn()
 
@@ -404,8 +434,8 @@ class UniversalInputInjector:
                     dy = 1 if event.get("dy", 0) > 0 else -1
                     self.native_uinput.write_event(EV_REL, REL_WHEEL, dy)
                     self.native_uinput.syn()
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"[InputBackend] Direct uinput injection exception: {ex}", flush=True)
 
         elif self.mode == "evdev" and self.ui:
             try:
@@ -417,12 +447,18 @@ class UniversalInputInjector:
                 if ev_type in ("touch_down", "mouse_down"):
                     btn_type = event.get("button", "left")
                     btn_code = e.BTN_RIGHT if btn_type == "right" else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    if btn_code == e.BTN_LEFT:
+                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
+                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 1)
                     self.ui.write(e.EV_KEY, btn_code, 1)
                     self.ui.syn()
 
                 elif ev_type in ("touch_up", "mouse_up"):
                     btn_type = event.get("button", "left")
                     btn_code = e.BTN_RIGHT if btn_type == "right" else (e.BTN_MIDDLE if btn_type == "middle" else e.BTN_LEFT)
+                    if btn_code == e.BTN_LEFT:
+                        self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
+                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 0)
                     self.ui.write(e.EV_KEY, btn_code, 0)
                     self.ui.syn()
 
@@ -433,8 +469,8 @@ class UniversalInputInjector:
                     dy = 1 if event.get("dy", 0) > 0 else -1
                     self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
                     self.ui.syn()
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"[InputBackend] evdev input injection exception: {ex}", flush=True)
 
         elif self.mode == "pynput" and self.mouse:
             try:
@@ -456,8 +492,21 @@ class UniversalInputInjector:
                     self.mouse.release(btn)
                 elif ev_type == "scroll":
                     self.mouse.scroll(0, 1 if event.get("dy", 0) > 0 else -1)
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"[InputBackend] pynput injection exception: {ex}", flush=True)
+
+        if self.keyboard and ev_type in ("key_down", "key_up"):
+            text = event.get("text", "")
+            key_name = str(event.get("key", "")).lower().replace("key_", "")
+            target_key = text if text else key_name
+            if target_key:
+                try:
+                    if ev_type == "key_down":
+                        self.keyboard.press(target_key)
+                    else:
+                        self.keyboard.release(target_key)
+                except Exception:
+                    pass
 
     def close(self):
         if self.native_uinput:

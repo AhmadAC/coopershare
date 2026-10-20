@@ -1,3 +1,4 @@
+
 # receiver.py
 
 """
@@ -650,7 +651,8 @@ class UniversalInputInjector:
                     e.EV_REL: [e.REL_WHEEL],
                 }
 
-                self.ui = UInput(cap, name="mrcoopers-receiver-input")
+                # Pass direct touch capabilities flags through to the kernel (Prop 0/1)
+                self.ui = UInput(cap, name="mrcoopers-receiver-input", input_props=[0, 1])
                 self.mode = "evdev"
                 logger.debug(f"Linux evdev virtual pointer active ({max_x}x{max_y}).")
             except Exception as ex:
@@ -752,6 +754,7 @@ class UniversalInputInjector:
                     )
                     if btn_code == e.BTN_LEFT:
                         self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
+                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 1)
                     self.ui.write(e.EV_KEY, btn_code, 1)
                     self.ui.syn()
 
@@ -764,6 +767,7 @@ class UniversalInputInjector:
                     )
                     if btn_code == e.BTN_LEFT:
                         self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
+                        self.ui.write(e.EV_KEY, e.BTN_TOOL_FINGER, 0)
                     self.ui.write(e.EV_KEY, btn_code, 0)
                     self.ui.syn()
 

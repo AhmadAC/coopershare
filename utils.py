@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from typing import Optional
 
 import mss
@@ -121,9 +122,54 @@ def ensure_uinput_permissions():
     if not sys.platform.startswith("linux"):
         return
 
+    pkexec_path = shutil.which("pkexec")
+    
+    # 1. Ensure kernel module is loaded
+    if not os.path.exists("/dev/uinput") and pkexec_path:
+        try:
+            print("[Sender-Bootstrap] Loading uinput kernel module...", flush=True)
+            subprocess.run([pkexec_path, "modprobe", "uinput"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
     if os.path.exists("/dev/uinput") and os.access("/dev/uinput", os.W_OK):
         return
 
+    user = os.environ.get("USER", "")
+    if not user:
+        try:
+            import getpass
+            user = getpass.getuser()
+        except Exception:
+            pass
+
+    print("[Sender-Bootstrap] Requesting /dev/uinput write permissions for touch controller...", flush=True)
+    if pkexec_path and user:
+        try:
+            # 2. Try granting permission via ACL
+            if shutil.which("setfacl"):
+                subprocess.run(
+                    [pkexec_path, "setfacl", "-m", f"u:{user}:rw", "/dev/uinput"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            
+            # 3. Try global chmod if ACL fails or isn't available
+            if not os.access("/dev/uinput", os.W_OK):
+                subprocess.run(
+                    [pkexec_path, "chmod", "0666", "/dev/uinput"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+        except Exception as e:
+            print(f"[Sender-Bootstrap] pkexec permission request failed: {e}", flush=True)
+
+    if not os.access("/dev/uinput", os.W_OK):
+        print(f"[Sender-Bootstrap] WARNING: Could not automatically grant /dev/uinput permissions.", flush=True)
+        print(f"[Sender-Bootstrap] Touch inputs will not work. Please manually run: sudo setfacl -m u:{user}:rw /dev/uinput", flush=True)
+
+    # 4. Standard udev rule creation as fallback
     rule_path = "/etc/udev/rules.d/99-uinput.rules"
     rule_content = 'KERNEL=="uinput", MODE="0660", TAG+="uaccess"\n'
 
