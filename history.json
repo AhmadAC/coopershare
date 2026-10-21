@@ -5,7 +5,7 @@
         "192.168.90.221": "317 CS"
     },
     "quality_preset": "Pixel-Perfect 1:1 (95%)",
-    "touch_input": true,
+    "touch_input": false,
     "tv_volume": 10,
     "allow_audio_when_paused": false,
     "opacity": 91,

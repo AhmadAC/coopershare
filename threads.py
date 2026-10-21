@@ -8,6 +8,7 @@ Features:
   upscales to 4K UHD via Lanczos-4 interpolation (or maintains native 4K+), encodes with
   4:4:4 full chroma at 98% quality to eliminate all compression artifacts on the board
 - Dual-display / Screen Extension sharing option with live on-the-fly target switching
+- Full KDE Plasma 6 Wayland multi-monitor support via KWin ScreenShot2 CaptureScreen and CaptureArea
 - Direct zero-copy BGRA memory ingestion into libavcodec (0.0ms color conversion)
 - Dual-tier capture failover: DXGI Hardware GPU Duplication with instant FastGDI backup
 - Steady frame pacing guarantee (caches last frame on static scenes so stream never starves)
@@ -112,7 +113,7 @@ def _extract_dict_from_dbus_meta(meta_raw) -> dict:
 
 
 class FastPipeReader:
-    def __init__(self, initial_capacity: int = 1920 * 1080 * 4 + 131072):
+    def __init__(self, initial_capacity: int = 3840 * 2160 * 4 + 262144):
         self.buffers = [
             bytearray(initial_capacity),
             bytearray(initial_capacity),
@@ -154,7 +155,7 @@ class FastPipeReader:
             expected = self.expected_size
             buf = self.buffers[self.buf_idx]
             if expected > len(buf):
-                buf.extend(b"\x00" * (expected - len(buf) + 131072))
+                buf.extend(b"\x00" * (expected - len(buf) + 262144))
             mv = memoryview(buf)
             offset = 0
 
@@ -178,27 +179,24 @@ class FastPipeReader:
 
 
 class KWinScreenShot2Grabber:
-    def __init__(self):
+    def __init__(self, target_screen_index: int = 0):
         self.available = False
         self.iface = None
+        self.target_screen_index = target_screen_index
+        self.target_screen_name = ""
+        self.mon_left = 0
+        self.mon_top = 0
+        self.logical_w = 1920
+        self.logical_h = 1080
         self.native_w = 1920
         self.native_h = 1080
-        self.logical_w = 1536
-        self.logical_h = 864
         self.dpr = 1.0
         self.pipe_reader = None
 
         if not sys.platform.startswith("linux") or fcntl is None:
             return
 
-        screen = QGuiApplication.primaryScreen()
-        if screen:
-            self.dpr = float(screen.devicePixelRatio())
-            self.logical_w = screen.size().width()
-            self.logical_h = screen.size().height()
-            self.native_w = int(round(self.logical_w * self.dpr))
-            self.native_h = int(round(self.logical_h * self.dpr))
-
+        self.set_target_screen(self.target_screen_index)
         self.pipe_reader = FastPipeReader()
 
         try:
@@ -226,6 +224,28 @@ class KWinScreenShot2Grabber:
                             self.iface = _get_interface()
         except Exception:
             self.available = False
+
+    def set_target_screen(self, target_index: int = 0):
+        self.target_screen_index = max(0, int(target_index))
+        screens = QGuiApplication.screens()
+        if screens:
+            idx = self.target_screen_index if self.target_screen_index < len(screens) else 0
+            screen = screens[idx]
+            self.target_screen_name = screen.name()
+            geom = screen.geometry()
+            self.mon_left = geom.x()
+            self.mon_top = geom.y()
+            self.logical_w = geom.width()
+            self.logical_h = geom.height()
+            self.dpr = float(screen.devicePixelRatio())
+            self.native_w = int(round(self.logical_w * self.dpr))
+            self.native_h = int(round(self.logical_h * self.dpr))
+        print(
+            f"[KWinScreenShot2] Configured screen index {self.target_screen_index}: "
+            f"name='{self.target_screen_name}', bounds=({self.mon_left},{self.mon_top},{self.logical_w}x{self.logical_h}), "
+            f"dpr={self.dpr:.2f}",
+            flush=True,
+        )
 
     def grab(
         self,
@@ -260,35 +280,66 @@ class KWinScreenShot2Grabber:
 
             self.pipe_reader.start_read(r_fd, expected_bytes)
 
-            reply = self.iface.call("CaptureActiveScreen", options, q_fd)
+            reply = None
+            if self.target_screen_name:
+                reply = self.iface.call("CaptureScreen", self.target_screen_name, options, q_fd)
+
             os.close(w_fd)
             w_fd = -1
             q_fd = None
 
             if _is_dbus_error(reply) or not reply.arguments():
+                os.close(r_fd)
+                r_fd = -1
+
                 r_fd2, w_fd2 = os.pipe()
                 try:
                     fcntl.fcntl(r_fd2, 1031, 1048576)
                 except Exception:
                     pass
                 q_fd2 = QDBusUnixFileDescriptor(w_fd2)
-
                 self.pipe_reader.start_read(r_fd2, expected_bytes)
-                reply2 = self.iface.call("CaptureWorkspace", options, q_fd2)
+
+                reply = self.iface.call(
+                    "CaptureArea",
+                    int(self.mon_left),
+                    int(self.mon_top),
+                    int(self.logical_w),
+                    int(self.logical_h),
+                    options,
+                    q_fd2,
+                )
                 os.close(w_fd2)
                 w_fd2 = -1
                 q_fd2 = None
-                os.close(r_fd)
                 r_fd = r_fd2
 
-                if _is_dbus_error(reply2) or not reply2.arguments():
+            if _is_dbus_error(reply) or not reply.arguments():
+                if r_fd != -1:
                     os.close(r_fd)
                     r_fd = -1
-                    return None
-                meta_raw = reply2.arguments()[0]
-            else:
-                meta_raw = reply.arguments()[0]
 
+                r_fd3, w_fd3 = os.pipe()
+                try:
+                    fcntl.fcntl(r_fd3, 1031, 1048576)
+                except Exception:
+                    pass
+                q_fd3 = QDBusUnixFileDescriptor(w_fd3)
+                self.pipe_reader.start_read(r_fd3, expected_bytes)
+
+                reply = self.iface.call("CaptureActiveScreen", options, q_fd3)
+                os.close(w_fd3)
+                w_fd3 = -1
+                q_fd3 = None
+                r_fd = r_fd3
+
+            if _is_dbus_error(reply) or not reply.arguments():
+                if r_fd != -1:
+                    os.close(r_fd)
+                    r_fd = -1
+                return None
+
+            meta_raw = reply.arguments()[0]
             raw_mv = self.pipe_reader.wait_read(timeout=init_timeout)
             os.close(r_fd)
             r_fd = -1
@@ -313,7 +364,7 @@ class KWinScreenShot2Grabber:
             elif self.logical_w * self.logical_h == total_pixels:
                 width, height = self.logical_w, self.logical_h
             else:
-                aspect = self.logical_w / self.logical_h if self.logical_h > 0 else (16.0 / 9.0)
+                aspect = self.logical_w / float(self.logical_h) if self.logical_h > 0 else (16.0 / 9.0)
                 height = int(round((total_pixels / aspect) ** 0.5))
                 width = int(round(height * aspect))
 
@@ -774,43 +825,70 @@ class ScreenSenderThread(QThread):
             os.environ.get("XDG_SESSION_TYPE") == "wayland" or os.environ.get("WAYLAND_DISPLAY") is not None
         )
 
-        kwin_grabber = KWinScreenShot2Grabber() if is_wayland else None
-        use_kwin = bool(kwin_grabber and kwin_grabber.available)
-
-        spectacle_grabber = None
-        use_spectacle = False
-        if is_wayland and not use_kwin:
-            spectacle_grabber = SpectacleGrabber()
-            use_spectacle = spectacle_grabber.available
-
-        dxgi_grabber = None
-        use_dxgi = False
-        fast_gdi_grabber = None
-        use_fast_gdi = False
-
-        screen = QGuiApplication.primaryScreen()
-        screen_dpr = float(screen.devicePixelRatio()) if screen else 1.0
-
         with create_mss_instance() as sct:
-            def get_target_monitor_and_idx():
-                num_mons = len(sct.monitors)
-                if self.share_extension and num_mons > 2:
-                    mon_idx = 2
+            def get_target_screen_info():
+                screens = QGuiApplication.screens()
+                if screens:
+                    num_qt = len(screens)
+                    target_idx = 1 if (self.share_extension and num_qt > 1) else 0
+                    s = screens[target_idx]
+                    geom = s.geometry()
+                    dpr = float(s.devicePixelRatio())
+                    return {
+                        "left": geom.x(),
+                        "top": geom.y(),
+                        "width": geom.width(),
+                        "height": geom.height(),
+                        "dpr": dpr,
+                        "name": s.name(),
+                        "idx": target_idx,
+                        "num_screens": num_qt,
+                    }
+
+                num_m = len(sct.monitors)
+                if self.share_extension and num_m > 2:
+                    m_idx = 2
                     dxgi_idx = 1
                 else:
-                    mon_idx = 1 if num_mons > 1 else 0
+                    m_idx = 1 if num_m > 1 else 0
                     dxgi_idx = 0
-                return sct.monitors[mon_idx], dxgi_idx, mon_idx
+                m = sct.monitors[m_idx]
+                return {
+                    "left": m.get("left", 0),
+                    "top": m.get("top", 0),
+                    "width": m.get("width", 1920),
+                    "height": m.get("height", 1080),
+                    "dpr": 1.0,
+                    "name": "",
+                    "idx": dxgi_idx,
+                    "num_screens": max(1, num_m - 1),
+                }
 
-            monitor, dxgi_target_idx, active_mon_idx = get_target_monitor_and_idx()
-            mon_left = monitor.get("left", 0)
-            mon_top = monitor.get("top", 0)
-            mon_w = monitor.get("width", 1920)
-            mon_h = monitor.get("height", 1080)
+            info = get_target_screen_info()
+            active_mon_idx = info["idx"]
+            mon_left = info["left"]
+            mon_top = info["top"]
+            mon_w = info["width"]
+            mon_h = info["height"]
+            screen_dpr = info["dpr"]
+
+            kwin_grabber = KWinScreenShot2Grabber(target_screen_index=active_mon_idx) if is_wayland else None
+            use_kwin = bool(kwin_grabber and kwin_grabber.available)
+
+            spectacle_grabber = None
+            use_spectacle = False
+            if is_wayland and not use_kwin:
+                spectacle_grabber = SpectacleGrabber()
+                use_spectacle = spectacle_grabber.available
+
+            dxgi_grabber = None
+            use_dxgi = False
+            fast_gdi_grabber = None
+            use_fast_gdi = False
 
             if sys.platform == "win32":
                 try:
-                    dxgi_grabber = WindowsDXGIGrabber(target_monitor_index=dxgi_target_idx)
+                    dxgi_grabber = WindowsDXGIGrabber(target_monitor_index=active_mon_idx)
                     use_dxgi = dxgi_grabber.available
                 except Exception as ex:
                     print(f"[Sender] Windows DXGI exception: {ex}", flush=True)
@@ -826,19 +904,19 @@ class ScreenSenderThread(QThread):
 
             active_backend = "MSS (Direct)"
             if use_dxgi:
-                active_backend = f"DXGI (GPU - Display {dxgi_target_idx + 1})"
+                active_backend = f"DXGI (GPU - Display {active_mon_idx + 1})"
             elif use_kwin:
-                active_backend = "KWin (D-Bus)"
+                active_backend = f"KWin (D-Bus - {info.get('name', '') or f'Display {active_mon_idx + 1}'})"
             elif use_spectacle:
                 active_backend = "Spectacle"
             elif use_fast_gdi:
-                active_backend = f"FastGDI (Display {dxgi_target_idx + 1})"
+                active_backend = f"FastGDI (Display {active_mon_idx + 1})"
 
             def get_backend_name():
                 nonlocal active_backend
                 return active_backend
 
-            print(f"[Sender] Active Capture Engine: {active_backend} (Display {active_mon_idx})", flush=True)
+            print(f"[Sender] Active Capture Engine: {active_backend} (Display {active_mon_idx + 1})", flush=True)
 
             self.pipeline_running = True
 
@@ -858,12 +936,17 @@ class ScreenSenderThread(QThread):
             while self.running and self.pipeline_running:
                 if self._target_display_changed:
                     self._target_display_changed = False
-                    monitor, dxgi_target_idx, active_mon_idx = get_target_monitor_and_idx()
-                    mon_left = monitor.get("left", 0)
-                    mon_top = monitor.get("top", 0)
-                    mon_w = monitor.get("width", 1920)
-                    mon_h = monitor.get("height", 1080)
+                    info = get_target_screen_info()
+                    active_mon_idx = info["idx"]
+                    mon_left = info["left"]
+                    mon_top = info["top"]
+                    mon_w = info["width"]
+                    mon_h = info["height"]
+                    screen_dpr = info["dpr"]
                     last_cached_frame = None
+
+                    if kwin_grabber:
+                        kwin_grabber.set_target_screen(active_mon_idx)
 
                     if dxgi_grabber:
                         try:
@@ -880,7 +963,7 @@ class ScreenSenderThread(QThread):
 
                     if sys.platform == "win32":
                         try:
-                            dxgi_grabber = WindowsDXGIGrabber(target_monitor_index=dxgi_target_idx)
+                            dxgi_grabber = WindowsDXGIGrabber(target_monitor_index=active_mon_idx)
                             use_dxgi = dxgi_grabber.available
                         except Exception:
                             use_dxgi = False
@@ -894,16 +977,16 @@ class ScreenSenderThread(QThread):
 
                     active_backend = "MSS (Direct)"
                     if use_dxgi:
-                        active_backend = f"DXGI (GPU - Display {dxgi_target_idx + 1})"
+                        active_backend = f"DXGI (GPU - Display {active_mon_idx + 1})"
                     elif use_kwin:
-                        active_backend = "KWin (D-Bus)"
+                        active_backend = f"KWin (D-Bus - {info.get('name', '') or f'Display {active_mon_idx + 1}'})"
                     elif use_spectacle:
                         active_backend = "Spectacle"
                     elif use_fast_gdi:
-                        active_backend = f"FastGDI (Display {dxgi_target_idx + 1})"
+                        active_backend = f"FastGDI (Display {active_mon_idx + 1})"
 
                     print(
-                        f"[Sender] Switched capture target to Display {active_mon_idx} "
+                        f"[Sender] Switched capture target to Display {active_mon_idx + 1} "
                         f"({mon_w}x{mon_h} at {mon_left},{mon_top}) via {active_backend}",
                         flush=True,
                     )
@@ -915,7 +998,6 @@ class ScreenSenderThread(QThread):
                     print("[Sender] Pause requested - capturing 4K Ultra HD presentation screenshot...", flush=True)
                     clean_frame = None
                     try:
-                        # 1. Grab clean, uncompressed native-resolution frame from active capture source
                         if use_dxgi and dxgi_grabber:
                             clean_frame = dxgi_grabber.grab()
                             if clean_frame is None and dxgi_grabber.last_frame is not None:
@@ -934,7 +1016,8 @@ class ScreenSenderThread(QThread):
                             clean_frame = spectacle_grabber.grab()
 
                         elif clean_frame is None and sct:
-                            sct_f = sct.grab(monitor)
+                            mss_target_idx = active_mon_idx + 1 if (active_mon_idx + 1 < len(sct.monitors)) else 0
+                            sct_f = sct.grab(sct.monitors[mss_target_idx])
                             clean_frame = np.frombuffer(sct_f.raw, dtype=np.uint8).reshape((sct_f.height, sct_f.width, 4)).copy()
 
                         if clean_frame is None and last_cached_frame is not None:
@@ -946,13 +1029,11 @@ class ScreenSenderThread(QThread):
                     if clean_frame is not None:
                         h_orig, w_orig = clean_frame.shape[:2]
 
-                        # 2. Convert to BGR format if 4-channel BGRA
                         if clean_frame.ndim == 3 and clean_frame.shape[2] == 4:
                             frame_bgr = cv2.cvtColor(clean_frame, cv2.COLOR_BGRA2BGR)
                         else:
                             frame_bgr = clean_frame
 
-                        # 3. Scale to 4K UHD (3840x2160) preserving exact aspect ratio with Lanczos-4
                         aspect = w_orig / float(h_orig) if h_orig > 0 else (16.0 / 9.0)
                         if aspect >= (16.0 / 9.0):
                             target_w = 3840
@@ -968,7 +1049,6 @@ class ScreenSenderThread(QThread):
 
                         h_final, w_final = frame_4k.shape[:2]
 
-                        # 4. Encode as ultra-high-fidelity 4K JPEG (98% quality, 4:4:4 chroma subsampling, zero artifacts)
                         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 98]
                         if hasattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR"):
                             samp_444 = getattr(cv2, "IMWRITE_JPEG_SAMPLING_FACTOR_444", 0x444)
@@ -980,7 +1060,6 @@ class ScreenSenderThread(QThread):
                         if success and enc_img is not None:
                             payload_bytes = b"JPEG" + enc_img.tobytes()
 
-                            # Flush queues to clear any lagging low-res streaming packets
                             while not self.raw_queue.empty():
                                 try:
                                     self.raw_queue.get_nowait()
@@ -993,10 +1072,8 @@ class ScreenSenderThread(QThread):
                                 except queue.Empty:
                                     break
 
-                            # Queue the pristine 4K presentation screenshot for transmission
                             self.send_queue.put((payload_bytes, 0.0, 0.0, False))
 
-                            # Wait briefly for network worker to deliver the 4K frame to the receiver
                             wait_deadline = time.perf_counter() + 0.6
                             while not self.send_queue.empty() and time.perf_counter() < wait_deadline:
                                 time.sleep(0.01)
@@ -1023,7 +1100,7 @@ class ScreenSenderThread(QThread):
                     if use_dxgi and dxgi_grabber:
                         f_raw = dxgi_grabber.grab()
                         if f_raw is not None:
-                            active_backend = f"DXGI (GPU - Display {dxgi_target_idx + 1})"
+                            active_backend = f"DXGI (GPU - Display {active_mon_idx + 1})"
                             render_cursor_on_frame(
                                 f_raw,
                                 monitor_left=dxgi_grabber.mon_left,
@@ -1036,7 +1113,7 @@ class ScreenSenderThread(QThread):
                     if f_raw is None and use_fast_gdi and fast_gdi_grabber:
                         f_raw = fast_gdi_grabber.grab()
                         if f_raw is not None:
-                            active_backend = f"FastGDI (Display {dxgi_target_idx + 1})"
+                            active_backend = f"FastGDI (Display {active_mon_idx + 1})"
                             render_cursor_on_frame(
                                 f_raw,
                                 monitor_left=mon_left,
@@ -1052,7 +1129,7 @@ class ScreenSenderThread(QThread):
                             native_resolution=use_native_res,
                         )
                         if f_raw is not None:
-                            active_backend = "KWin (D-Bus)"
+                            active_backend = f"KWin (D-Bus - {info.get('name', '') or f'Display {active_mon_idx + 1}'})"
                     elif f_raw is None and use_spectacle and spectacle_grabber:
                         f_raw = spectacle_grabber.grab()
                         if f_raw is not None:
@@ -1066,10 +1143,11 @@ class ScreenSenderThread(QThread):
                                 orig_screen_h=mon_h,
                             )
                     elif f_raw is None and sct:
-                        sct_frame = sct.grab(monitor)
+                        mss_target_idx = active_mon_idx + 1 if (active_mon_idx + 1 < len(sct.monitors)) else 0
+                        sct_frame = sct.grab(sct.monitors[mss_target_idx])
                         f_raw = np.frombuffer(sct_frame.raw, dtype=np.uint8).reshape((sct_frame.height, sct_frame.width, 4)).copy()
                         if f_raw is not None:
-                            active_backend = f"MSS (Display {active_mon_idx})"
+                            active_backend = f"MSS (Display {active_mon_idx + 1})"
                             render_cursor_on_frame(
                                 f_raw,
                                 monitor_left=mon_left,
@@ -1157,7 +1235,7 @@ class AudioSenderThread(QThread):
         sample_rate = wasapi.sample_rate if use_native_wasapi else DEFAULT_SAMPLE_RATE
 
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.STREAM)
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.sock.settimeout(3.0)
             self.sock.connect((self.target_ip, AUDIO_PORT))

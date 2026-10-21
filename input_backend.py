@@ -5,6 +5,7 @@ Cross-Platform Universal Input Injector.
 Features:
 - Ultra-Low Latency Win32 SendInput batch injection (sub-millisecond hardware mouse & keyboard events)
 - Direct Linux Kernel /dev/uinput virtual absolute pointer & keyboard driver (Zero external dependencies on Wayland / X11)
+- True multi-monitor virtual workspace coordinate projection mapping across displays
 - python-evdev driver (if installed)
 - pynput fallback (X11 only)
 """
@@ -32,6 +33,8 @@ import struct
 import sys
 import time
 import numpy as np
+
+from PySide6.QtGui import QGuiApplication
 
 try:
     import fcntl
@@ -266,11 +269,18 @@ class UniversalInputInjector:
         self.screen_h = max(1, screen_h)
         self.mon_left = mon_left
         self.mon_top = mon_top
+        self.virt_min_x = 0
+        self.virt_min_y = 0
+        self.virt_w = self.screen_w
+        self.virt_h = self.screen_h
+
         self.mode = "none"
         self.mouse = None
         self.keyboard = None
         self.ui = None
         self.native_uinput = None
+
+        self._calc_virtual_bounds()
 
         if sys.platform == "win32":
             self.mode = "win32"
@@ -278,11 +288,6 @@ class UniversalInputInjector:
         elif sys.platform.startswith("linux"):
             if USE_EVDEV:
                 try:
-                    min_x = min(0, mon_left)
-                    max_x = max(self.screen_w, mon_left + self.screen_w)
-                    min_y = min(0, mon_top)
-                    max_y = max(self.screen_h, mon_top + self.screen_h)
-
                     cap = {
                         e.EV_KEY: [
                             e.BTN_LEFT,
@@ -294,15 +299,14 @@ class UniversalInputInjector:
                             e.BTN_TOOL_FINGER,
                         ],
                         e.EV_ABS: [
-                            (e.ABS_X, AbsInfo(value=0, min=min_x, max=max_x, fuzz=0, flat=0, resolution=1)),
-                            (e.ABS_Y, AbsInfo(value=0, min=min_y, max=max_y, fuzz=0, flat=0, resolution=1)),
+                            (e.ABS_X, AbsInfo(value=0, min=0, max=UINPUT_MAX_ABS, fuzz=0, flat=0, resolution=1)),
+                            (e.ABS_Y, AbsInfo(value=0, min=0, max=UINPUT_MAX_ABS, fuzz=0, flat=0, resolution=1)),
                         ],
                         e.EV_REL: [e.REL_WHEEL],
                     }
-                    # Pass direct touch capabilities flags through to the kernel (Prop 0/1)
                     self.ui = UInput(cap, name="mrcoopers-virtual-pointer", input_props=[0, 1])
                     self.mode = "evdev"
-                    print(f"[InputBackend] Linux evdev virtual pointer active ({max_x}x{max_y}).", flush=True)
+                    print(f"[InputBackend] Linux evdev virtual pointer active (multi-display desktop {self.virt_w}x{self.virt_h}).", flush=True)
                 except Exception as ex:
                     print(f"[InputBackend] Linux evdev init notice: {ex}", flush=True)
                     self.mode = "none"
@@ -311,7 +315,7 @@ class UniversalInputInjector:
                 try:
                     self.native_uinput = PurePythonLinuxUInput(max_abs=UINPUT_MAX_ABS)
                     self.mode = "direct_uinput"
-                    print("[InputBackend] Direct Linux uinput active.", flush=True)
+                    print(f"[InputBackend] Direct Linux uinput active (multi-display desktop {self.virt_w}x{self.virt_h}).", flush=True)
                 except Exception as ex:
                     print(f"[InputBackend] Direct uinput failed: {ex}", flush=True)
 
@@ -328,11 +332,29 @@ class UniversalInputInjector:
             else:
                 self.mode = "unsupported"
 
+    def _calc_virtual_bounds(self):
+        screens = QGuiApplication.screens()
+        if screens:
+            min_x = min(s.geometry().x() for s in screens)
+            min_y = min(s.geometry().y() for s in screens)
+            max_x = max(s.geometry().x() + s.geometry().width() for s in screens)
+            max_y = max(s.geometry().y() + s.geometry().height() for s in screens)
+            self.virt_min_x = min_x
+            self.virt_min_y = min_y
+            self.virt_w = max(1, max_x - min_x)
+            self.virt_h = max(1, max_y - min_y)
+        else:
+            self.virt_min_x = min(0, self.mon_left)
+            self.virt_min_y = min(0, self.mon_top)
+            self.virt_w = max(self.screen_w, self.mon_left + self.screen_w)
+            self.virt_h = max(self.screen_h, self.mon_top + self.screen_h)
+
     def update_geometry(self, screen_w: int, screen_h: int, mon_left: int = 0, mon_top: int = 0):
         self.screen_w = max(1, screen_w)
         self.screen_h = max(1, screen_h)
         self.mon_left = mon_left
         self.mon_top = mon_top
+        self._calc_virtual_bounds()
 
     def execute(self, event: dict):
         ev_type = event.get("type")
@@ -344,8 +366,11 @@ class UniversalInputInjector:
             clamped_ny = max(0.0, min(1.0, float(ny)))
             px = self.mon_left + int(round(clamped_nx * (self.screen_w - 1)))
             py = self.mon_top + int(round(clamped_ny * (self.screen_h - 1)))
-            abs_x = int(round(clamped_nx * UINPUT_MAX_ABS))
-            abs_y = int(round(clamped_ny * UINPUT_MAX_ABS))
+
+            global_nx = (px - self.virt_min_x) / float(max(1, self.virt_w - 1))
+            global_ny = (py - self.virt_min_y) / float(max(1, self.virt_h - 1))
+            abs_x = int(round(max(0.0, min(1.0, global_nx)) * UINPUT_MAX_ABS))
+            abs_y = int(round(max(0.0, min(1.0, global_ny)) * UINPUT_MAX_ABS))
         else:
             px, py, abs_x, abs_y = None, None, None, None
 
